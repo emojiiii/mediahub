@@ -135,6 +135,17 @@
 - RustSec scanned 360 lockfile dependencies against 1,166 official advisories with zero vulnerabilities.
 - Built `mediahub:dependency-upgrade` successfully and verified its non-root writable runtime, health endpoint, OCI metadata, and libvips linkage.
 
+## Libvips CI compatibility
+
+- Investigated the reported GitHub failure and confirmed it is caused by generated libvips 8.18 bindings running against an older system libvips.
+- Selected a minimal WebP suffix-option encoding path for cross-version compatibility.
+- First 8.14.1 container attempt stopped before tests because a login shell removed Cargo from PATH; the second stopped during an external Debian mirror 502.
+- The first completed 8.14.1 test run exposed `keep` as the same generated-binding compatibility class for JPEG; migrated all three savers to explicit suffix options.
+- Debian bookworm libvips 8.14.1 image suite passed: 11 tests, 0 failures, including both reported transcode failures.
+- Pinned libvips 8.18.4 image suite passed: 11 tests, 0 failures; the release `mediahub-server` build also passed.
+- Local format check, diff check, focused adapter tests, `docker-libvips` server check, and workspace Clippy with all targets/features passed.
+- Rebuilt `mediahub:dependency-upgrade`; runtime smoke passed as non-root user with Docker health `healthy` and HTTP 200 live/readiness responses.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

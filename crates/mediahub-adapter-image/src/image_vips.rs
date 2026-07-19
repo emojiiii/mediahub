@@ -129,33 +129,15 @@ fn encode_vips(
     }
     let quality = i32::from(transform.quality());
     let result = match transform.format() {
-        VariantFormat::Jpeg => ops::jpegsave_buffer_with_opts(
-            image,
-            &ops::JpegsaveBufferOptions {
-                q: quality,
-                keep: ops::ForeignKeep::None,
-                profile: None,
-                ..ops::JpegsaveBufferOptions::default()
-            },
-        ),
-        VariantFormat::Png => ops::pngsave_buffer_with_opts(
-            image,
-            &ops::PngsaveBufferOptions {
-                q: quality,
-                keep: ops::ForeignKeep::None,
-                profile: None,
-                ..ops::PngsaveBufferOptions::default()
-            },
-        ),
-        VariantFormat::Webp => ops::webpsave_buffer_with_opts(
-            image,
-            &ops::WebpsaveBufferOptions {
-                q: quality,
-                keep: ops::ForeignKeep::None,
-                profile: None,
-                ..ops::WebpsaveBufferOptions::default()
-            },
-        ),
+        VariantFormat::Jpeg => {
+            image.image_write_to_buffer(&format!(".jpg[Q={quality},strip]"))
+        }
+        VariantFormat::Png => {
+            image.image_write_to_buffer(&format!(".png[Q={quality},strip]"))
+        }
+        VariantFormat::Webp => {
+            image.image_write_to_buffer(&format!(".webp[Q={quality},strip]"))
+        }
     };
     result.map_err(|error| {
         let libvips_error = VIPS_APP

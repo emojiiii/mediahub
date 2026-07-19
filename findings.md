@@ -269,3 +269,13 @@
 - The only Web direct dependency behind `latest` is TypeScript 5.9.3; TypeScript 7.0.2 cannot be used until openapi-typescript publishes compatible support.
 - The only Rust direct declaration intentionally below its crate's newest stable major is password-hash 0.5.0, because stable argon2 0.5.3 exposes that exact type line and uses the direct declaration's `getrandom` feature.
 - The Rust 1.97.0 deployment image builds successfully on Linux with libvips 8.18.4. Runtime smoke confirms UID 10001, writable storage, healthy HTTP response, and resolved `libvips.so.42` with no missing libraries.
+
+## Libvips CI compatibility
+
+- `libvips` crate 2.3.0 generated `WebpsaveBufferOptions` against libvips 8.18 and always forwards every field to the variadic C API, including `exact=false`.
+- The GitHub runner's distro libvips predates the `exact` property, so WebP encoding fails before it can produce output.
+- `VipsImage::image_write_to_buffer` accepts saver suffix options and forwards only explicitly named properties. `.webp[Q=...,strip]` preserves quality and metadata stripping without depending on the new `exact` property.
+- Debian bookworm currently supplies libvips 8.14.1, making it a suitable lower-bound reproduction environment for the GitHub system-package failure.
+- Libvips 8.14.1 also predates the generated binding's `keep` saver property. All three output formats need the minimal suffix-option path, not only WebP.
+- The final `.jpg`, `.png`, and `.webp` suffix-option implementation passes all 11 libvips-enabled tests on both Debian libvips 8.14.1 and the deployment image's pinned libvips 8.18.4.
+- The release server builds successfully with the pinned library, and the rebuilt deployment image starts as the non-root `mediahub` user with both live and readiness checks returning HTTP 200.

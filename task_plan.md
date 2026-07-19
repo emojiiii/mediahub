@@ -163,3 +163,28 @@ Upgrade direct Web, Rust, GitHub Actions, and build-image dependencies to their 
 | First runtime smoke test skipped database creation due PowerShell empty-output truthiness | 1 | Explicitly create and verify the isolated runtime database before restarting the image |
 | The first `ldd` filter lost shell quoting after Docker argument forwarding | 1 | Run `ldd` directly as the container entrypoint and filter its output in PowerShell |
 | Hadolint's cached image had no entrypoint | 1 | Invoke its declared `/bin/hadolint` command explicitly |
+
+## Current Task: Libvips CI Compatibility
+
+### Goal
+
+Make the libvips image tests and production encoder work with both the GitHub runner's distro libvips and the Docker image's pinned libvips 8.18.4.
+
+### Phases
+
+**Status:** complete
+
+- [completed] 1. Reproduce the CI error from the reported output and trace the generated binding behavior
+- [completed] 2. Replace all generated saver-option calls with minimal cross-version option paths
+- [completed] 3. Run image tests against an older distro libvips and pinned libvips 8.18.4
+- [completed] 4. Re-run formatting, Clippy, workflow-equivalent checks, and deployment-image smoke tests
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| GitHub libvips tests reject `webpsave_buffer` option `exact` | 1 | The 8.18-generated Rust binding passes every option field; switch WebP encoding to a suffix option string containing only long-supported `Q` and `strip` |
+| First old-libvips container used a login shell that removed Cargo from PATH | 1 | Re-run with a non-login `bash -c` shell |
+| Debian package mirror returned HTTP 502 for `libsz2` | 1 | Add APT acquisition retries and `--fix-missing` before running the 8.14.1 test suite |
+| Libvips 8.14.1 also rejects the generated JPEG option `keep` | 1 | Route JPEG, PNG, and WebP through minimal suffix options so no 8.18-only default fields cross the FFI boundary |
+| Final repository scan included a nonexistent optional `compose.yaml` path | 1 | Use the repository's actual `docker-compose.yml`; no build or runtime check was affected |
