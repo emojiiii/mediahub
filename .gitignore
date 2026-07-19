@@ -1,0 +1,9 @@
+/target
+/web/node_modules
+/web/dist
+/web/*.tsbuildinfo
+/data
+/backups
+.playwright-cli/
+logs/
+output/

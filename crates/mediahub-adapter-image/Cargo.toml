@@ -1,0 +1,25 @@
+[package]
+name = "mediahub-adapter-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bounded image processing adapter for MediaHub"
+
+[features]
+default = []
+libvips = ["dep:libvips"]
+
+[dependencies]
+async-trait = { workspace = true }
+image = { workspace = true }
+mediahub-app = { path = "../mediahub-app" }
+mediahub-core = { path = "../mediahub-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+webp = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libvips = { version = "2.3.0", optional = true }
+
+[lints]
+workspace = true

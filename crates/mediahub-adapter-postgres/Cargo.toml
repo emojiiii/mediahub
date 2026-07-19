@@ -1,0 +1,21 @@
+[package]
+name = "mediahub-adapter-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PostgreSQL repository adapter for MediaHub"
+
+[dependencies]
+async-trait.workspace = true
+mediahub-app = { path = "../mediahub-app" }
+mediahub-core = { path = "../mediahub-core" }
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["postgres", "time", "json"] }
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
