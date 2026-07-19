@@ -1,7 +1,6 @@
 .git
 target
-web/node_modules
-web/dist
+web
 data
 .env
 .env.*

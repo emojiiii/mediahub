@@ -2,7 +2,17 @@ name: CI
 
 on:
   push:
+    paths:
+      - .github/workflows/ci.yml
+      - Cargo.lock
+      - Cargo.toml
+      - "crates/**"
   pull_request:
+    paths:
+      - .github/workflows/ci.yml
+      - Cargo.lock
+      - Cargo.toml
+      - "crates/**"
 
 permissions:
   contents: read
@@ -40,23 +50,3 @@ jobs:
       - run: cargo test -p mediahub-adapter-image --features libvips
       - run: cargo check -p mediahub-server --features docker-libvips
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-  web:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
-      - run: npm ci
-      - run: cargo run -p mediahub-openapi -- --check
-        working-directory: .
-      - run: npm run api:check
-      - run: npm test
-      - run: npm run build

@@ -209,6 +209,22 @@
 - Added Dependabot coverage for Cargo, npm, GitHub Actions, and Docker; added MIT license, security policy, contribution guide, `.env.example`, and secret-safe ignore rules.
 - README and runbook now document published-image deployment, the API-only image boundary, secure random key generation, current environment names, and the separate web-console deployment.
 - Post-change Actionlint, Compose parsing, Hadolint (excluding intentional apt patch pinning), Gitleaks, and whitespace checks pass.
+
+### Final workflow scope
+
+- The user confirmed that Cloudflare builds the Web UI directly; GitHub Actions must not install, test, or build `web/`.
+- Rust CI should run only for `crates/**`, root Cargo manifest/lock changes, or its own workflow definition.
+- Container builds should use the same backend paths plus Dockerfile and `.dockerignore` changes. Tag pushes remain release triggers.
+- `web/` uses pnpm, and the Docker build context should exclude it completely so UI changes cannot invalidate backend image layers.
+
+### Final verification
+
+- Both GitHub workflows pass Actionlint and contain no Web, Node, npm, or package-lock references.
+- `pnpm install --lockfile-only --frozen-lockfile` accepts `web/pnpm-lock.yaml`; Cloudflare can own the actual Web install/build.
+- Docker build context is approximately 963 KB with `web/` excluded. `mediahub:open-source-audit` built successfully from Rust 1.88 and custom libvips.
+- The final image runs as UID/GID 10001, owns `/data/storage` as mode 0750, can write there through a fresh anonymous volume, has no missing shared libraries, and includes the expected OCI labels and liveness health check.
+- A fresh PostgreSQL database plus fresh storage volume reached HTTP 200 on both `/health/live` and `/health/ready`; Docker reported the container as healthy.
+- The first runtime attempt correctly failed closed because the reused test database contained object metadata while the fresh storage volume was empty. This was test-state mismatch, not an image defect.
 - The first full workspace test run exposed a pre-existing CI failure: `data_plane_sql_keeps_native_types_locks_and_atomic_boundaries` searched only `media.rs` and `s3_multipart.rs`, but both are now include facades and the asserted SQL lives in their split implementation files.
 - The SQL invariants themselves remain present. Updating the test input to concatenate the facade plus all included implementation files restores the intended structural coverage without changing database behavior.
 - First post-upgrade Clippy run failed only on a current-stable `collapsible_if` lint in `async_job_error.rs`; the validation condition is being collapsed as suggested.

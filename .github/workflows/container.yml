@@ -6,6 +6,13 @@ on:
       - master
     tags:
       - "v*.*.*"
+    paths:
+      - .github/workflows/container.yml
+      - .dockerignore
+      - Cargo.lock
+      - Cargo.toml
+      - Dockerfile
+      - "crates/**"
   pull_request:
     paths:
       - .github/workflows/container.yml

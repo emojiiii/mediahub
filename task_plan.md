@@ -92,15 +92,17 @@ Remove the runtime Mock implementation and all demo data/accounts so the console
 
 Make the GitHub Actions and container build reproducible for deployment, fix confirmed release blockers, and produce an evidence-backed pre-open-source review.
 
+The GitHub workflows cover backend crates and the API/worker image only. Cloudflare owns the Web UI build, which uses pnpm and must not trigger backend CI or container publishing.
+
 ### Phases
 
-**Status:** in_progress
+**Status:** complete
 
 - [completed] 1. Inventory repository metadata, GitHub Actions, Docker/Compose, and documented deployment contract
 - [completed] 2. Audit secrets, licenses, generated artifacts, dependencies, and release-facing configuration
 - [completed] 3. Fix confirmed CI, container, dependency, and open-source readiness issues
-- [in_progress] 4. Run local CI-equivalent checks and build/test the deployment image
-- [pending] 5. Rebuild, inspect the image, and deliver the remaining-risk checklist
+- [completed] 4. Run local backend CI-equivalent checks and build/test the deployment image
+- [completed] 5. Inspect the image and deliver the remaining-risk checklist
 
 ### Current Task Errors
 
@@ -117,3 +119,5 @@ Make the GitHub Actions and container build reproducible for deployment, fix con
 | Clippy on current stable rejected a nested `if let` with `collapsible_if` | 1 | Collapse the condition without changing validation behavior |
 | Vite 8 build passed compilation but failed the repository's lazy-viewer chunk contract because Rolldown merged the DOCX asset | 1 | Use the compatible patched Vite 7 line and React plugin 5.2, then regenerate the lockfile and rerun the build |
 | Incremental npm lock update omitted `@emnapi/wasi-threads`, so `npm ci` rejected package/lock drift | 1 | Remove the generated lock and ignored `node_modules`, then resolve from an empty dependency tree and verify with `npm ci` |
+| First runtime image check used a database populated by tests with an empty anonymous storage volume | 1 | Confirmed the consistency guard was correct; created a fresh isolated database and reran the image successfully |
+| Empty PostgreSQL existence query returned PowerShell `$null` and `.Trim()` failed | 1 | Use null-safe string matching before creating the isolated image-audit database |

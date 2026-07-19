@@ -94,6 +94,11 @@
 - First Rust workspace run found one stale source-structure test after the earlier PostgreSQL file split; fixed the test to scan the actual included implementation files.
 - Clippy exposed and fixed one current-stable lint; Vite 8 exposed a lazy-chunk contract regression, so the frontend target is being adjusted to Vite 7.3.6/plugin-react 5.2.0 before rerunning build.
 - Clippy now passes. The first incremental Vite 7 lock update omitted an optional WASI dependency, so npm correctly rejected it as non-reproducible; a clean lock resolution is in progress.
+- User clarified the final ownership boundary: Cloudflare builds the pnpm Web UI; GitHub Actions and the deployment image cover backend crates only.
+- Removed the GitHub Web job and restricted backend CI/image triggers to crates, Cargo files, Docker inputs, and their own workflow files.
+- Replaced package-lock with a pnpm 10.23.0 lockfile and excluded `web/` from the Docker build context.
+- Built `mediahub:open-source-audit`; verified non-root storage writes, shared libraries, OCI metadata, live/readiness HTTP 200, and Docker healthy state.
+- Removed the temporary API/PostgreSQL audit containers and retained the local image.
 
 ## Application resource isolation
 

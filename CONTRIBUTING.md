@@ -15,9 +15,9 @@ $env:DATABASE_URL = $env:MEDIAHUB_TEST_POSTGRES_URL
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 Set-Location web
-npm ci
-npm test
-npm run build
+pnpm install --frozen-lockfile
+pnpm test
+pnpm build
 ```
 
 The PostgreSQL contract test is destructive. Use a dedicated test database and

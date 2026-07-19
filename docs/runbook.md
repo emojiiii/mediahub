@@ -48,8 +48,8 @@ the local console in a second terminal with:
 
 ```powershell
 Set-Location web
-npm ci
-npm run dev
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
 ```powershell
@@ -508,7 +508,7 @@ $env:MEDIAHUB_TEST_POSTGRES_URL = 'postgres://mediahub:mediahub-local-only@127.0
 $env:DATABASE_URL = $env:MEDIAHUB_TEST_POSTGRES_URL # Required by sqlx::test server tests.
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-Set-Location web; npm run build
+Set-Location web; pnpm build
 ```
 
 The current Server supports runtime Local/S3 selection, but intentionally does
