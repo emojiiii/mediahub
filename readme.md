@@ -2,8 +2,23 @@
 
 > 面向 AI 时代媒体产物的自托管对象存储与处理服务。
 
-当前状态：设计阶段  
+当前状态：开发预览（V1 Docker Profile）
 文档版本：v1.0
+
+## 快速开始
+
+MediaHub 的发布镜像包含 API 与 Worker，Web 控制台位于 `web/`，需要单独部署。先复制环境模板并填写其中所有必填密钥与邮件服务配置：
+
+```bash
+cp .env.example .env
+docker compose pull
+docker compose up -d --no-build
+curl --fail http://127.0.0.1:3000/health/ready
+```
+
+默认镜像为 `ghcr.io/emojiiii/mediahub:latest`。生产环境应将 `MEDIAHUB_IMAGE` 固定到版本标签或镜像摘要，并在反向代理处终止 TLS。需要从源码构建时执行 `docker compose up -d --build`。完整配置、前端启动、备份恢复与 S3 后端说明见 [`docs/runbook.md`](docs/runbook.md)。
+
+本项目采用 MIT 许可证。安全问题请按 [`SECURITY.md`](SECURITY.md) 私下报告，贡献流程见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 1. 项目定位
 
@@ -1510,19 +1525,15 @@ reverse-proxy  可选，TLS、限流和 CDN 回源
 
 ```text
 MEDIAHUB_DATABASE_URL
-STORAGE_BACKEND
-STORAGE_ROOT
-PUBLIC_BASE_URL
-SESSION_SECRET
-MASTER_KEY_V1
-MASTER_KEY_V2
-ACTIVE_MASTER_KEY_VERSION
-MAIL_PROVIDER_*
-UPLOAD_MAX_BYTES
-IMAGE_MAX_PIXELS
-MAX_TTL_SECONDS
-WORKER_CONCURRENCY
-REGISTRATION_ENABLED
+MEDIAHUB_STORAGE_BACKEND
+MEDIAHUB_STORAGE_ROOT
+MEDIAHUB_ACCESS_KEY_MASTER_KEY
+MEDIAHUB_ACCESS_KEY_MASTER_KEY_VERSION
+MEDIAHUB_MEDIA_SIGNING_KEY
+MEDIAHUB_EMAIL_PROVIDER_*
+MEDIAHUB_EMAIL_FROM
+MEDIAHUB_CORS_ALLOWED_ORIGINS
+MEDIAHUB_REGISTRATION_ENABLED
 ```
 
 生产环境要求：

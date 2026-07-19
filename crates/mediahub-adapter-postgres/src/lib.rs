@@ -97,7 +97,14 @@ mod tests {
 
     #[test]
     fn data_plane_sql_keeps_native_types_locks_and_atomic_boundaries() {
-        let media = include_str!("media.rs");
+        let media = [
+            include_str!("media.rs"),
+            include_str!("media_buckets.rs"),
+            include_str!("media_queries.rs"),
+            include_str!("media_mutations.rs"),
+            include_str!("media_support.rs"),
+        ]
+        .concat();
         let idempotency = include_str!("idempotency.rs");
         assert!(media.contains("FOR UPDATE"));
         assert!(media.contains("QueryBuilder::<Postgres>"));
@@ -108,7 +115,12 @@ mod tests {
         assert!(idempotency.contains("create_in_transaction(&mut transaction, session)"));
         assert!(idempotency.contains("insert_bucket(&mut transaction, bucket)"));
         assert!(idempotency.contains("status = 'completed'"));
-        let s3_multipart = include_str!("s3_multipart.rs");
+        let s3_multipart = [
+            include_str!("s3_multipart.rs"),
+            include_str!("multipart_lifecycle.rs"),
+            include_str!("multipart_helpers.rs"),
+        ]
+        .concat();
         assert!(s3_multipart.contains("FOR UPDATE SKIP LOCKED LIMIT $2"));
     }
 }

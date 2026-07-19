@@ -6,13 +6,19 @@ documents the currently implemented local Docker-profile foundation.
 ## Run
 
 ```powershell
-$env:MEDIAHUB_ACCESS_KEY_MASTER_KEY = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
-$env:MEDIAHUB_MEDIA_SIGNING_KEY = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA='
+function New-MediaHubKey {
+    $bytes = [byte[]]::new(32)
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    [Convert]::ToBase64String($bytes)
+}
+$env:MEDIAHUB_ACCESS_KEY_MASTER_KEY = New-MediaHubKey
+$env:MEDIAHUB_MEDIA_SIGNING_KEY = New-MediaHubKey
 $env:MEDIAHUB_ALLOW_INSECURE_COOKIES = 'true'
 $env:MEDIAHUB_CORS_ALLOWED_ORIGINS = 'http://localhost:5173,http://127.0.0.1:5173'
 $env:MEDIAHUB_EXPOSE_AUTH_TOKENS = 'true' # isolated local development only
 $env:MEDIAHUB_REGISTRATION_ENABLED = 'true'
 $env:MEDIAHUB_STORAGE_BACKEND = 'local'
+$env:MEDIAHUB_POSTGRES_PASSWORD = 'mediahub-local-only' # isolated local development only
 $env:MEDIAHUB_DATABASE_URL = 'postgres://mediahub:mediahub-local-only@127.0.0.1:5432/mediahub'
 docker compose up -d postgres
 cargo run -p mediahub-server
@@ -20,6 +26,21 @@ cargo run -p mediahub-server
 
 The default URL is `http://127.0.0.1:3000`. Metadata is stored in PostgreSQL 17;
 object files are stored under `data/storage`.
+
+For a container deployment, copy `.env.example` to `.env`, fill every required
+secret/provider value, and pull the published API/worker image:
+
+```powershell
+Copy-Item .env.example .env
+docker compose pull
+docker compose up -d --no-build
+docker compose ps
+```
+
+The default image is `ghcr.io/emojiiii/mediahub:latest`. Set `MEDIAHUB_IMAGE`
+to a version tag or digest for reproducible deployments. The image contains the
+API and workers only; deploy the `web/` console separately and set
+`VITE_API_BASE_URL` to the public API origin.
 
 The web console has no embedded demo or Mock API. It always calls the real API,
 using `VITE_API_BASE_URL` when set and `http://localhost:3000` otherwise. Start
@@ -335,7 +356,9 @@ database health check before starting MediaHub:
 docker compose up -d --build
 ```
 
-Override the development credentials above for any shared deployment.
+Compose requires an explicit PostgreSQL password. Override every development
+credential above for any shared deployment. Public registration defaults to
+disabled unless `MEDIAHUB_REGISTRATION_ENABLED=true` is set deliberately.
 PostgreSQL backup/restore uses database-native point-in-time recovery together
 with the object-storage snapshot boundary.
 

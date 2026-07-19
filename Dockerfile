@@ -1,6 +1,7 @@
 FROM rust:1.88-bookworm AS builder
 ARG LIBVIPS_VERSION=8.18.4
 ARG LIBVIPS_SHA256=1e8d2228a4ffae7498e357dcddb3775440afa7b11726841cd511674dced84257
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         libexpat1-dev \
@@ -69,8 +70,14 @@ COPY . .
 RUN cargo build --release --package mediahub-server --features docker-libvips
 
 FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.title="MediaHub" \
+      org.opencontainers.image.description="Self-hosted media object storage and processing service" \
+      org.opencontainers.image.source="https://github.com/emojiiii/mediahub" \
+      org.opencontainers.image.licenses="MIT"
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        curl \
         libexpat1 \
         libglib2.0-0 \
         libjpeg62-turbo \
@@ -80,7 +87,8 @@ RUN apt-get update \
         libwebpmux3 \
         zlib1g \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 mediahub
+    && useradd --create-home --uid 10001 mediahub \
+    && install --directory --owner=mediahub --group=mediahub --mode=0750 /data/storage
 WORKDIR /app
 COPY --from=builder /opt/libvips/lib/ /usr/local/lib/
 COPY --from=builder /app/target/release/mediahub-server /usr/local/bin/mediahub-server
@@ -91,4 +99,6 @@ ENV MEDIAHUB_DATABASE_URL=postgres://mediahub:mediahub-local-only@postgres:5432/
 ENV MEDIAHUB_STORAGE_ROOT=/data/storage
 VOLUME ["/data"]
 EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:3000/health/live"]
 ENTRYPOINT ["/usr/local/bin/mediahub-server"]

@@ -64,6 +64,37 @@
 - Final cargo fmt --all -- --check: passed.
 - Final cargo check --workspace: passed.
 - Full cargo test --workspace was not run because some suites are destructive/integration-heavy; the relevant contract and library suites were run individually.
+## Open-source release and container audit
+
+- Started 2026-07-19.
+- Confirmed the worktree was clean at `97ed657` before beginning this audit.
+- Recovered and retained the completed historical planning context.
+- Began repository, GitHub Actions, Docker, and public-release inventory.
+- Found no container build/publish workflow; the checked-in CI currently validates source only.
+- Identified a missing root MIT license file despite the workspace manifest declaring MIT.
+- Confirmed the current Docker image packages the API/worker only, while the web console remains a separate Pages/Vite deployment.
+- Completed the repository/workflow/container/documentation inventory.
+- Found stale public README status/configuration text; the current runbook is more accurate but not a concise image-based deployment guide.
+- Initial tracked-file and one-commit history scan found no likely real credentials or private keys.
+- Reproduced the Web CI dependency-install blocker: npm reports `ENOLOCK` because the workflow-required `web/package-lock.json` does not exist.
+- Generated npm lockfile v3 and successfully queried the official npm advisory service.
+- Recorded 5 npm audit findings; Vite is fixable, while the SheetJS/xlsx chain requires a deliberate replacement or mitigation.
+- Gitleaks reported one redacted finding pending path/rule triage; the first RustSec container approach was invalid and will be replaced.
+- Triaged the Gitleaks hit as a fixed runbook example key, not a credential; planned secure random-key generation in the documentation.
+- Verified a patched official SheetJS 0.20.3 tarball and a compatible Vite 8/Vitest 4 upgrade set.
+- First canonical lockfile regeneration failed because npm's host-replacement option also rewrote the intentional SheetJS CDN URL; identified the 404 in the npm debug log and removed that option for the retry.
+- Rebuilt the npm lockfile using canonical sources; clean `npm ci` passes and npm audit reports zero vulnerabilities.
+- Actionlint passed. Hadolint found the checksum-pipeline shell issue plus intentionally unpinned apt-package warnings.
+- RustSec found two reachable quick-xml denial-of-service advisories and one non-enabled rsa lockfile advisory.
+- Reproduced the container's fresh-volume permission failure as UID 10001 against root-owned `/data`.
+- Implemented the npm/Rust dependency fixes, non-root volume ownership, health check, OCI labels, GHCR multi-architecture publishing, secure Compose defaults, and public-project policy/docs.
+- Post-change quick validation passed: Actionlint, Compose interpolation, Hadolint with only DL3008 excluded, Gitleaks with zero findings, and `git diff --check`.
+- RustSec now reports only the disabled sqlx-mysql/rsa lockfile path; no MediaHub target enables that dependency.
+- Frontend verification after the Vite/Vitest upgrade: 26 files and 128 tests passed.
+- First Rust workspace run found one stale source-structure test after the earlier PostgreSQL file split; fixed the test to scan the actual included implementation files.
+- Clippy exposed and fixed one current-stable lint; Vite 8 exposed a lazy-chunk contract regression, so the frontend target is being adjusted to Vite 7.3.6/plugin-react 5.2.0 before rerunning build.
+- Clippy now passes. The first incremental Vite 7 lock update omitted an optional WASI dependency, so npm correctly rejected it as non-reproducible; a clean lock resolution is in progress.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

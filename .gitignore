@@ -7,3 +7,6 @@
 .playwright-cli/
 logs/
 output/
+.env
+.env.*
+!.env.example

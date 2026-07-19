@@ -85,3 +85,35 @@ Remove the runtime Mock implementation and all demo data/accounts so the console
 | Generated real-facade patch was truncated around a very long source line and wrote an ellipsis marker into `api/index.ts` | 1 | Recover the affected backend adapter span from local build/cache artifacts, then use small apply_patch hunks only |
 | Browser wait for the generic login error title timed out after submitting the reported credentials | 1 | Inspect a fresh URL/DOM snapshot and browser logs before choosing a more specific assertion |
 | Completion helper initially reported 0/2 because the recovered plan used non-template `[completed]` markers | 1 | Added explicit template-compatible complete status to both task phase sections |
+
+## Current Task: Open-source Release and Container Audit
+
+### Goal
+
+Make the GitHub Actions and container build reproducible for deployment, fix confirmed release blockers, and produce an evidence-backed pre-open-source review.
+
+### Phases
+
+**Status:** in_progress
+
+- [completed] 1. Inventory repository metadata, GitHub Actions, Docker/Compose, and documented deployment contract
+- [completed] 2. Audit secrets, licenses, generated artifacts, dependencies, and release-facing configuration
+- [completed] 3. Fix confirmed CI, container, dependency, and open-source readiness issues
+- [in_progress] 4. Run local CI-equivalent checks and build/test the deployment image
+- [pending] 5. Rebuild, inspect the image, and deliver the remaining-risk checklist
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| Initial planning update could not match a historical mojibake line in `progress.md` | 1 | Retry with stable ASCII section-heading anchors and preserve all historical content |
+| `npm audit` failed with `ENOLOCK` because `web/package-lock.json` is absent | 1 | Treat as a confirmed CI blocker; generate a lockfile, then validate with a clean `npm ci` and audit |
+| npm mirror returned 404 for the security advisory endpoint | 1 | Re-ran the audit against `https://registry.npmjs.org` and obtained a valid report |
+| `rustsec/rustsec:latest` container image does not exist | 1 | Use the supported `cargo-audit` CLI instead of retrying the invalid image |
+| Initial `cargo audit` advisory-database fetch timed out and left no usable cache | 1 | Download the official advisory database archive separately, then run `cargo audit --no-fetch --db ...` |
+| npm lock regeneration rewrote the SheetJS CDN tarball to a nonexistent npm-registry path and timed out | 1 | Remove `replace-registry-host=always`; use the official registry for registry packages while preserving the explicit SheetJS CDN URL |
+| Hadolint invocation used unsupported PowerShell stdin redirection | 1 | Re-ran Hadolint by bind-mounting the Dockerfile read-only and obtained the actual warnings |
+| Workspace tests failed because a PostgreSQL source-contract test scanned only refactored facade files | 1 | Concatenate the facade and its included implementation files so the existing SQL invariants are checked where they now live |
+| Clippy on current stable rejected a nested `if let` with `collapsible_if` | 1 | Collapse the condition without changing validation behavior |
+| Vite 8 build passed compilation but failed the repository's lazy-viewer chunk contract because Rolldown merged the DOCX asset | 1 | Use the compatible patched Vite 7 line and React plugin 5.2, then regenerate the lockfile and rerun the build |
+| Incremental npm lock update omitted `@emnapi/wasi-threads`, so `npm ci` rejected package/lock drift | 1 | Remove the generated lock and ignored `node_modules`, then resolve from an empty dependency tree and verify with `npm ci` |

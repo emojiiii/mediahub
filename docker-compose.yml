@@ -1,12 +1,13 @@
 services:
   mediahub:
+    image: ${MEDIAHUB_IMAGE:-ghcr.io/emojiiii/mediahub:latest}
     build:
       context: .
     ports:
       - "3000:3000"
     environment:
       MEDIAHUB_BIND_ADDR: 0.0.0.0:3000
-      MEDIAHUB_DATABASE_URL: ${MEDIAHUB_DATABASE_URL:-postgres://${MEDIAHUB_POSTGRES_USER:-mediahub}:${MEDIAHUB_POSTGRES_PASSWORD:-mediahub-local-only}@postgres:5432/${MEDIAHUB_POSTGRES_DB:-mediahub}}
+      MEDIAHUB_DATABASE_URL: ${MEDIAHUB_DATABASE_URL:-postgres://${MEDIAHUB_POSTGRES_USER:-mediahub}:${MEDIAHUB_POSTGRES_PASSWORD:?set_a_postgres_password}@postgres:5432/${MEDIAHUB_POSTGRES_DB:-mediahub}}
       MEDIAHUB_STORAGE_BACKEND: ${MEDIAHUB_STORAGE_BACKEND:-local}
       MEDIAHUB_STORAGE_ROOT: /data/storage
       # S3-compatible storage is selected with MEDIAHUB_STORAGE_BACKEND=s3.
@@ -28,7 +29,7 @@ services:
       # Independent base64-encoded key used only to sign short-lived media URLs.
       MEDIAHUB_MEDIA_SIGNING_KEY: ${MEDIAHUB_MEDIA_SIGNING_KEY:?set_an_independent_32_byte_base64_media_signing_key}
       # Set to false after bootstrapping accounts to reject public registration.
-      MEDIAHUB_REGISTRATION_ENABLED: ${MEDIAHUB_REGISTRATION_ENABLED:-true}
+      MEDIAHUB_REGISTRATION_ENABLED: ${MEDIAHUB_REGISTRATION_ENABLED:-false}
       # Browser consoles call the API directly. Use an exact comma-separated
       # allowlist; keep it empty when the console is served from the API origin.
       MEDIAHUB_CORS_ALLOWED_ORIGINS: ${MEDIAHUB_CORS_ALLOWED_ORIGINS:-}
@@ -56,7 +57,7 @@ services:
     environment:
       POSTGRES_DB: ${MEDIAHUB_POSTGRES_DB:-mediahub}
       POSTGRES_USER: ${MEDIAHUB_POSTGRES_USER:-mediahub}
-      POSTGRES_PASSWORD: ${MEDIAHUB_POSTGRES_PASSWORD:-mediahub-local-only}
+      POSTGRES_PASSWORD: ${MEDIAHUB_POSTGRES_PASSWORD:?set_a_postgres_password}
     ports:
       - "127.0.0.1:${MEDIAHUB_POSTGRES_PORT:-5432}:5432"
     volumes:

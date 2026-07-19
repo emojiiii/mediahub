@@ -137,3 +137,79 @@
 - Playwright discovers the two real-backend workflows; they are credential-gated rather than coupled to removed demo seeds.
 - Running Playwright without `MEDIAHUB_E2E_*` credentials exits successfully with both destructive real-backend workflows skipped, as designed.
 - Final filesystem verification confirms `web/src/api/mock.ts` is absent and `web/src/api/index.ts` directly exports `backendApi`.
+
+## Open-source release and container audit
+
+### Requirements
+
+- Validate whether the checked-in GitHub Actions workflows build successfully and follow a deployable image publishing contract.
+- Build the deployment image locally and inspect the resulting runtime image.
+- Review the repository for security, licensing, documentation, packaging, and release-readiness issues before it is made public.
+- Fix issues that can be confirmed locally without inventing deployment-specific policy.
+
+### Initial inventory
+
+- The repository has one workflow, `.github/workflows/ci.yml`; it tests Rust and the web console but does not build or publish a container image.
+- CI uses PostgreSQL 17, stable Rust with rustfmt/clippy, Node.js 22, `npm ci`, OpenAPI drift checks, unit tests, production web build, libvips tests, and an all-feature Clippy pass.
+- The root `Dockerfile` builds only `mediahub-server` with a checksum-pinned libvips source tarball and runs as UID 10001 on Debian Bookworm slim.
+- The runtime image exposes port 3000 and persists `/data`; the separate Vite web console is not included in the image or Compose stack.
+- Compose requires access-key encryption, media-signing, and email-provider secrets at interpolation time, and persists both PostgreSQL and local object data in named volumes.
+- The workspace declares `license = "MIT"`, but the tracked repository has no root `LICENSE` file.
+- The repository currently has no `SECURITY.md`, contribution guide, code of conduct, issue templates, or dependency-update configuration.
+- Local Docker, Rust, Node.js, npm, and Git are available. `actionlint`, Gitleaks, Trivy, Syft, and Hadolint are not installed locally; containerized or downloaded equivalents may be used for read-only validation.
+- The worktree was clean before this audit and the Git remote is `https://github.com/emojiiii/mediahub.git`.
+
+### Documentation and metadata audit
+
+- `readme.md` still labels the project as being in a design phase and functions primarily as a long product specification rather than a public project entry point.
+- The README deployment configuration table contains stale generic names such as `STORAGE_BACKEND`, `SESSION_SECRET`, and `MASTER_KEY_V1`; the implementation and Compose file use `MEDIAHUB_*` names documented in `docs/runbook.md`.
+- The executable deployment instructions are in the English-only runbook and currently teach source builds (`docker compose up --build`), not pulling a published image.
+- The README intentionally documents the web console as a separate Cloudflare Pages/Vite deployment; an API-only container is therefore consistent with the stated architecture, but this must be explicit in the quick start.
+- Individual Cargo packages inherit the MIT declaration but generally omit `repository`, `homepage`, `documentation`, `readme`, and sometimes `description` metadata. The web package is private, which is appropriate for an application bundle.
+- A tracked-file secret-pattern scan found only Compose/CI development passwords and explicit test fixtures. The single-commit Git history contains no historically tracked `.env`, private-key, credential, or secret-named file.
+- Docker Desktop and Buildx are healthy and advertise both `linux/amd64` and `linux/arm64`, so local image and multi-platform build validation are possible.
+
+### Confirmed CI blocker
+
+- `web/package-lock.json` is absent, while the web CI job configures `actions/setup-node` with that exact cache dependency path and runs `npm ci`.
+- `npm audit --json` reproduced the underlying failure as `ENOLOCK`; a clean GitHub runner cannot install the web dependencies until a lockfile is committed.
+- The missing lockfile also makes dependency resolution non-reproducible and prevents reliable npm vulnerability review.
+
+### Dependency and secret scan
+
+- The generated lockfile initially embedded `registry.npmmirror.com` artifact URLs from the developer-machine npm configuration; a public lockfile should use the canonical npm registry.
+- Official npm audit reports 5 vulnerable packages: 4 high and 1 moderate. Vite/esbuild advisories have a supported major-version fix; `xlsx` has prototype-pollution and ReDoS advisories with no npm-registry automatic fix.
+- `@open-file-viewer/core` and `@open-file-viewer/react` inherit the `xlsx` advisory, and the project also imports `xlsx` directly for spreadsheet preview. Because uploaded files are untrusted input, this is a real residual risk rather than an unused transitive dependency.
+- Gitleaks scanned approximately 2.44 MB and reported one finding. The path/rule still needs to be inspected without exposing the matched value before deciding whether it is a real credential or a documented test placeholder.
+- `cargo-audit` and `cargo-deny` are not installed. The attempted `rustsec/rustsec:latest` container fallback is not a published image and failed before scanning.
+- The Gitleaks finding is the public example `MEDIAHUB_MEDIA_SIGNING_KEY` in `docs/runbook.md:10`, not a live credential. Replacing fixed example keys with documented random generation will avoid false alarms and teach safer deployment behavior.
+- The latest `@open-file-viewer` release (0.1.26) still depends on `xlsx ^0.18.5`; upgrading that package alone does not resolve the SheetJS advisories.
+- SheetJS publishes the patched `xlsx` 0.20.3 package from its official CDN, where the package metadata is reachable and declares Apache-2.0. npm `overrides` can force the viewer's transitive copy to this same direct dependency.
+- A compatible current frontend toolchain is available: Vite 8.1.5, `@vitejs/plugin-react` 6.0.3, Vitest 4.1.10, and `vite-plugin-static-copy` 4.1.1. All support Vite 8 and Node.js 22+; Vite specifically requires Node 22.12 or newer.
+
+### Container and Rust audit
+
+- Clean `npm ci` succeeds from the new canonical lockfile and official npm audit now reports zero vulnerabilities.
+- Actionlint accepts the existing GitHub Actions workflow.
+- Hadolint reports only unpinned Debian apt package versions and a missing `pipefail` shell for the checksum pipeline. The checksum pipeline warning is actionable; exact apt patch pinning conflicts with normal Bookworm security updates and will remain an explicitly accepted warning.
+- RustSec found two remotely triggerable denial-of-service advisories in `quick-xml 0.40.1`; MediaHub directly iterates checked attributes while parsing untrusted S3 XML, so these are reachable.
+- `object_store 0.14.1` updates its `quick-xml` requirement from 0.40.1 to patched 0.41.0. Updating both the workspace dependency and the Server's direct dependency will remove the vulnerable version.
+- RustSec also reports the unpatched `rsa 0.9.10` advisory from `Cargo.lock`, but `cargo tree --target all --invert rsa` finds no enabled path in any MediaHub target. Re-evaluate after updating the lockfile; this is not linked into the runtime as currently configured.
+- An existing API image proves the runtime volume defect: it runs as UID/GID 10001, `/data` is root-owned mode 0755, `/data/storage` is absent, and a write as the runtime user fails with `Permission denied`.
+- `LocalObjectStore::new` creates the configured root at process startup, so a fresh Docker volume prevents local-storage deployments from starting until the image creates and owns `/data/storage` before switching users.
+
+### Implemented release hardening
+
+- Added the missing npm lockfile, upgraded the Vite/Vitest toolchain, and forced direct/transitive SheetJS use to patched 0.20.3; clean install and npm audit both pass.
+- Updated `object_store` to 0.14.1 and direct `quick-xml` to 0.41.0; both reachable XML denial-of-service advisories are removed.
+- `rsa` remains only beneath the disabled `sqlx-mysql` package recorded by Cargo's lockfile resolver; neither `cargo tree --target all --invert rsa` nor the equivalent sqlx-mysql query finds an enabled target path.
+- The image now creates `/data/storage` as UID/GID 10001, provides an HTTP liveness health check, includes CA certificates/curl, enables `pipefail` for source checksum verification, and declares OCI source/license metadata.
+- Compose can pull `ghcr.io/emojiiii/mediahub:latest` while retaining a local build definition. PostgreSQL password is now required and public registration defaults to disabled.
+- Added a multi-architecture GHCR workflow with PR build-only behavior, branch/tag/SHA labels, BuildKit cache, provenance, and SBOM publication.
+- Added Dependabot coverage for Cargo, npm, GitHub Actions, and Docker; added MIT license, security policy, contribution guide, `.env.example`, and secret-safe ignore rules.
+- README and runbook now document published-image deployment, the API-only image boundary, secure random key generation, current environment names, and the separate web-console deployment.
+- Post-change Actionlint, Compose parsing, Hadolint (excluding intentional apt patch pinning), Gitleaks, and whitespace checks pass.
+- The first full workspace test run exposed a pre-existing CI failure: `data_plane_sql_keeps_native_types_locks_and_atomic_boundaries` searched only `media.rs` and `s3_multipart.rs`, but both are now include facades and the asserted SQL lives in their split implementation files.
+- The SQL invariants themselves remain present. Updating the test input to concatenate the facade plus all included implementation files restores the intended structural coverage without changing database behavior.
+- First post-upgrade Clippy run failed only on a current-stable `collapsible_if` lint in `async_job_error.rs`; the validation condition is being collapsed as suggested.
+- Vite 8's new Rolldown output omitted the expected `docx-preview` lazy asset and failed `verify-viewer-chunks.mjs`. Vite 7.3.6 remains above all audited Vite vulnerability ranges and preserves the existing Rollup chunk contract, so it is the safer compatibility target.

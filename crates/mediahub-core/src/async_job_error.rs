@@ -122,10 +122,10 @@ fn validate_persisted(value: &PersistedAsyncJob) -> AsyncJobResult<()> {
     if let Some(summary) = &value.error_summary {
         validate_error_summary(summary)?;
     }
-    if let Some(lease_token) = &value.lease_token {
-        if lease_token.is_empty() || lease_token.len() > MAX_ASYNC_JOB_IDEMPOTENCY_KEY_BYTES {
-            return Err(AsyncJobError::InvalidLeaseToken);
-        }
+    if let Some(lease_token) = &value.lease_token
+        && (lease_token.is_empty() || lease_token.len() > MAX_ASYNC_JOB_IDEMPOTENCY_KEY_BYTES)
+    {
+        return Err(AsyncJobError::InvalidLeaseToken);
     }
     Ok(())
 }

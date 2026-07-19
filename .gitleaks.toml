@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated and local runtime directories"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)web/node_modules/''',
+  '''(^|/)web/dist/''',
+  '''(^|/)data/''',
+  '''(^|/)logs/''',
+]
