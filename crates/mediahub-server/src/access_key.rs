@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    aead::{Aead, Generate, Key, KeyInit},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use thiserror::Error;
@@ -78,16 +78,15 @@ impl AccessKeyCipher {
     }
 
     pub fn encrypt(&self, secret: &[u8]) -> Result<String, AccessKeyCipherError> {
-        let mut nonce_bytes = [0_u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::generate();
         let ciphertext = self
             .ciphers
             .get(&self.active_version)
             .expect("active cipher is validated during construction")
-            .encrypt(Nonce::from_slice(&nonce_bytes), secret)
+            .encrypt(&nonce, secret)
             .map_err(|_| AccessKeyCipherError::EncryptionFailed)?;
         let mut encoded = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
-        encoded.extend_from_slice(&nonce_bytes);
+        encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
         Ok(URL_SAFE_NO_PAD.encode(encoded))
     }
@@ -107,17 +106,16 @@ impl AccessKeyCipher {
         let (nonce, ciphertext) = encoded
             .split_at_checked(NONCE_BYTES)
             .ok_or(AccessKeyCipherError::InvalidCiphertext)?;
+        let nonce = Nonce::try_from(nonce).map_err(|_| AccessKeyCipherError::InvalidCiphertext)?;
         cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| AccessKeyCipherError::DecryptionFailed)
     }
 }
 
 #[must_use]
 pub fn generate_secret() -> String {
-    let mut bytes = [0_u8; KEY_BYTES];
-    OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+    URL_SAFE_NO_PAD.encode(Key::<Aes256Gcm>::generate())
 }
 
 #[cfg(test)]

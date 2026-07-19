@@ -229,3 +229,43 @@
 - The SQL invariants themselves remain present. Updating the test input to concatenate the facade plus all included implementation files restores the intended structural coverage without changing database behavior.
 - First post-upgrade Clippy run failed only on a current-stable `collapsible_if` lint in `async_job_error.rs`; the validation condition is being collapsed as suggested.
 - Vite 8's new Rolldown output omitted the expected `docx-preview` lazy asset and failed `verify-viewer-chunks.mjs`. Vite 7.3.6 remains above all audited Vite vulnerability ranges and preserves the existing Rollup chunk contract, so it is the safer compatibility target.
+
+## Latest dependency upgrade
+
+### Requirements
+
+- Upgrade all direct dependencies where the latest release is compatible after reasonable migration work, with Web UI as the highest priority.
+- Use pnpm and keep Cloudflare as the Web build owner; do not reintroduce Web jobs into GitHub Actions.
+- Treat latest-major upgrades as migrations that require tests, not automatic version substitutions.
+- Record explicit technical reasons for any package that must remain below latest.
+
+### Initial inventory
+
+- The pnpm lock already resolves many caret-ranged Web packages to current releases, but the manifest still advertises older minimums. Latest-major migrations are required for resolvers 5, React Router 7, Zod 4, Vite 8/plugin-react 6, jsdom 29, TypeScript 7, Lucide 1, and openapi-fetch 0.17.
+- Current Web latest versions reported by the official registry include Vite 8.1.5, TypeScript 7.0.2, React Router 7.18.1, Zod 4.4.3, Lucide React 1.25.0, jsdom 29.1.1, and `@hookform/resolvers` 5.4.0.
+- Cargo can immediately update 38 compatible locked packages on Rust 1.97. Direct major candidates include aes-gcm 0.11, AWS credential/signature crates, hmac 0.13, password-hash 0.6, rand 0.10, reqwest 0.13, sha2 0.11, sqlx 0.9, and tower-http 0.7.
+- The production Docker builder is pinned to Rust 1.88 while the current stable toolchain used locally is Rust 1.97.0.
+- GitHub Actions also have new majors available for the Docker setup/login/metadata/build actions. These need workflow schema validation after upgrading.
+
+### Direct dependency matrix
+
+- Cargo's non-aggressive direct scan confirms compatible updates for serde 1.0.229, thiserror 2.0.19, uuid 1.24.0, futures 0.3.33, AWS credential types 1.3.0, AWS SigV4 1.5.1, and md-5 0.11.0. An aggressive scan is still required for every cross-major candidate.
+- Latest official Actions tags are checkout 7.0.0, setup-qemu 4.2.0, setup-buildx 4.2.0, login 4.4.0, metadata 6.2.0, build-push 7.3.0, and rust-cache 2.9.1.
+- The Action versions seen in the screenshot are therefore real current majors rather than Dependabot noise; they can be upgraded together and validated with Actionlint.
+- pnpm 11 no longer reads `pnpm.overrides` from package.json and strictly checks the declared package-manager version. The SheetJS security override must move to `web/pnpm-workspace.yaml` before upgrading.
+- pnpm 11's first latest update was blocked by supply-chain verification: open-file-viewer 0.1.26 and postcss 8.5.20 were less than 24 hours old, while the external SheetJS 0.20.3 tarball lacked a registry-style integrity entry. No compatibility conclusion can be drawn until the policy is handled explicitly.
+- After adding exact release-age/provenance exceptions, pnpm 11 next rejected the fixed SheetJS URL override because `blockExoticSubdeps` forbids URL dependencies below the root. A package-scoped exception is preferable to disabling this policy globally.
+- The latest `openapi-typescript` release is 7.13.0 and has no newer preview line; it declares TypeScript `^5.x`. TypeScript 7.0.2 is genuinely incompatible: client generation crashes because `ts.factory` is unavailable through the API shape expected by openapi-typescript.
+- The latest compatible TypeScript is 5.9.3, so this is a required compatibility exception rather than an overlooked update.
+- The upgraded Web test suite passes: 26 files and 128 tests under pnpm 11.15.0.
+- React Router 7 removes the `BrowserRouter.future` prop used to opt into v7 behavior on React Router 6; removing the prop preserves the now-default semantics.
+- Vite 8.1.5 successfully compiles the application, but Rolldown 1.1.5 automatically merges the statically imported `docx-preview` dependency into `ObjectFileViewer`. Rolldown's supported `output.codeSplitting.groups` API can preserve the named lazy chunk without reverting Vite.
+- After explicit splitting, Vite 8 lists the DOCX chunk in the main chunk's `__vite__mapDeps` table so it can preload it when the lazy `ObjectFileViewer` import is requested. This is not a top-level import and does not load the DOCX code on the initial page.
+- `vite-plugin-static-copy` 4.1.1 always preserves matched directory structure unless `rename.stripBase` is enabled. Without migration, PDF.js assets land under `pdfjs/*/node_modules/pdfjs-dist/...` and runtime CMap/font URLs break.
+- Official npm audit found five lodash advisories through `open-file-viewer -> mammoth -> argparse@1 -> lodash@3`. Mammoth 1.12.0 does not import argparse anywhere in its JS; it is a stale CLI dependency. Overriding it to latest argparse 3.0.0 removes lodash without changing the browser conversion path.
+- After the argparse override, pnpm resolves one argparse 3.0.0 copy for both Mammoth and OpenAPI tooling; lodash is absent, peer checks pass, and official npm audit reports zero known vulnerabilities.
+- Stable argon2 0.5.3 still depends on password-hash 0.5. The direct password-hash declaration enables `getrandom` on that same dependency; upgrading it alone to 0.6 would create an unused second type universe and would not upgrade password verification.
+- After the Rust migrations, both regular and aggressive cargo-outdated scans report no outdated workspace root dependencies. Libvips 8.18.4 remains the newest stable upstream tag.
+- The only Web direct dependency behind `latest` is TypeScript 5.9.3; TypeScript 7.0.2 cannot be used until openapi-typescript publishes compatible support.
+- The only Rust direct declaration intentionally below its crate's newest stable major is password-hash 0.5.0, because stable argon2 0.5.3 exposes that exact type line and uses the direct declaration's `getrandom` feature.
+- The Rust 1.97.0 deployment image builds successfully on Linux with libvips 8.18.4. Runtime smoke confirms UID 10001, writable storage, healthy HTTP response, and resolved `libvips.so.42` with no missing libraries.

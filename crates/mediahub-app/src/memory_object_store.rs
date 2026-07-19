@@ -319,7 +319,7 @@ impl UploadSessionStorage for InMemoryObjectStore {
             size: u64::try_from(object.content.len())
                 .map_err(|_| ObjectStoreError::Unavailable("object exceeds u64 size".to_owned()))?,
             mime: object.content_type.clone(),
-            sha256: format!("{:x}", Sha256::digest(&object.content)),
+            sha256: hex::encode(Sha256::digest(&object.content)),
         })
     }
 

@@ -23,7 +23,7 @@ async fn consume_one_time_token(
 
 async fn find_application(
     pool: &sqlx::PgPool,
-    query: &str,
+    query: &'static str,
     user_id: Uuid,
 ) -> Result<Option<ApplicationSummary>, RepositoryError> {
     let row = sqlx::query(query)

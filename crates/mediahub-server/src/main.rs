@@ -28,7 +28,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{StreamExt, stream};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 #[cfg(not(all(feature = "docker-libvips", target_os = "linux")))]
 use mediahub_adapter_image::RustImageProcessor as RuntimeImageProcessor;
 #[cfg(all(feature = "docker-libvips", target_os = "linux"))]

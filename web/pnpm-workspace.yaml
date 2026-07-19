@@ -1,0 +1,17 @@
+packages:
+  - .
+
+overrides:
+  argparse: 3.0.0
+  xlsx: https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz
+
+# Patched SheetJS releases are published from the vendor CDN, not npm.
+blockExoticSubdeps: false
+
+minimumReleaseAgeExclude:
+  - "@open-file-viewer/core@0.1.26"
+  - "@open-file-viewer/react@0.1.26"
+  - "postcss@8.5.20"
+
+trustPolicyExclude:
+  - "xlsx@0.20.3"

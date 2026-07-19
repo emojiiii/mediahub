@@ -100,6 +100,41 @@
 - Built `mediahub:open-source-audit`; verified non-root storage writes, shared libraries, OCI metadata, live/readiness HTTP 200, and Docker healthy state.
 - Removed the temporary API/PostgreSQL audit containers and retained the local image.
 
+## Latest dependency upgrade
+
+- Started from clean commit `8c834ed` on 2026-07-19.
+- Began direct dependency inventory for pnpm Web, Cargo workspace, Actions, and Docker build images.
+- Captured the Web major-upgrade set and Cargo's compatible lockfile updates; `cargo-outdated` is being installed for the full direct-major matrix.
+- Installed cargo-outdated 0.19.0 and captured direct Cargo plus official Actions latest-version matrices.
+- Began pnpm 11 migration; moved the xlsx override to the pnpm 11 workspace configuration.
+- First pnpm 11 latest update was stopped by release-age/integrity policy before dependency compatibility tests; policy configuration is being inspected.
+- Exact pnpm policy exceptions passed the first checks, but the xlsx transitive URL override hit `blockExoticSubdeps`; investigating scoped configuration.
+- Completed the pnpm 11 latest resolution after adding the required SheetJS policy exception; `pnpm outdated` reports no remaining Web updates.
+- Ran the upgraded Web test suite: 26 files and 128 tests passed.
+- Confirmed TypeScript 7.0.2 breaks `openapi-typescript` 7.13.0 at runtime; selected TypeScript 5.9.3 as the latest compatible release.
+- Removed obsolete React Router 6 future flags after the React Router 7 type check rejected them.
+- Added a Vite 8/Rolldown code-splitting group for `docx-preview` to restore the viewer lazy-loading contract.
+- Updated the viewer-chunk verifier to distinguish Vite 8 lazy preload metadata from actual static imports while retaining the initial HTML and import-chain checks.
+- Migrated PDF.js static-copy targets to the v4 flattening option so the existing public asset URLs are preserved.
+- Production Web build now passes on Vite 8.1.5 with all lazy-viewer and local PDF asset checks.
+- Official npm audit exposed a stale Mammoth CLI dependency on vulnerable lodash 3; added a pnpm override to latest argparse 3.0.0 to remove that chain.
+- Final upgraded Web verification passed: no peer issues, 26 test files/128 tests, production build/lazy asset contract, and zero official npm audit findings.
+- Updated Cargo's compatible lock set and raised workspace/direct manifest floors to the latest same-major releases, including the previously exact-pinned AWS crates.
+- Began the crypto-major migration with aes-gcm 0.11, hmac 0.13, sha2 0.11, and md-5 0.11; password-hash remains on the latest line compatible with stable argon2.
+- Migrated SHA-256 string formatting to explicit hex encoding for digest 0.11.
+- Migrated aes-gcm 0.11 to generated typed nonces/keys and checked nonce conversion; imported hmac 0.13's explicit `KeyInit` trait.
+- Updated rand to 0.10.2; the project's `rand::random` API remains compatible.
+- Updated reqwest to 0.13.4 and migrated its renamed rustls feature, allowing Cargo to remove the direct reqwest 0.12 copy.
+- Updated tower-http to 0.7.0 for the existing CORS, request-id, and trace layers.
+- Began the SQLx 0.9.0 database API migration.
+- Updated the shared PostgreSQL query helper to accept static SQL text as required by SQLx 0.9.
+- Updated the Docker builder to Rust 1.97.0 and all GitHub Actions to their latest verified formal tags; the workflow remains backend-only.
+- Actionlint and Hadolint passed for the upgraded backend-only workflow and Dockerfile.
+- Full PostgreSQL-backed workspace tests passed; the external real-S3 test remained the single expected ignored test.
+- CI feature checks and Clippy with all targets/features passed.
+- RustSec scanned 360 lockfile dependencies against 1,166 official advisories with zero vulnerabilities.
+- Built `mediahub:dependency-upgrade` successfully and verified its non-root writable runtime, health endpoint, OCI metadata, and libvips linkage.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

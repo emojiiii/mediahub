@@ -7,9 +7,9 @@ description = "S3-compatible object storage adapter for MediaHub"
 
 [dependencies]
 async-trait.workspace = true
-aws-credential-types = "=1.2.8"
-aws-sigv4 = { version = "=1.3.6", default-features = false, features = ["http1", "sign-http"] }
-futures-util = "0.3"
+aws-credential-types = "=1.3.0"
+aws-sigv4 = { version = "=1.5.1", default-features = false, features = ["http1", "sign-http"] }
+futures-util = "0.3.33"
 hex.workspace = true
 http.workspace = true
 mediahub-app = { path = "../mediahub-app" }

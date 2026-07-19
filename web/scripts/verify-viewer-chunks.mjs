@@ -21,6 +21,12 @@ function forbidReference(content, asset, owner) {
   if (content.includes(asset)) throw new Error(`${owner} eagerly references ${asset}`)
 }
 
+function forbidStaticImport(content, asset, owner) {
+  const escapedAsset = asset.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const staticImport = new RegExp(`(?:from|import)\\s*["'][^"']*${escapedAsset}["']`)
+  if (staticImport.test(content)) throw new Error(`${owner} statically imports ${asset}`)
+}
+
 const html = await readFile(path.join(distRoot, 'index.html'), 'utf8')
 const mainMatch = html.match(/<script[^>]+src="\/assets\/([^"?]+\.js)"/)
 if (!mainMatch) throw new Error('Unable to resolve the main JavaScript asset from index.html')
@@ -81,7 +87,9 @@ const deepViewerAssets = [
 ]
 for (const asset of deepViewerAssets) {
   forbidReference(html, asset, 'index.html')
-  forbidReference(main, asset, mainAsset)
+  // Vite 8 stores lazy dependency URLs in the main chunk's __vite__mapDeps table.
+  // Only a top-level static import would make one of these assets eager.
+  forbidStaticImport(main, asset, mainAsset)
 }
 
 requireReference(objectViewer, archivePluginAsset, objectViewerAsset)

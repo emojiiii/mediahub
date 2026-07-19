@@ -21,6 +21,11 @@ Improve structure across the Rust workspace without changing behavior. Reduce ov
 
 | Error | Attempt | Resolution |
 | --- | --- | --- |
+| `cargo outdated` is not installed | 1 | Install the current locked `cargo-outdated` CLI, then inventory direct major upgrades |
+| Action tag parser rejected one-segment tags such as `v1` as `System.Version` | 1 | Ignore one-segment aliases; use the highest complete semantic tag returned for each official action repository |
+| pnpm 11 rejected the pnpm 10 project declaration and ignored package.json overrides | 1 | Update `packageManager` to 11.15.0 and move the xlsx override to `pnpm-workspace.yaml` before resolving dependencies |
+| pnpm 11 supply-chain policy rejected newly published packages and the external SheetJS tarball | 1 | Inspect pnpm 11 policy settings and add the narrowest explicit exceptions required by the user-requested latest versions and verified SheetJS source |
+| pnpm 11 blocked the SheetJS URL override as an exotic transitive dependency | 1 | Check for a package-scoped `blockExoticSubdeps` exclusion before considering an explicit project-level opt-out |
 | Session catch-up script rejected by Windows sandbox ACL | 1 | Recovered context from current workspace and git status |
 | First sibling-module split produced private-item errors | 1 | Reworked handlers into crate-level included implementation files; kept only bootstrap/workers as true modules |
 | Mechanical extraction left orphaned attributes and duplicate entrypoint declarations | 1 | Corrected file boundaries and rebuilt main.rs tail |
@@ -121,3 +126,40 @@ The GitHub workflows cover backend crates and the API/worker image only. Cloudfl
 | Incremental npm lock update omitted `@emnapi/wasi-threads`, so `npm ci` rejected package/lock drift | 1 | Remove the generated lock and ignored `node_modules`, then resolve from an empty dependency tree and verify with `npm ci` |
 | First runtime image check used a database populated by tests with an empty anonymous storage volume | 1 | Confirmed the consistency guard was correct; created a fresh isolated database and reran the image successfully |
 | Empty PostgreSQL existence query returned PowerShell `$null` and `.Trim()` failed | 1 | Use null-safe string matching before creating the isolated image-audit database |
+
+## Current Task: Latest Dependency Upgrade
+
+### Goal
+
+Upgrade direct Web, Rust, GitHub Actions, and build-image dependencies to their latest viable releases, migrate breaking APIs, and prove compatibility with full tests and production builds.
+
+### Phases
+
+**Status:** complete
+
+- [completed] 1. Inventory every outdated direct dependency and classify breaking upgrades
+- [completed] 2. Upgrade the pnpm Web workspace and restore all UI/build contracts
+- [completed] 3. Upgrade Rust, GitHub Actions, and Docker build dependencies
+- [completed] 4. Run full Web and backend verification, security audits, and image checks
+- [completed] 5. Document any dependency that cannot safely move to latest
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| PowerShell parsed a quoted `rg` pattern incorrectly during a read-only source scan | 1 | Re-ran the scan with a single-quoted literal pattern |
+| `openapi-typescript` crashed under TypeScript 7 while generating the client | 1 | Confirmed the latest 7.13.0 release requires TypeScript `^5.x`; retain latest compatible TypeScript 5.9.3 |
+| React Router 7 rejected the obsolete `BrowserRouter.future` migration flags | 1 | Remove the flags because their v7 behavior is now the default |
+| Vite 8/Rolldown merged `docx-preview` into the lazy object-viewer chunk | 1 | Add an explicit Rolldown code-splitting group that preserves the existing DOCX lazy-load contract |
+| `vite-plugin-static-copy` 4 preserved the full source path for PDF.js support files | 1 | Enable `rename.stripBase` for CMaps and standard fonts so their public URLs remain stable |
+| The configured npm mirror does not implement the audit API | 1 | Run pnpm audit explicitly against the official npm registry |
+| Latest open-file-viewer pulled a vulnerable lodash 3 through an unused Mammoth CLI dependency | 1 | Override the unused argparse 1 dependency to latest 3.0.0, which removes lodash, then re-run tests/build/audit |
+| digest 0.11 removed `LowerHex` from digest output arrays | 1 | Encode the seven SHA-256 outputs explicitly with the existing `hex` dependency |
+| The local adapter did not previously depend on `hex` | 1 | Add the workspace `hex` dependency used by the digest 0.11 migration |
+| An explicit rand 0.9 lockfile update target no longer existed after resolution | 1 | Confirmed Cargo had already converged the direct dependency on rand 0.10.2; workspace check passed |
+| SQLx 0.9 requires the reusable query helper's SQL text to outlive its async query | 1 | Tighten the helper parameter to `&'static str`; its only caller passes a SQL literal |
+| Docker Hub manifest lookup timed out before returning Rust image metadata | 1 | Keep the verified stable Rust 1.97.0 target and validate the tag through the actual deployment-image build |
+| Online cargo-audit database refresh timed out and left an incomplete cache | 1 | Download the official RustSec database archive and audit the lockfile with `--no-fetch --db` |
+| First runtime smoke test skipped database creation due PowerShell empty-output truthiness | 1 | Explicitly create and verify the isolated runtime database before restarting the image |
+| The first `ldd` filter lost shell quoting after Docker argument forwarding | 1 | Run `ldd` directly as the container entrypoint and filter its output in PowerShell |
+| Hadolint's cached image had no entrypoint | 1 | Invoke its declared `/bin/hadolint` command explicitly |

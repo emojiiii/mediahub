@@ -125,7 +125,7 @@ async fn s3_upload_part(
         .max_object_size()
         .unwrap_or(MAX_UPLOAD_OBJECT_BYTES)
         .min(MAX_UPLOAD_OBJECT_BYTES);
-    let sha256 = format!("{:x}", Sha256::digest(&content));
+    let sha256 = hex::encode(Sha256::digest(&content));
     let etag = format!("\"{sha256}\"");
     let storage_key = new_multipart_part_storage_key(upload_id, part_number);
     state

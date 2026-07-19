@@ -548,7 +548,7 @@ impl ObjectStore for S3ObjectStore {
         }
         Ok(ComposedObject {
             size,
-            sha256: format!("{:x}", digest.finalize()),
+            sha256: hex::encode(digest.finalize()),
         })
     }
 

@@ -1,6 +1,6 @@
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore},
+    aead::{Aead, Generate, KeyInit, Payload},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use thiserror::Error;
@@ -179,13 +179,12 @@ impl ContinuationTokenCodec {
         if internal_cursor.is_empty() || internal_cursor.len() > MAX_INTERNAL_CURSOR_BYTES {
             return Err(S3ListError::InvalidInternalCursor);
         }
-        let mut nonce_bytes = [0_u8; TOKEN_NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::generate();
         let aad = token_aad(bucket, query)?;
         let ciphertext = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &nonce,
                 Payload {
                     msg: internal_cursor.as_bytes(),
                     aad: &aad,
@@ -194,7 +193,7 @@ impl ContinuationTokenCodec {
             .map_err(|_| S3ListError::TokenEncodingFailed)?;
         let mut bytes = Vec::with_capacity(1 + TOKEN_NONCE_BYTES + ciphertext.len());
         bytes.push(TOKEN_VERSION);
-        bytes.extend_from_slice(&nonce_bytes);
+        bytes.extend_from_slice(&nonce);
         bytes.extend_from_slice(&ciphertext);
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
@@ -218,11 +217,12 @@ impl ContinuationTokenCodec {
         }
         let nonce = &bytes[1..1 + TOKEN_NONCE_BYTES];
         let ciphertext = &bytes[1 + TOKEN_NONCE_BYTES..];
+        let nonce = Nonce::try_from(nonce).map_err(|_| S3ListError::InvalidContinuationToken)?;
         let aad = token_aad(bucket, query)?;
         let cursor = self
             .cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                &nonce,
                 Payload {
                     msg: ciphertext,
                     aad: &aad,

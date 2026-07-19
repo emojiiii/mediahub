@@ -586,7 +586,7 @@ mod tests {
         let completion = CompleteUploadSessionRequest {
             application_id,
             upload_session_id: receipt.session.id(),
-            sha256: format!("{:x}", Sha256::digest(content)),
+            sha256: hex::encode(Sha256::digest(content)),
         };
         let first = block_on(service.complete(&completion)).expect("first completion");
         let second = block_on(service.complete(&completion)).expect("replayed completion");

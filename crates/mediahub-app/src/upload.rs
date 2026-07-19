@@ -452,7 +452,7 @@ where
         now: OffsetDateTime,
     ) -> Result<Media, ApplicationError> {
         let digest = Sha256::digest(&request.content);
-        let sha256 = format!("{digest:x}");
+        let sha256 = hex::encode(digest);
         let system_metadata = SystemMetadata::new(&request.mime, size, None, None, None, sha256)?;
         Ok(Media::new(
             NewMedia {

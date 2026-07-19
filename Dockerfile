@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.97.0-bookworm AS builder
 ARG LIBVIPS_VERSION=8.18.4
 ARG LIBVIPS_SHA256=1e8d2228a4ffae7498e357dcddb3775440afa7b11726841cd511674dced84257
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

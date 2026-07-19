@@ -303,7 +303,7 @@ impl LocalObjectStore {
             Self::write_new(&metadata_path, content_type.as_bytes())?;
             Ok(ComposedObject {
                 size,
-                sha256: format!("{:x}", digest.finalize()),
+                sha256: hex::encode(digest.finalize()),
             })
         })();
         if result.is_err() {
@@ -340,7 +340,7 @@ impl LocalObjectStore {
                 .ok_or_else(|| ObjectStoreError::Unavailable("object exceeds u64 size".into()))?;
             digest.update(&buffer[..read]);
         }
-        Ok((size, format!("{:x}", digest.finalize())))
+        Ok((size, hex::encode(digest.finalize())))
     }
 
     fn content_type_for(&self, key: &str) -> Result<Option<String>, ObjectStoreError> {
