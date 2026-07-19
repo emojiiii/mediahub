@@ -47,7 +47,7 @@ subtle = "2.6.1"
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["serde", "serde-human-readable"] }
 tokio = { version = "1.45.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6.6", features = ["cors", "request-id", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "request-id", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 url = "2.5.4"
