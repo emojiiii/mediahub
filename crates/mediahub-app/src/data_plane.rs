@@ -1,4 +1,8 @@
+use std::fmt;
+
 use mediahub_core::{ApplicationId, BucketId, Media, MediaId, MediaState, OffsetDateTime};
+
+use crate::Redacted;
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaListQuery {
@@ -67,7 +71,12 @@ pub struct S3MediaPage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IdempotencyClaim {
-    Claimed,
+    /// The caller owns this claim until it is completed or released.
+    ///
+    /// The token is an opaque fencing value. It must be carried in the
+    /// [`IdempotencyContext`] passed to completion/release operations so an
+    /// expired request cannot mutate a newer claim for the same key.
+    Claimed(String),
     InProgress,
     Completed(CompletedIdempotencyResponse),
     Conflict,
@@ -80,12 +89,26 @@ pub struct CompletedIdempotencyResponse {
     pub resource_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdempotencyContext {
     pub application_id: ApplicationId,
     pub operation_scope: String,
     pub key: String,
     pub request_hash: String,
+    pub claim_token: String,
+}
+
+impl fmt::Debug for IdempotencyContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdempotencyContext")
+            .field("application_id", &self.application_id)
+            .field("operation_scope", &self.operation_scope)
+            .field("key", &Redacted(&self.key))
+            .field("request_hash", &Redacted(&self.request_hash))
+            .field("claim_token", &Redacted(&self.claim_token))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

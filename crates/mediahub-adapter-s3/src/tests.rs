@@ -10,7 +10,7 @@
     };
 
     use async_trait::async_trait;
-    use futures_util::stream::BoxStream;
+    use futures_util::{StreamExt as _, stream::BoxStream};
     use mediahub_app::{ObjectStoreError, UploadSessionStorage};
     use mediahub_core::{
         ApplicationId, BucketId, ClientMetadata, MediaId, NewUploadSession, OffsetDateTime,
@@ -22,6 +22,7 @@
         PutOptions, PutPayload, PutResult, RenameOptions, Result as BackendResult,
         aws::AmazonS3Builder, memory::InMemory, path::Path,
     };
+    use sha2::{Digest, Sha256};
 
     use super::{
         AwsPresignedPutSigner, COMMIT_COMPARE_CHUNK_SIZE, PresignedPutSigner, S3ObjectStore,
@@ -49,8 +50,15 @@
     struct CommitProbeStore {
         inner: InMemory,
         copy_calls: AtomicUsize,
+        fail_delete_calls: AtomicUsize,
         full_get_calls: AtomicUsize,
         range_get_calls: AtomicUsize,
+    }
+
+    impl CommitProbeStore {
+        fn fail_next_delete(&self) {
+            self.fail_delete_calls.store(1, Ordering::Relaxed);
+        }
     }
 
     impl fmt::Display for CommitProbeStore {
@@ -95,6 +103,17 @@
             &self,
             locations: BoxStream<'static, BackendResult<Path>>,
         ) -> BoxStream<'static, BackendResult<Path>> {
+            if self.fail_delete_calls.swap(0, Ordering::Relaxed) != 0 {
+                return locations
+                    .map(|location| match location {
+                        Ok(_) => Err(object_store::Error::Generic {
+                            store: "commit probe",
+                            source: Box::new(std::io::Error::other("injected delete failure")),
+                        }),
+                        Err(error) => Err(error),
+                    })
+                    .boxed();
+            }
             self.inner.delete_stream(locations)
         }
 
@@ -173,7 +192,7 @@
         );
         assert_eq!(
             query_parameter(&signed, "X-Amz-SignedHeaders"),
-            Some("content-length%3Bcontent-type%3Bhost")
+            Some("content-length%3Bcontent-type%3Bhost%3Bif-none-match")
         );
         assert_ne!(
             query_parameter(&signed, "X-Amz-Signature"),
@@ -209,7 +228,8 @@
             .expect("prepared upload");
         assert_eq!(prepared.target.headers["content-length"], "5");
         assert_eq!(prepared.target.headers["content-type"], "text/plain");
-        assert!(prepared.target.url.contains("tenant/objects/"));
+        assert_eq!(prepared.target.headers["if-none-match"], "*");
+        assert!(prepared.target.url.contains("tenant/temporary/uploads/"));
 
         let mut attributes = Attributes::new();
         attributes.insert(Attribute::ContentType, "text/plain".into());
@@ -240,11 +260,99 @@
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
 
+        let final_upload_key = format!("objects/{media_id}");
+        store
+            .finalize_upload(&session, &final_upload_key)
+            .await
+            .expect("finalize verified upload");
+        assert_eq!(
+            mediahub_app::ObjectStore::read(&store, &final_upload_key)
+                .await
+                .expect("read finalized upload"),
+            b"hello"
+        );
+        assert_eq!(
+            store.inspect_upload(&session).await.expect("inspect finalized upload").sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+
         store.abort_upload(&session).await.expect("first abort");
         store.abort_upload(&session).await.expect("repeated abort");
+        assert!(
+            !mediahub_app::ObjectStore::exists(&store, &final_upload_key)
+                .await
+                .expect("finalized upload cleanup")
+        );
         assert_eq!(
             store.inspect_upload(&session).await,
             Err(ObjectStoreError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_upload_cleanup_removes_temporary_but_preserves_final_object() {
+        let backend = Arc::new(InMemory::new());
+        let store = S3ObjectStore::from_parts(
+            backend.clone(),
+            Some("tenant"),
+            Some(Arc::new(StubSigner)),
+        )
+        .expect("test store");
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + std::time::Duration::from_secs(600);
+        let upload_session_id = UploadSessionId::new();
+        let media_id = MediaId::new();
+        let prepared = store
+            .prepare_upload(upload_session_id, media_id, 5, "text/plain", expires_at)
+            .await
+            .expect("prepared upload");
+        let temporary_key = prepared.storage_key.clone();
+
+        let mut attributes = Attributes::new();
+        attributes.insert(Attribute::ContentType, "text/plain".into());
+        BackendObjectStore::put_opts(
+            backend.as_ref(),
+            &Path::from(format!("tenant/{temporary_key}")),
+            b"hello".to_vec().into(),
+            PutOptions::from(attributes),
+        )
+        .await
+        .expect("simulated direct PUT");
+        let mut session = upload_session(
+            upload_session_id,
+            media_id,
+            prepared.storage_key,
+            expires_at,
+            now,
+        );
+        let final_key = format!("objects/{media_id}");
+        store
+            .finalize_upload(&session, &final_key)
+            .await
+            .expect("finalize upload");
+        session
+            .complete(now + std::time::Duration::from_secs(1))
+            .expect("complete session");
+
+        store
+            .abort_upload(&session)
+            .await
+            .expect("clean completed upload");
+        store
+            .abort_upload(&session)
+            .await
+            .expect("repeat completed cleanup");
+
+        assert!(
+            !mediahub_app::ObjectStore::exists(&store, &temporary_key)
+                .await
+                .expect("temporary existence")
+        );
+        assert_eq!(
+            mediahub_app::ObjectStore::read(&store, &final_key)
+                .await
+                .expect("final object survives cleanup"),
+            b"hello"
         );
     }
 
@@ -279,6 +387,10 @@
         assert_eq!(
             metadata.content_type.as_deref(),
             Some("application/octet-stream")
+        );
+        assert_eq!(
+            metadata.checksum_sha256,
+            Some(hex::encode(Sha256::digest(&content)))
         );
 
         mediahub_app::ObjectStore::put_temporary(
@@ -329,6 +441,93 @@
             .await
             .expect("committed bytes");
         assert_eq!(stored.as_ref(), content);
+    }
+
+    #[tokio::test]
+    async fn promotion_cleanup_failure_keeps_final_and_retries_temporary_deletion() {
+        let backend = Arc::new(CommitProbeStore::default());
+        let store = S3ObjectStore::from_backend(backend.clone(), Some("tenant"))
+            .expect("test object store");
+        let temporary_key = "temporary/cleanup-retry";
+        let final_key = "objects/cleanup-retry";
+        let content = b"durable promotion";
+        mediahub_app::ObjectStore::put_temporary(
+            &store,
+            temporary_key,
+            content,
+            "text/plain",
+        )
+        .await
+        .expect("temporary write");
+
+        backend.fail_next_delete();
+        assert!(matches!(
+            mediahub_app::ObjectStore::commit_temporary(&store, temporary_key, final_key).await,
+            Err(ObjectStoreError::Unavailable(_))
+        ));
+        let promoted = backend
+            .inner
+            .get(&Path::from("tenant/objects/cleanup-retry"))
+            .await
+            .expect("promoted final survives cleanup failure")
+            .bytes()
+            .await
+            .expect("promoted final bytes");
+        assert_eq!(promoted.as_ref(), content);
+        assert!(
+            mediahub_app::ObjectStore::exists(&store, temporary_key)
+                .await
+                .expect("temporary remains retryable")
+        );
+
+        mediahub_app::ObjectStore::commit_temporary(&store, temporary_key, final_key)
+            .await
+            .expect("retry removes temporary");
+        assert!(
+            !mediahub_app::ObjectStore::exists(&store, temporary_key)
+                .await
+                .expect("temporary cleaned")
+        );
+        assert_eq!(
+            mediahub_app::ObjectStore::checksum_sha256(&store, final_key)
+                .await
+                .expect("final checksum"),
+            hex::encode(Sha256::digest(content))
+        );
+        assert_eq!(backend.full_get_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn checksum_sha256_streams_when_metadata_is_missing() {
+        let backend = Arc::new(InMemory::new());
+        let store = S3ObjectStore::from_backend(backend.clone(), Some("tenant"))
+            .expect("test object store");
+        let key = "objects/checksum-fallback";
+        let content = b"checksum fallback content";
+        let mut attributes = Attributes::new();
+        attributes.insert(Attribute::ContentType, "text/plain".into());
+        BackendObjectStore::put_opts(
+            backend.as_ref(),
+            &Path::from(format!("tenant/{key}")),
+            content.to_vec().into(),
+            PutOptions::from(attributes),
+        )
+        .await
+        .expect("raw object without checksum metadata");
+
+        assert_eq!(
+            mediahub_app::ObjectStore::head(&store, key)
+                .await
+                .expect("head object")
+                .checksum_sha256,
+            None
+        );
+        assert_eq!(
+            mediahub_app::ObjectStore::checksum_sha256(&store, key)
+                .await
+                .expect("streaming checksum"),
+            hex::encode(Sha256::digest(content))
+        );
     }
 
     fn upload_session(

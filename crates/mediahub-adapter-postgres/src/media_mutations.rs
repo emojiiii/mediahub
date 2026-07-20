@@ -151,6 +151,70 @@ impl MediaRepository for PostgresRepository {
         row.map(row_to_media).transpose()
     }
 
+    async fn claim_stale_uploading(
+        &self,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<LeasedMediaUpload>, RepositoryError> {
+        let now = postgres_time(now);
+        let leased_until = postgres_time(leased_until);
+        if leased_until <= now {
+            return Err(RepositoryError::Invariant(
+                "upload reconciliation lease must end in the future".into(),
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let rows = sqlx::query(
+            "SELECT media.* FROM media \
+             WHERE media.state = 'uploading' AND media.upload_leased_until <= $1 \
+                AND NOT EXISTS (SELECT 1 FROM s3_multipart_uploads upload \
+                    WHERE upload.application_id = media.application_id \
+                      AND upload.bucket_id = media.bucket_id \
+                      AND upload.object_key = media.object_key \
+                      AND upload.state = 'completing') \
+             ORDER BY media.upload_leased_until, media.id \
+             FOR UPDATE SKIP LOCKED LIMIT $2",
+        )
+        .bind(now)
+        .bind(as_i64(limit as u64)?)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let temporary_key = row
+                .try_get::<String, _>("upload_temporary_key")
+                .map_err(database_error)?;
+            let media = row_to_media(row)?;
+            let lease_token = uuid::Uuid::new_v4().to_string();
+            let updated = sqlx::query(
+                "UPDATE media SET upload_lease_token = $1, upload_leased_until = $2 \
+                 WHERE id = $3 AND state = 'uploading'",
+            )
+            .bind(&lease_token)
+            .bind(leased_until)
+            .bind(media.id().as_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if updated.rows_affected() != 1 {
+                return Err(RepositoryError::Conflict);
+            }
+            claimed.push(LeasedMediaUpload {
+                media,
+                temporary_key,
+                lease_token,
+                leased_until,
+            });
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(claimed)
+    }
+
     async fn reserve_quota(
         &self,
         application_id: ApplicationId,
@@ -183,10 +247,26 @@ impl MediaRepository for PostgresRepository {
         })
     }
 
-    async fn create_uploading(&self, media: Media) -> Result<(), RepositoryError> {
+    async fn create_uploading(
+        &self,
+        media: Media,
+        temporary_key: &str,
+        lease_token: &str,
+        leased_until: OffsetDateTime,
+    ) -> Result<(), RepositoryError> {
         if media.state() != MediaState::Uploading {
             return Err(RepositoryError::Invariant(
                 "only uploading media can be created".into(),
+            ));
+        }
+        let leased_until = postgres_time(leased_until);
+        if temporary_key.is_empty()
+            || lease_token.is_empty()
+            || lease_token.len() > 255
+            || leased_until <= postgres_time(media.updated_at())
+        {
+            return Err(RepositoryError::Invariant(
+                "ordinary upload lease is invalid".into(),
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
@@ -213,26 +293,101 @@ impl MediaRepository for PostgresRepository {
             return Err(RepositoryError::Conflict);
         }
         insert_media(&mut transaction, &media).await?;
+        let updated = sqlx::query(
+            "UPDATE media SET upload_temporary_key = $1, upload_lease_token = $2, \
+             upload_leased_until = $3 WHERE id = $4 AND state = 'uploading'",
+        )
+        .bind(temporary_key)
+        .bind(lease_token)
+        .bind(leased_until)
+        .bind(media.id().as_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
         transaction.commit().await.map_err(database_error)
+    }
+
+    async fn renew_upload_lease(
+        &self,
+        media_id: MediaId,
+        lease_token: &str,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+    ) -> Result<bool, RepositoryError> {
+        let now = postgres_time(now);
+        let leased_until = postgres_time(leased_until);
+        if leased_until <= now {
+            return Err(RepositoryError::Invariant(
+                "ordinary upload lease must end in the future".into(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE media SET upload_leased_until = $1 \
+             WHERE id = $2 AND state = 'uploading' AND upload_lease_token = $3 \
+               AND upload_leased_until > $4",
+        )
+        .bind(leased_until)
+        .bind(media_id.as_uuid())
+        .bind(lease_token)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn commit_upload(
         &self,
         media_id: MediaId,
+        lease_token: &str,
         committed_at: mediahub_core::OffsetDateTime,
         event: OutboxEvent,
     ) -> Result<Media, RepositoryError> {
+        let committed_at = postgres_time(committed_at);
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT state, upload_lease_token, upload_leased_until FROM media \
+             WHERE id = $1 FOR UPDATE",
+        )
+        .bind(media_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(RepositoryError::NotFound)?;
+        let state: String = row.try_get("state").map_err(database_error)?;
+        if state == "uploading"
+            && (row
+                .try_get::<Option<String>, _>("upload_lease_token")
+                .map_err(database_error)?
+                .as_deref()
+                != Some(lease_token)
+                || row
+                    .try_get::<Option<OffsetDateTime>, _>("upload_leased_until")
+                    .map_err(database_error)?
+                    .is_none_or(|until| until <= committed_at))
+        {
+            return Err(RepositoryError::Conflict);
+        }
         let persisted =
             commit_upload_in_transaction(&mut transaction, media_id, committed_at, &event).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(persisted)
     }
 
-    async fn abort_upload(&self, media_id: MediaId) -> Result<(), RepositoryError> {
+    async fn abort_upload(
+        &self,
+        media_id: MediaId,
+        lease_token: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), RepositoryError> {
+        let now = postgres_time(now);
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
-            "SELECT application_id, state, size_bytes FROM media WHERE id = $1 FOR UPDATE",
+            "SELECT application_id, state, size_bytes, upload_lease_token, upload_leased_until \
+             FROM media WHERE id = $1 FOR UPDATE",
         )
         .bind(media_id.as_uuid())
         .fetch_optional(&mut *transaction)
@@ -245,6 +400,18 @@ impl MediaRepository for PostgresRepository {
         if row.try_get::<String, _>("state").map_err(database_error)? != "uploading" {
             transaction.commit().await.map_err(database_error)?;
             return Ok(());
+        }
+        if row
+            .try_get::<Option<String>, _>("upload_lease_token")
+            .map_err(database_error)?
+            .as_deref()
+            != Some(lease_token)
+            || row
+                .try_get::<Option<OffsetDateTime>, _>("upload_leased_until")
+                .map_err(database_error)?
+                .is_none_or(|until| until <= now)
+        {
+            return Err(RepositoryError::Conflict);
         }
         let application_id: uuid::Uuid = row.try_get("application_id").map_err(database_error)?;
         let size: i64 = row.try_get("size_bytes").map_err(database_error)?;

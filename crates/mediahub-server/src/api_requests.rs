@@ -234,7 +234,8 @@ struct ListWebhookDeliveriesQuery {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WebhookDeliveryCursorToken {
-    updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<i64>,
     row_id: i64,
 }
 

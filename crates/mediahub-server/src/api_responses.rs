@@ -590,3 +590,82 @@ impl From<AuditEvent> for AuditResponse {
     }
 }
 
+#[derive(Serialize)]
+struct AsyncJobResponse {
+    id: String,
+    application_id: String,
+    operation_scope: String,
+    request_id: Option<String>,
+    action: AsyncJobAction,
+    state: mediahub_core::AsyncJobState,
+    total_items: u32,
+    succeeded_items: u32,
+    failed_items: u32,
+    attempt_count: u32,
+    max_attempts: u32,
+    next_attempt_at: Option<OffsetDateTime>,
+    error_summary: Option<String>,
+    started_at: Option<OffsetDateTime>,
+    completed_at: Option<OffsetDateTime>,
+    failed_at: Option<OffsetDateTime>,
+    cancelled_at: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl From<mediahub_core::AsyncJob> for AsyncJobResponse {
+    fn from(job: mediahub_core::AsyncJob) -> Self {
+        Self {
+            id: job.id().to_string(),
+            application_id: job.application_id().to_string(),
+            operation_scope: job.operation_scope().to_owned(),
+            request_id: job.request_id().map(str::to_owned),
+            action: job.action().clone(),
+            state: job.state(),
+            total_items: job.total_items(),
+            succeeded_items: job.succeeded_items(),
+            failed_items: job.failed_items(),
+            attempt_count: job.attempt_count(),
+            max_attempts: job.max_attempts(),
+            next_attempt_at: job.next_attempt_at(),
+            error_summary: job.error_summary().map(str::to_owned),
+            started_at: job.started_at(),
+            completed_at: job.completed_at(),
+            failed_at: job.failed_at(),
+            cancelled_at: job.cancelled_at(),
+            created_at: job.created_at(),
+            updated_at: job.updated_at(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AsyncJobDetailsResponse {
+    job: AsyncJobResponse,
+    item_results: Vec<AsyncJobItemResult>,
+}
+
+impl From<mediahub_app::AsyncJobDetails> for AsyncJobDetailsResponse {
+    fn from(details: mediahub_app::AsyncJobDetails) -> Self {
+        Self {
+            job: details.job.into(),
+            item_results: details.item_results,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AsyncJobReceiptResponse {
+    job: AsyncJobResponse,
+    already_existed: bool,
+}
+
+impl From<mediahub_app::AsyncJobReceipt> for AsyncJobReceiptResponse {
+    fn from(receipt: mediahub_app::AsyncJobReceipt) -> Self {
+        Self {
+            job: receipt.job.into(),
+            already_existed: receipt.already_existed,
+        }
+    }
+}
+

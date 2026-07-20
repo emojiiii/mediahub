@@ -1,6 +1,6 @@
 // Async-job aggregate and persistence model.
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NewAsyncJob {
     pub id: AsyncJobId,
     pub application_id: ApplicationId,
@@ -13,7 +13,7 @@ pub struct NewAsyncJob {
     pub max_attempts: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedAsyncJob {
     pub id: AsyncJobId,
     pub application_id: ApplicationId,
@@ -40,12 +40,14 @@ pub struct PersistedAsyncJob {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct AsyncJob {
     id: AsyncJobId,
     application_id: ApplicationId,
     operation_scope: String,
+    #[serde(skip_serializing)]
     idempotency_key: String,
+    #[serde(skip_serializing)]
     request_hash: String,
     request_id: Option<String>,
     action: AsyncJobAction,
@@ -56,7 +58,9 @@ pub struct AsyncJob {
     attempt_count: u32,
     max_attempts: u32,
     next_attempt_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing)]
     lease_token: Option<String>,
+    #[serde(skip_serializing)]
     leased_until: Option<OffsetDateTime>,
     error_summary: Option<String>,
     started_at: Option<OffsetDateTime>,
@@ -65,6 +69,83 @@ pub struct AsyncJob {
     cancelled_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+struct Sensitive;
+
+impl fmt::Debug for Sensitive {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl fmt::Debug for NewAsyncJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAsyncJob")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("operation_scope", &self.operation_scope)
+            .field("idempotency_key", &Sensitive)
+            .field("request_hash", &Sensitive)
+            .field("request_id", &self.request_id)
+            .field("action", &self.action)
+            .field("total_items", &self.total_items)
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PersistedAsyncJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedAsyncJob")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("operation_scope", &self.operation_scope)
+            .field("idempotency_key", &Sensitive)
+            .field("request_hash", &Sensitive)
+            .field("request_id", &self.request_id)
+            .field("action", &self.action)
+            .field("state", &self.state)
+            .field("total_items", &self.total_items)
+            .field("succeeded_items", &self.succeeded_items)
+            .field("failed_items", &self.failed_items)
+            .field("attempt_count", &self.attempt_count)
+            .field("max_attempts", &self.max_attempts)
+            .field("lease_token", &self.lease_token.as_ref().map(|_| Sensitive))
+            .field("leased_until", &self.leased_until)
+            .field("error_summary", &self.error_summary)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for AsyncJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsyncJob")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("operation_scope", &self.operation_scope)
+            .field("idempotency_key", &Sensitive)
+            .field("request_hash", &Sensitive)
+            .field("request_id", &self.request_id)
+            .field("action", &self.action)
+            .field("state", &self.state)
+            .field("total_items", &self.total_items)
+            .field("succeeded_items", &self.succeeded_items)
+            .field("failed_items", &self.failed_items)
+            .field("attempt_count", &self.attempt_count)
+            .field("max_attempts", &self.max_attempts)
+            .field("lease_token", &self.lease_token.as_ref().map(|_| Sensitive))
+            .field("leased_until", &self.leased_until)
+            .field("error_summary", &self.error_summary)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 impl AsyncJob {
@@ -78,9 +159,16 @@ impl AsyncJob {
         if input.total_items == 0 {
             return Err(AsyncJobError::EmptyBatch);
         }
+        if input.total_items > MAX_ASYNC_JOB_ITEMS {
+            return Err(AsyncJobError::TooManyItems);
+        }
         if input.max_attempts == 0 {
             return Err(AsyncJobError::InvalidMaxAttempts);
         }
+        if input.max_attempts > MAX_ASYNC_JOB_ATTEMPTS {
+            return Err(AsyncJobError::TooManyAttempts);
+        }
+        validate_request_id(input.request_id.as_deref())?;
 
         Ok(Self {
             id: input.id,
@@ -259,6 +347,26 @@ impl AsyncJob {
     }
 
     #[must_use]
+    pub const fn started_at(&self) -> Option<OffsetDateTime> {
+        self.started_at
+    }
+
+    #[must_use]
+    pub const fn completed_at(&self) -> Option<OffsetDateTime> {
+        self.completed_at
+    }
+
+    #[must_use]
+    pub const fn failed_at(&self) -> Option<OffsetDateTime> {
+        self.failed_at
+    }
+
+    #[must_use]
+    pub const fn cancelled_at(&self) -> Option<OffsetDateTime> {
+        self.cancelled_at
+    }
+
+    #[must_use]
     pub const fn created_at(&self) -> OffsetDateTime {
         self.created_at
     }
@@ -293,6 +401,9 @@ impl AsyncJob {
         if leased_until <= now {
             return Err(AsyncJobError::InvalidLeaseExpiry);
         }
+        if leased_until - now > time::Duration::seconds(MAX_ASYNC_JOB_LEASE_SECONDS) {
+            return Err(AsyncJobError::LeaseTooLong);
+        }
         if !self.is_claimable_at(now) {
             return Err(if self.attempt_count >= self.max_attempts {
                 AsyncJobError::AttemptsExhausted
@@ -307,6 +418,27 @@ impl AsyncJob {
         self.lease_token = Some(lease_token);
         self.leased_until = Some(leased_until);
         self.started_at.get_or_insert(now);
+        self.updated_at = now;
+        Ok(())
+    }
+
+    /// Extends an active lease while retaining the original fencing token.
+    /// The new expiry is bounded so a corrupted worker cannot create an
+    /// effectively permanent claim.
+    pub fn renew_lease(
+        &mut self,
+        lease_token: &str,
+        leased_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> AsyncJobResult<()> {
+        self.verify_lease(lease_token, now)?;
+        if leased_until <= now {
+            return Err(AsyncJobError::InvalidLeaseExpiry);
+        }
+        if leased_until - now > time::Duration::seconds(MAX_ASYNC_JOB_LEASE_SECONDS) {
+            return Err(AsyncJobError::LeaseTooLong);
+        }
+        self.leased_until = Some(leased_until);
         self.updated_at = now;
         Ok(())
     }
@@ -410,4 +542,3 @@ impl AsyncJob {
         Ok(())
     }
 }
-

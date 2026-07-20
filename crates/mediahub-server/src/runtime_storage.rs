@@ -135,6 +135,13 @@ impl ObjectStore for RuntimeObjectStore {
         }
     }
 
+    async fn checksum_sha256(&self, key: &str) -> Result<String, ObjectStoreError> {
+        match self {
+            Self::Local(store) => store.checksum_sha256(key).await,
+            Self::S3(store) => store.checksum_sha256(key).await,
+        }
+    }
+
     async fn list(
         &self,
         prefix: &str,
@@ -208,6 +215,17 @@ impl UploadSessionStorage for RuntimeObjectStore {
         }
     }
 
+    async fn finalize_upload(
+        &self,
+        session: &UploadSession,
+        final_storage_key: &str,
+    ) -> Result<(), ObjectStoreError> {
+        match self {
+            Self::Local(store) => store.finalize_upload(session, final_storage_key).await,
+            Self::S3(store) => store.finalize_upload(session, final_storage_key).await,
+        }
+    }
+
     async fn abort_upload(&self, session: &UploadSession) -> Result<(), ObjectStoreError> {
         match self {
             Self::Local(store) => store.abort_upload(session).await,
@@ -241,7 +259,8 @@ mod tests {
             LocalObjectStore::new(&root).expect("create local object store"),
         );
         assert_eq!(runtime.backend_name(), "local");
-        assert_eq!(runtime.local_root(), Some(root.as_path()));
+        let canonical_root = fs::canonicalize(&root).expect("canonical local storage root");
+        assert_eq!(runtime.local_root(), Some(canonical_root.as_path()));
         runtime.health_check().await.expect("healthy local store");
 
         runtime
@@ -427,21 +446,24 @@ mod tests {
             .expect("prepare signed S3 upload");
 
         assert_eq!(prepared.storage_backend, "s3");
-        assert_eq!(prepared.storage_key, format!("objects/{media_id}"));
+        assert_eq!(
+            prepared.storage_key,
+            format!("temporary/uploads/{upload_id}")
+        );
         assert_eq!(prepared.target.method, "PUT");
         assert_eq!(prepared.target.headers["content-length"], "5");
         assert_eq!(prepared.target.headers["content-type"], "image/png");
+        assert_eq!(prepared.target.headers["if-none-match"], "*");
         assert!(
             prepared
                 .target
                 .url
-                .starts_with("https://storage.example.test/test-bucket/tenant/objects/")
+                .starts_with("https://storage.example.test/test-bucket/tenant/temporary/uploads/")
         );
         assert!(
-            prepared
-                .target
-                .url
-                .contains("X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost")
+            prepared.target.url.contains(
+                "X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost%3Bif-none-match"
+            )
         );
         assert!(prepared.target.url.contains("X-Amz-Security-Token="));
         assert!(!prepared.target.url.starts_with("/api/v1/uploads/"));

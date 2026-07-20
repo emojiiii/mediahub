@@ -2,7 +2,7 @@
 
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use image::{ImageBuffer, Rgb};
+    use image::{ImageBuffer, Rgb, Rgba};
     use mediahub_core::{CropPosition, VariantFit};
 
     use super::*;
@@ -373,4 +373,42 @@
         .expect("transform");
         let result = RustImageProcessor.process(&encoded, &transform).await;
         assert_eq!(result, Err(ImageProcessorError::OutputTooLarge));
+    }
+
+    #[test]
+    fn cover_rejects_unbounded_intermediate_dimensions() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16_384, 1, Rgb([1, 2, 3])));
+        assert_eq!(
+            cover(image, 4_096, 4_096, CropPosition::Center),
+            Err(ImageProcessorError::OutputTooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn rgba16_cover_respects_intermediate_byte_limit() {
+        let image = DynamicImage::ImageRgba16(ImageBuffer::from_pixel(
+            1_024,
+            256,
+            Rgba([1_u16, 2, 3, u16::MAX]),
+        ));
+        let mut encoded = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut encoded), ImageFormat::Png)
+            .expect("16-bit PNG fixture encoding");
+        let transform = VariantTransform::new(
+            Some(MAX_VARIANT_DIMENSION),
+            Some(MAX_VARIANT_DIMENSION),
+            VariantFit::Cover,
+            80,
+            VariantFormat::Png,
+            0,
+            CropPosition::Center,
+            "ffffff",
+        )
+        .expect("transform");
+
+        assert_eq!(
+            RustImageProcessor.process(&encoded, &transform).await,
+            Err(ImageProcessorError::OutputTooLarge)
+        );
     }

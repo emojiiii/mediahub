@@ -22,23 +22,6 @@ async fn register(
     let now = OffsetDateTime::now_utc();
     let user_id = UserId::new();
     let application_id = ApplicationId::new();
-    state
-        .repository
-        .create_user(user_id, &email, &password_hash, now)
-        .await
-        .map_err(ApiError::from_repository)?;
-    state
-        .repository
-        .create_application(
-            application_id,
-            user_id,
-            "Default application",
-            &format!("app_{}", application_id.as_uuid().simple()),
-            DEFAULT_APPLICATION_QUOTA_BYTES,
-            now,
-        )
-        .await
-        .map_err(ApiError::from_repository)?;
     let default_bucket = Bucket::new(
         BucketId::new(),
         application_id,
@@ -47,33 +30,36 @@ async fn register(
         now,
     )
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    state
-        .repository
-        .create_bucket(&default_bucket)
-        .await
-        .map_err(ApiError::from_repository)?;
     let verification_token = generate_auth_token();
     let verification_expires_at = now + time::Duration::seconds(VERIFY_EMAIL_TOKEN_SECONDS);
     state
         .repository
-        .create_one_time_token(
+        .register_user(
             user_id,
-            OneTimeTokenPurpose::VerifyEmail,
+            &email,
+            &password_hash,
+            application_id,
+            "Default application",
+            &format!("app_{}", application_id.as_uuid().simple()),
+            DEFAULT_APPLICATION_QUOTA_BYTES,
+            &default_bucket,
             &token_hash(&verification_token),
             verification_expires_at,
             now,
         )
         .await
         .map_err(ApiError::from_repository)?;
-    if let Some(provider) = &state.email_provider {
-        provider
+    if let Some(provider) = &state.email_provider
+        && let Err(error) = provider
             .send_token(
                 &email,
                 AuthEmailKind::VerifyEmail,
                 &verification_token,
                 verification_expires_at,
             )
-            .await?;
+            .await
+    {
+        warn!(error = %error.message, email, "registration verification email delivery failed");
     }
     Ok((
         StatusCode::CREATED,

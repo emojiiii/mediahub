@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use mediahub_core::{ApplicationId, OffsetDateTime, UserId};
+use std::fmt;
 
-use crate::{QuotaSnapshot, RepositoryError};
+use crate::{QuotaSnapshot, Redacted, RepositoryError};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserAccount {
     pub id: UserId,
     pub email_normalized: String,
@@ -14,6 +15,23 @@ pub struct UserAccount {
     pub last_login_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+impl fmt::Debug for UserAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserAccount")
+            .field("id", &self.id)
+            .field("email_normalized", &self.email_normalized)
+            .field("password_hash", &Redacted(&self.password_hash))
+            .field("email_verified_at", &self.email_verified_at)
+            .field("status", &self.status)
+            .field("system_role", &self.system_role)
+            .field("last_login_at", &self.last_login_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +70,7 @@ pub struct ApplicationSummary {
     pub quota: QuotaSnapshot,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewAccessKey {
     pub id: String,
     pub application_id: ApplicationId,
@@ -66,7 +84,25 @@ pub struct NewAccessKey {
     pub created_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Debug for NewAccessKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAccessKey")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_ciphertext", &Redacted(&self.secret_ciphertext))
+            .field("secret_key_version", &self.secret_key_version)
+            .field("secret_last_four", &self.secret_last_four)
+            .field("name", &self.name)
+            .field("permissions", &self.permissions)
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct AccessKeyRecord {
     pub id: String,
     pub application_id: ApplicationId,
@@ -79,6 +115,25 @@ pub struct AccessKeyRecord {
     pub expires_at: Option<OffsetDateTime>,
     pub revoked_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
+}
+
+impl fmt::Debug for AccessKeyRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessKeyRecord")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_ciphertext", &Redacted(&self.secret_ciphertext))
+            .field("secret_key_version", &self.secret_key_version)
+            .field("secret_last_four", &self.secret_last_four)
+            .field("name", &self.name)
+            .field("permissions", &self.permissions)
+            .field("expires_at", &self.expires_at)
+            .field("revoked_at", &self.revoked_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 #[async_trait]

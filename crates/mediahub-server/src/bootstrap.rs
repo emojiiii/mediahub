@@ -95,17 +95,33 @@ pub(super) async fn run() -> anyhow::Result<()> {
         http_metrics: HttpMetrics::default(),
         metrics_bearer_token: config.metrics_bearer_token.map(Arc::from),
     });
-    tokio::spawn(super::workers::run_lifecycle_worker(repository.clone(), object_store));
-    tokio::spawn(super::workers::run_outbox_worker(repository.clone(), access_key_cipher));
-    tokio::spawn(super::workers::run_async_job_worker(repository));
+    let mut lifecycle_worker = tokio::spawn(super::workers::run_lifecycle_worker(
+        repository.clone(),
+        object_store,
+    ));
+    let mut outbox_worker = tokio::spawn(super::workers::run_outbox_worker(
+        repository.clone(),
+        access_key_cipher,
+    ));
+    let mut async_job_worker = tokio::spawn(super::workers::run_async_job_worker(repository));
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(address = %config.bind_addr, "MediaHub server listening");
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    );
+    tokio::select! {
+        result = server => result.map_err(anyhow::Error::from),
+        result = &mut lifecycle_worker => Err(anyhow::anyhow!(
+            "lifecycle worker exited unexpectedly: {result:?}"
+        )),
+        result = &mut outbox_worker => Err(anyhow::anyhow!(
+            "outbox worker exited unexpectedly: {result:?}"
+        )),
+        result = &mut async_job_worker => Err(anyhow::anyhow!(
+            "async job worker exited unexpectedly: {result:?}"
+        )),
+    }
 }
 

@@ -8,7 +8,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -21,10 +21,10 @@ use mediahub_core::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BucketRepository, Clock, ComposedObject, MediaRepository, ObjectMetadata, ObjectPage,
-    ObjectStore, ObjectStoreError, OutboxEvent, OutboxRepository, PreparedUpload, RepositoryError,
-    StoredUpload, UploadSessionCancellation, UploadSessionCompletion, UploadSessionExpiration,
-    UploadSessionRepository, UploadSessionStorage, UploadTarget,
+    BucketRepository, Clock, ComposedObject, LeasedMediaUpload, MediaRepository, ObjectMetadata,
+    ObjectPage, ObjectStore, ObjectStoreError, OutboxEvent, OutboxRepository, PreparedUpload,
+    RepositoryError, StoredUpload, UploadSessionCancellation, UploadSessionCompletion,
+    UploadSessionExpiration, UploadSessionRepository, UploadSessionStorage, UploadTarget,
 };
 
 const MEMORY_BACKEND: &str = "memory";

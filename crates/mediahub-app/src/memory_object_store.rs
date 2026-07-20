@@ -27,6 +27,7 @@ struct ObjectStoreState {
     objects: HashMap<String, StoredObject>,
     fail_next_put: Option<ObjectStoreError>,
     fail_next_commit: Option<ObjectStoreError>,
+    fail_next_abort: Option<ObjectStoreError>,
 }
 
 #[derive(Clone)]
@@ -46,6 +47,12 @@ impl InMemoryObjectStore {
         self.lock()
             .expect("in-memory object store lock")
             .fail_next_commit = Some(error);
+    }
+
+    pub fn fail_next_abort(&self, error: ObjectStoreError) {
+        self.lock()
+            .expect("in-memory object store lock")
+            .fail_next_abort = Some(error);
     }
 
     #[must_use]
@@ -324,6 +331,16 @@ impl UploadSessionStorage for InMemoryObjectStore {
     }
 
     async fn abort_upload(&self, session: &UploadSession) -> Result<(), ObjectStoreError> {
+        if let Some(error) = self
+            .lock()?
+            .fail_next_abort
+            .take()
+        {
+            return Err(error);
+        }
+        if session.state() == UploadSessionState::Completed {
+            return Ok(());
+        }
         self.delete(session.storage_key()).await
     }
 }

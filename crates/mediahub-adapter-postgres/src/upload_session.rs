@@ -46,7 +46,7 @@ impl UploadSessionRepository for PostgresRepository {
         completed_at: OffsetDateTime,
         event: OutboxEvent,
     ) -> Result<UploadSessionCompletion, RepositoryError> {
-        let completed_at = postgres_time(completed_at);
+        let requested_completed_at = postgres_time(completed_at);
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query("SELECT * FROM upload_sessions WHERE id = $1 FOR UPDATE")
             .bind(upload_session_id.as_uuid())
@@ -54,6 +54,11 @@ impl UploadSessionRepository for PostgresRepository {
             .await
             .map_err(database_error)?
             .ok_or(RepositoryError::NotFound)?;
+        let database_now = sqlx::query_scalar::<_, OffsetDateTime>("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let completed_at = postgres_time(database_now.max(requested_completed_at));
         let mut session = row_to_upload_session(row)?;
         match session.state() {
             UploadSessionState::Completed => {
@@ -185,8 +190,13 @@ impl UploadSessionRepository for PostgresRepository {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let rows = sqlx::query(
             "SELECT id FROM upload_sessions \
-             WHERE state = 'pending' AND session_expires_at <= $1 \
-             ORDER BY session_expires_at, id FOR UPDATE SKIP LOCKED LIMIT $2",
+             WHERE (state = 'pending' AND session_expires_at <= $1) \
+                OR (state IN ('completed', 'expired', 'cancelled') \
+                    AND session_expires_at <= $1 \
+                    AND storage_cleanup_completed_at IS NULL) \
+             ORDER BY CASE WHEN state = 'pending' THEN 0 ELSE 1 END, \
+                      CASE WHEN state = 'pending' THEN session_expires_at ELSE updated_at END, id \
+             FOR UPDATE SKIP LOCKED LIMIT $2",
         )
         .bind(expired_at)
         .bind(limit)
@@ -196,14 +206,54 @@ impl UploadSessionRepository for PostgresRepository {
         let mut expired = Vec::with_capacity(rows.len());
         for row in rows {
             let id = UploadSessionId::from_uuid(row.try_get("id").map_err(database_error)?);
-            if let UploadSessionExpiration::Expired(session) =
-                expire_in_transaction(&mut transaction, id, expired_at).await?
-            {
-                expired.push(session);
+            let disposition = expire_in_transaction(&mut transaction, id, expired_at).await?;
+            sqlx::query("UPDATE upload_sessions SET updated_at = $1 WHERE id = $2")
+                .bind(expired_at)
+                .bind(id.as_uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            match disposition {
+                UploadSessionExpiration::Expired(session)
+                | UploadSessionExpiration::AlreadyExpired(session) => expired.push(session),
+                UploadSessionExpiration::Cancelled => {
+                    let row = sqlx::query("SELECT * FROM upload_sessions WHERE id = $1")
+                        .bind(id.as_uuid())
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                    expired.push(row_to_upload_session(row)?);
+                }
+                UploadSessionExpiration::Completed => {
+                    let row = sqlx::query("SELECT * FROM upload_sessions WHERE id = $1")
+                        .bind(id.as_uuid())
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                    expired.push(row_to_upload_session(row)?);
+                }
+                UploadSessionExpiration::NotDue => {}
             }
         }
         transaction.commit().await.map_err(database_error)?;
         Ok(expired)
+    }
+
+    async fn complete_upload_session_cleanup(
+        &self,
+        upload_session_id: UploadSessionId,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE upload_sessions SET storage_cleanup_completed_at = CURRENT_TIMESTAMP, \
+             updated_at = CURRENT_TIMESTAMP \
+             WHERE id = $1 AND state IN ('completed', 'expired', 'cancelled') \
+               AND storage_cleanup_completed_at IS NULL",
+        )
+        .bind(upload_session_id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(result.rows_affected() == 1)
     }
 }
 

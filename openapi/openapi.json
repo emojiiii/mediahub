@@ -14,8 +14,8 @@
         "name": "limit",
         "required": false,
         "schema": {
-          "default": 50,
-          "maximum": 100,
+          "default": 100,
+          "maximum": 200,
           "minimum": 1,
           "type": "integer"
         }
@@ -30,10 +30,9 @@
       },
       "ApplicationContext": {
         "in": "header",
-        "name": "X-Application-Id",
+        "name": "X-MediaHub-App-Id",
         "required": false,
         "schema": {
-          "format": "uuid",
           "type": "string"
         }
       },
@@ -67,6 +66,8 @@
         "name": "Content-Length",
         "required": true,
         "schema": {
+          "maximum": 2147483648,
+          "minimum": 1,
           "type": "integer"
         }
       },
@@ -266,6 +267,8 @@
         "name": "background",
         "required": false,
         "schema": {
+          "default": "ffffff",
+          "pattern": "^[0-9A-Fa-f]{6}$",
           "type": "string"
         }
       },
@@ -274,6 +277,9 @@
         "name": "blur",
         "required": false,
         "schema": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -282,6 +288,14 @@
         "name": "crop",
         "required": false,
         "schema": {
+          "default": "center",
+          "enum": [
+            "center",
+            "top",
+            "bottom",
+            "left",
+            "right"
+          ],
           "type": "string"
         }
       },
@@ -290,6 +304,12 @@
         "name": "fit",
         "required": false,
         "schema": {
+          "default": "inside",
+          "enum": [
+            "cover",
+            "contain",
+            "inside"
+          ],
           "type": "string"
         }
       },
@@ -312,6 +332,8 @@
         "name": "h",
         "required": false,
         "schema": {
+          "maximum": 4096,
+          "minimum": 1,
           "type": "integer"
         }
       },
@@ -320,6 +342,9 @@
         "name": "quality",
         "required": false,
         "schema": {
+          "default": 80,
+          "maximum": 100,
+          "minimum": 1,
           "type": "integer"
         }
       },
@@ -328,6 +353,8 @@
         "name": "w",
         "required": false,
         "schema": {
+          "maximum": 4096,
+          "minimum": 1,
           "type": "integer"
         }
       },
@@ -753,6 +780,7 @@
         "properties": {
           "quota_bytes": {
             "format": "int64",
+            "maximum": 9223372036854775807,
             "minimum": 0,
             "type": "integer"
           }
@@ -899,18 +927,21 @@
             "type": "integer"
           },
           "cancelled_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
           "completed_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
           "created_at": {
+            "format": "date-time",
             "type": "string"
           },
           "error_summary": {
@@ -920,6 +951,7 @@
             ]
           },
           "failed_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -933,24 +965,19 @@
           "id": {
             "type": "string"
           },
-          "idempotency_key": {
-            "type": "string"
-          },
           "max_attempts": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
           "next_attempt_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
           "operation_scope": {
-            "type": "string"
-          },
-          "request_hash": {
             "type": "string"
           },
           "request_id": {
@@ -960,13 +987,14 @@
             ]
           },
           "started_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/AsyncJobState"
           },
           "succeeded_items": {
             "format": "int64",
@@ -979,6 +1007,7 @@
             "type": "integer"
           },
           "updated_at": {
+            "format": "date-time",
             "type": "string"
           }
         },
@@ -986,8 +1015,7 @@
           "id",
           "application_id",
           "operation_scope",
-          "idempotency_key",
-          "request_hash",
+          "request_id",
           "action",
           "state",
           "total_items",
@@ -995,6 +1023,12 @@
           "failed_items",
           "attempt_count",
           "max_attempts",
+          "next_attempt_at",
+          "error_summary",
+          "started_at",
+          "completed_at",
+          "failed_at",
+          "cancelled_at",
           "created_at",
           "updated_at"
         ],
@@ -1006,7 +1040,7 @@
             "properties": {
               "ttl_seconds": {
                 "format": "int64",
-                "minimum": 0,
+                "minimum": 1,
                 "type": [
                   "integer",
                   "null"
@@ -1089,6 +1123,7 @@
             "type": "integer"
           },
           "completed_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -1119,15 +1154,17 @@
           },
           "result": {},
           "started_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
           "state": {
-            "type": "string"
+            "$ref": "#/components/schemas/AsyncJobItemState"
           },
           "updated_at": {
+            "format": "date-time",
             "type": "string"
           }
         },
@@ -1138,9 +1175,23 @@
           "ordinal",
           "state",
           "attempt_count",
+          "result",
+          "error_code",
+          "error_summary",
+          "started_at",
+          "completed_at",
           "updated_at"
         ],
         "type": "object"
+      },
+      "AsyncJobItemState": {
+        "enum": [
+          "pending",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
       },
       "AsyncJobReceipt": {
         "additionalProperties": false,
@@ -1157,6 +1208,16 @@
           "already_existed"
         ],
         "type": "object"
+      },
+      "AsyncJobState": {
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
       },
       "AuditEvent": {
         "additionalProperties": false,
@@ -1260,8 +1321,11 @@
           },
           "media_ids": {
             "items": {
+              "format": "uuid",
               "type": "string"
             },
+            "maxItems": 1000,
+            "minItems": 1,
             "type": "array"
           }
         },
@@ -1481,10 +1545,7 @@
             "items": {
               "type": "string"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "default_ttl_seconds": {
             "format": "int64",
@@ -1498,10 +1559,7 @@
             "items": {
               "$ref": "#/components/schemas/LifecycleRule"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "max_object_size": {
             "format": "int64",
@@ -1656,10 +1714,8 @@
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "default": true,
+            "type": "boolean"
           },
           "events": {
             "items": {
@@ -2278,10 +2334,8 @@
             ]
           },
           "rotate_secret": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "default": false,
+            "type": "boolean"
           },
           "url": {
             "type": [

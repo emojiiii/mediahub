@@ -1,3 +1,7 @@
+use std::{fmt, future::Future, time::Duration as StdDuration};
+
+use futures_timer::Delay;
+use futures_util::FutureExt;
 use mediahub_core::{
     ApplicationId, BucketId, ClientMetadata, DomainError, Media, MediaId, NewMedia, OffsetDateTime,
     SystemMetadata, Visibility,
@@ -5,13 +9,16 @@ use mediahub_core::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ApplicationError, BucketRepository, Clock, MediaRepository, ObjectStore, OutboxEvent,
+    ApplicationError, BucketRepository, Clock, MediaRepository, ObjectStore, OutboxEvent, Redacted,
     RepositoryError, S3MultipartRepository,
 };
 
+pub const MEDIA_UPLOAD_LEASE_SECONDS: i64 = 120;
+pub const MEDIA_UPLOAD_HEARTBEAT_SECONDS: u64 = 30;
+
 /// Input accepted after authentication and transport-layer parsing. Content
 /// facts such as its SHA-256 and size are derived by the application service.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct UploadMediaRequest {
     pub application_id: ApplicationId,
     pub bucket_id: BucketId,
@@ -29,7 +36,7 @@ pub struct UploadMediaRequest {
 /// A complete object already staged by a transport-specific flow such as S3
 /// Multipart. Size and SHA-256 must be derived while composing the staged
 /// bytes, never inferred from multipart ETags.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StagedUploadMediaRequest {
     pub application_id: ApplicationId,
     pub bucket_id: BucketId,
@@ -44,6 +51,46 @@ pub struct StagedUploadMediaRequest {
     pub visibility_override: Option<Visibility>,
     pub expire_at: Option<OffsetDateTime>,
     pub metadata: ClientMetadata,
+}
+
+impl fmt::Debug for UploadMediaRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UploadMediaRequest")
+            .field("application_id", &self.application_id)
+            .field("bucket_id", &self.bucket_id)
+            .field("object_key", &self.object_key)
+            .field("original_name", &self.original_name)
+            .field("display_name", &self.display_name)
+            .field("extension", &self.extension)
+            .field("mime", &self.mime)
+            .field("content", &Redacted(&self.content))
+            .field("visibility_override", &self.visibility_override)
+            .field("expire_at", &self.expire_at)
+            .field("metadata", &Redacted(&self.metadata))
+            .finish()
+    }
+}
+
+impl fmt::Debug for StagedUploadMediaRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagedUploadMediaRequest")
+            .field("application_id", &self.application_id)
+            .field("bucket_id", &self.bucket_id)
+            .field("object_key", &self.object_key)
+            .field("original_name", &self.original_name)
+            .field("display_name", &self.display_name)
+            .field("extension", &self.extension)
+            .field("mime", &self.mime)
+            .field("temporary_key", &Redacted(&self.temporary_key))
+            .field("size", &self.size)
+            .field("sha256", &Redacted(&self.sha256))
+            .field("visibility_override", &self.visibility_override)
+            .field("expire_at", &self.expire_at)
+            .field("metadata", &Redacted(&self.metadata))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,9 +129,10 @@ where
     /// # Errors
     ///
     /// Returns a stable application error for authorization scope, duplicate
-    /// keys, policy and quota violations, or an adapter failure. If a write
-    /// starts and then fails, the service attempts to remove staged/final
-    /// objects and abort the uploading record before returning.
+    /// keys, policy and quota violations, or an adapter failure. Failures
+    /// before promotion clean up the staged row; promotion and DB commit
+    /// failures are treated as ambiguous and retain the final object/row for
+    /// reconciliation rather than risking data loss.
     pub async fn upload(
         &self,
         request: &UploadMediaRequest,
@@ -146,7 +194,13 @@ where
                 }
             };
 
-        if let Err(error) = self.media_repository.create_uploading(media.clone()).await {
+        let lease_token = MediaId::new().to_string();
+        let leased_until = now + time::Duration::seconds(MEDIA_UPLOAD_LEASE_SECONDS);
+        if let Err(error) = self
+            .media_repository
+            .create_uploading(media.clone(), &temporary_key, &lease_token, leased_until)
+            .await
+        {
             let _ = self
                 .media_repository
                 .release_quota(media.application_id(), media.size())
@@ -154,30 +208,48 @@ where
             return Err(map_create_error(error));
         }
 
-        if let Err(error) = self
-            .object_store
-            .put_temporary(&temporary_key, &request.content, media.mime())
-            .await
+        if let Err(error) = run_storage_with_upload_lease(
+            &self.media_repository,
+            &self.clock,
+            media.id(),
+            &lease_token,
+            self.object_store
+                .put_temporary(&temporary_key, &request.content, media.mime()),
+        )
+        .await
         {
-            self.rollback(media.id(), &temporary_key, media.storage_key())
-                .await;
-            return Err(error.into());
+            match error {
+                LeasedStorageError::Storage(storage_error) => {
+                    self.rollback_before_promotion(media.id(), &temporary_key, &lease_token)
+                        .await;
+                    return Err(storage_error.into());
+                }
+                LeasedStorageError::Ownership(repository_error) => {
+                    return Err(repository_error.into());
+                }
+            }
         }
 
-        if let Err(error) = self
-            .object_store
-            .commit_temporary(&temporary_key, media.storage_key())
-            .await
+        if let Err(error) = run_storage_with_upload_lease(
+            &self.media_repository,
+            &self.clock,
+            media.id(),
+            &lease_token,
+            self.object_store
+                .commit_temporary(&temporary_key, media.storage_key()),
+        )
+        .await
         {
-            self.rollback(media.id(), &temporary_key, media.storage_key())
-                .await;
-            return Err(error.into());
+            // Any response from promotion is ambiguous: the provider may
+            // have created the final object before the error reached us.
+            // Never abort the durable row or delete the final key here.
+            return Err(error.into_application_error());
         }
 
         let event = OutboxEvent::media_uploaded(&media, now);
         match self
             .media_repository
-            .commit_upload(media.id(), self.clock.now(), event.clone())
+            .commit_upload(media.id(), &lease_token, self.clock.now(), event.clone())
             .await
         {
             Ok(media) => Ok(UploadReceipt {
@@ -185,8 +257,10 @@ where
                 event_id: event.id,
             }),
             Err(error) => {
-                self.rollback(media.id(), &temporary_key, media.storage_key())
-                    .await;
+                // The repository error may be post-commit (for example a
+                // response lost after PostgreSQL committed). Keep both the
+                // final object and uploading row for reconciliation instead
+                // of deleting potentially active data.
                 Err(error.into())
             }
         }
@@ -278,37 +352,47 @@ where
                 return Err(error.into());
             }
         };
-        if let Err(error) = self.media_repository.create_uploading(media.clone()).await {
+        let lease_token = MediaId::new().to_string();
+        let leased_until = now + time::Duration::seconds(MEDIA_UPLOAD_LEASE_SECONDS);
+        if let Err(error) = self
+            .media_repository
+            .create_uploading(
+                media.clone(),
+                &request.temporary_key,
+                &lease_token,
+                leased_until,
+            )
+            .await
+        {
             let _ = self
                 .media_repository
                 .release_quota(media.application_id(), media.size())
                 .await;
             return Err(map_create_error(error));
         }
-        if let Err(error) = self
-            .object_store
-            .commit_temporary(&request.temporary_key, media.storage_key())
-            .await
+        if let Err(error) = run_storage_with_upload_lease(
+            &self.media_repository,
+            &self.clock,
+            media.id(),
+            &lease_token,
+            self.object_store
+                .commit_temporary(&request.temporary_key, media.storage_key()),
+        )
+        .await
         {
-            self.rollback(media.id(), &request.temporary_key, media.storage_key())
-                .await;
-            return Err(error.into());
+            return Err(error.into_application_error());
         }
         let event = OutboxEvent::media_uploaded(&media, now);
         match self
             .media_repository
-            .commit_upload(media.id(), self.clock.now(), event.clone())
+            .commit_upload(media.id(), &lease_token, self.clock.now(), event.clone())
             .await
         {
             Ok(media) => Ok(UploadReceipt {
                 media,
                 event_id: event.id,
             }),
-            Err(error) => {
-                self.rollback(media.id(), &request.temporary_key, media.storage_key())
-                    .await;
-                Err(error.into())
-            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -366,14 +450,6 @@ where
             .commit_temporary(&request.temporary_key, media.storage_key())
             .await
         {
-            self.rollback_multipart(
-                upload_id,
-                completion_token,
-                media.id(),
-                &request.temporary_key,
-                media.storage_key(),
-            )
-            .await;
             return Err(error.into());
         }
         let event = OutboxEvent::media_uploaded(&media, now);
@@ -392,17 +468,7 @@ where
                 media,
                 event_id: event.id,
             }),
-            Err(error) => {
-                self.rollback_multipart(
-                    upload_id,
-                    completion_token,
-                    media.id(),
-                    &request.temporary_key,
-                    media.storage_key(),
-                )
-                .await;
-                Err(error.into())
-            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -474,28 +540,93 @@ where
         )?)
     }
 
-    async fn rollback(&self, media_id: MediaId, temporary_key: &str, final_key: &str) {
-        let _ = self.object_store.delete(temporary_key).await;
-        let _ = self.object_store.delete(final_key).await;
-        let _ = self.media_repository.abort_upload(media_id).await;
-    }
-
-    async fn rollback_multipart(
+    async fn rollback_before_promotion(
         &self,
-        upload_id: &str,
-        completion_token: &str,
         media_id: MediaId,
         temporary_key: &str,
-        final_key: &str,
-    ) where
-        M: S3MultipartRepository,
+        lease_token: &str,
+    ) {
+        if run_storage_with_upload_lease(
+            &self.media_repository,
+            &self.clock,
+            media_id,
+            lease_token,
+            self.object_store.delete(temporary_key),
+        )
+        .await
+        .is_ok()
+        {
+            let _ = self
+                .media_repository
+                .abort_upload(media_id, lease_token, self.clock.now())
+                .await;
+        }
+    }
+}
+
+enum LeasedStorageError {
+    Storage(crate::ObjectStoreError),
+    Ownership(RepositoryError),
+}
+
+impl LeasedStorageError {
+    fn into_application_error(self) -> ApplicationError {
+        match self {
+            Self::Storage(error) => error.into(),
+            Self::Ownership(error) => error.into(),
+        }
+    }
+}
+
+async fn run_storage_with_upload_lease<M, C, F, T>(
+    repository: &M,
+    clock: &C,
+    media_id: MediaId,
+    lease_token: &str,
+    operation: F,
+) -> Result<T, LeasedStorageError>
+where
+    M: MediaRepository,
+    C: Clock,
+    F: Future<Output = Result<T, crate::ObjectStoreError>>,
+{
+    renew_upload_ownership(repository, clock, media_id, lease_token).await?;
+    let operation = operation.fuse();
+    futures_util::pin_mut!(operation);
+    loop {
+        let heartbeat = Delay::new(StdDuration::from_secs(MEDIA_UPLOAD_HEARTBEAT_SECONDS)).fuse();
+        futures_util::pin_mut!(heartbeat);
+        futures_util::select! {
+            result = &mut operation => {
+                renew_upload_ownership(repository, clock, media_id, lease_token).await?;
+                return result.map_err(LeasedStorageError::Storage);
+            }
+            () = heartbeat => {
+                renew_upload_ownership(repository, clock, media_id, lease_token).await?;
+            }
+        }
+    }
+}
+
+async fn renew_upload_ownership<M, C>(
+    repository: &M,
+    clock: &C,
+    media_id: MediaId,
+    lease_token: &str,
+) -> Result<(), LeasedStorageError>
+where
+    M: MediaRepository,
+    C: Clock,
+{
+    let now = clock.now();
+    let leased_until = now + time::Duration::seconds(MEDIA_UPLOAD_LEASE_SECONDS);
+    match repository
+        .renew_upload_lease(media_id, lease_token, now, leased_until)
+        .await
+        .map_err(LeasedStorageError::Ownership)?
     {
-        let _ = self.object_store.delete(temporary_key).await;
-        let _ = self.object_store.delete(final_key).await;
-        let _ = self
-            .media_repository
-            .abort_uploading_for_multipart(upload_id, completion_token, media_id)
-            .await;
+        true => Ok(()),
+        false => Err(LeasedStorageError::Ownership(RepositoryError::Conflict)),
     }
 }
 
@@ -706,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_failure_removes_promoted_object_and_rolls_back_upload() {
+    fn uncertain_commit_failure_keeps_promoted_object_for_reconciliation() {
         let (application_id, bucket_id, object_store, repository, service) = setup();
         repository.fail_next_commit(RepositoryError::Unavailable(
             "database unavailable".to_owned(),
@@ -718,14 +849,14 @@ mod tests {
 
         assert!(matches!(error, ApplicationError::Repository(_)));
         assert_eq!(object_store.temporary_count(), 0);
-        assert_eq!(object_store.object_count(), 0);
-        assert_eq!(repository.media_count(), 0);
+        assert_eq!(object_store.object_count(), 1);
+        assert_eq!(repository.media_count(), 1);
         assert_eq!(
             repository.quota(application_id).expect("quota exists"),
             crate::QuotaSnapshot {
                 quota_bytes: 1024,
                 used_bytes: 0,
-                reserved_bytes: 0,
+                reserved_bytes: 4,
             }
         );
     }

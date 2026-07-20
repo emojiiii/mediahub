@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Range};
+use std::{collections::BTreeMap, fmt, ops::Range};
 
 use async_trait::async_trait;
 use mediahub_core::{
@@ -7,7 +7,10 @@ use mediahub_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::upload_session::{PreparedUpload, StoredUpload};
+use crate::{
+    Redacted,
+    upload_session::{PreparedUpload, StoredUpload},
+};
 
 /// Backend-neutral facts returned by `head` and prefix listing operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +29,28 @@ pub struct ObjectMetadata {
 pub struct ObjectPage {
     pub objects: Vec<ObjectMetadata>,
     pub next_cursor: Option<String>,
+}
+
+/// One ordinary upload lease claimed for recovery. The opaque token fences
+/// every commit and rollback after ownership changes between instances.
+#[derive(Clone)]
+pub struct LeasedMediaUpload {
+    pub media: Media,
+    pub temporary_key: String,
+    pub lease_token: String,
+    pub leased_until: OffsetDateTime,
+}
+
+impl fmt::Debug for LeasedMediaUpload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeasedMediaUpload")
+            .field("media", &self.media)
+            .field("temporary_key", &Redacted(&self.temporary_key))
+            .field("lease_token", &Redacted(&self.lease_token))
+            .field("leased_until", &self.leased_until)
+            .finish()
+    }
 }
 
 /// Facts derived while composing ordered temporary objects into one staged
@@ -78,6 +103,17 @@ pub trait ObjectStore: Send + Sync {
     /// Returns immutable object facts without treating ETag as a checksum.
     async fn head(&self, key: &str) -> Result<ObjectMetadata, ObjectStoreError>;
 
+    /// Returns a trustworthy SHA-256 without requiring the caller to buffer
+    /// the complete object. Backends may use verified provider metadata or a
+    /// streaming digest.
+    async fn checksum_sha256(&self, key: &str) -> Result<String, ObjectStoreError> {
+        self.head(key).await?.checksum_sha256.ok_or_else(|| {
+            ObjectStoreError::Unavailable(
+                "object backend did not provide a trustworthy SHA-256".into(),
+            )
+        })
+    }
+
     /// Lists one lexicographically ordered page below a relative prefix.
     async fn list(
         &self,
@@ -115,6 +151,17 @@ pub trait UploadSessionStorage: Send + Sync {
         session: &UploadSession,
     ) -> Result<StoredUpload, ObjectStoreError>;
 
+    /// Promotes a verified session-scoped temporary object to the immutable
+    /// media key. Implementations must make this operation idempotent and
+    /// must never overwrite an existing final object.
+    async fn finalize_upload(
+        &self,
+        _session: &UploadSession,
+        _final_storage_key: &str,
+    ) -> Result<(), ObjectStoreError> {
+        Ok(())
+    }
+
     /// Terminates multipart state and removes uncommitted objects. Repeated
     /// calls must be safe because cancellation and expiry are retried.
     async fn abort_upload(&self, session: &UploadSession) -> Result<(), ObjectStoreError>;
@@ -133,6 +180,16 @@ pub trait MediaRepository: Send + Sync {
         object_key: &str,
     ) -> Result<Option<Media>, RepositoryError>;
 
+    /// Atomically claims expired ordinary uploads for reconciliation. Each
+    /// returned row owns a freshly rotated fencing token. Multipart uploads
+    /// retain their separate completion protocol and must be excluded.
+    async fn claim_stale_uploading(
+        &self,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<LeasedMediaUpload>, RepositoryError>;
+
     /// Atomically checks available quota and increases reserved bytes.
     async fn reserve_quota(
         &self,
@@ -142,20 +199,42 @@ pub trait MediaRepository: Send + Sync {
 
     /// Persists an `uploading` media record. The unique key constraint must
     /// cover `(application_id, bucket_id, object_key)`.
-    async fn create_uploading(&self, media: Media) -> Result<(), RepositoryError>;
+    async fn create_uploading(
+        &self,
+        media: Media,
+        temporary_key: &str,
+        lease_token: &str,
+        leased_until: OffsetDateTime,
+    ) -> Result<(), RepositoryError>;
+
+    /// Extends an unexpired ordinary upload lease without rotating its token.
+    /// Returns `false` after ownership is lost or the row leaves `uploading`.
+    async fn renew_upload_lease(
+        &self,
+        media_id: MediaId,
+        lease_token: &str,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+    ) -> Result<bool, RepositoryError>;
 
     /// Atomically activates the media, commits its reservation, and writes the
     /// outbox event. It must reject any record not in `uploading` state.
     async fn commit_upload(
         &self,
         media_id: MediaId,
+        lease_token: &str,
         committed_at: OffsetDateTime,
         event: OutboxEvent,
     ) -> Result<Media, RepositoryError>;
 
     /// Removes an uploading record and releases its reservation in one durable
     /// operation. Calling it after a partial failure must be idempotent.
-    async fn abort_upload(&self, media_id: MediaId) -> Result<(), RepositoryError>;
+    async fn abort_upload(
+        &self,
+        media_id: MediaId,
+        lease_token: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), RepositoryError>;
 
     /// Releases a reservation when no media record was successfully created.
     async fn release_quota(
@@ -236,6 +315,14 @@ pub trait UploadSessionRepository: Send + Sync {
         expired_at: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<UploadSession>, RepositoryError>;
+
+    /// Acknowledges physical object cleanup after a terminal session has been
+    /// expired or cancelled. Unacknowledged terminal rows are returned by the
+    /// next expiry scan so a transient storage failure is retried.
+    async fn complete_upload_session_cleanup(
+        &self,
+        upload_session_id: UploadSessionId,
+    ) -> Result<bool, RepositoryError>;
 }
 
 #[derive(Clone, Debug)]
@@ -380,13 +467,26 @@ pub struct OutboxEvent {
 /// Endpoint data required to perform one webhook delivery. The encrypted
 /// secret remains opaque to the application layer and is decrypted only by
 /// the server worker immediately before signing a request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebhookDeliveryEndpoint {
     pub id: String,
     pub application_id: ApplicationId,
     pub url: String,
     pub secret_ciphertext: String,
     pub secret_key_version: u32,
+}
+
+impl fmt::Debug for WebhookDeliveryEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebhookDeliveryEndpoint")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("url", &self.url)
+            .field("secret_ciphertext", &Redacted(&self.secret_ciphertext))
+            .field("secret_key_version", &self.secret_key_version)
+            .finish()
+    }
 }
 
 /// Durable state for one Outbox event and one subscribed webhook endpoint.
@@ -404,11 +504,22 @@ pub struct WebhookDelivery {
 }
 
 /// A delivery claim fenced by a unique lease token.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct LeasedWebhookDelivery {
     pub delivery: WebhookDelivery,
     pub lease_token: String,
     pub leased_until: OffsetDateTime,
+}
+
+impl fmt::Debug for LeasedWebhookDelivery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeasedWebhookDelivery")
+            .field("delivery", &self.delivery)
+            .field("lease_token", &Redacted(&self.lease_token))
+            .field("leased_until", &self.leased_until)
+            .finish()
+    }
 }
 
 /// Result of recording a failed delivery attempt.

@@ -36,7 +36,7 @@ async fn postgres_repository_contract() {
         .migrate()
         .await
         .expect("migrate contract database");
-    sqlx::query("TRUNCATE TABLE users CASCADE")
+    sqlx::query("TRUNCATE TABLE audit_logs, users CASCADE")
         .execute(repository.pool())
         .await
         .expect("reset dedicated contract database");
@@ -49,6 +49,7 @@ async fn postgres_repository_contract() {
     .expect("restore default system settings");
 
     control_plane_schema_contract(&repository).await;
+    tenant_fk_schema_contract(&repository).await;
     control_plane_repository_contract(&repository).await;
     let fixture = Fixture::create(&repository).await;
     administration_and_webhook_contract(&repository, &fixture).await;
@@ -60,6 +61,30 @@ async fn postgres_repository_contract() {
     s3_multipart_quota_and_bucket_contract(&repository, &fixture).await;
     async_job_contract(&repository, &fixture).await;
     variant_contract(&repository, &fixture).await;
+    stale_upload_reconciliation_contract(&repository, &fixture).await;
+}
+
+async fn tenant_fk_schema_contract(repository: &PostgresRepository) {
+    let rows = sqlx::query(
+        "SELECT conname, pg_get_constraintdef(oid) AS definition \
+         FROM pg_constraint \
+         WHERE conname IN (\
+             'media_bucket_application_fkey',\
+             'upload_sessions_bucket_application_fkey',\
+             's3_multipart_uploads_bucket_application_fkey'\
+         )",
+    )
+    .fetch_all(repository.pool())
+    .await
+    .expect("inspect tenant foreign keys");
+    assert_eq!(rows.len(), 3, "all tenant foreign keys must be present");
+    for row in rows {
+        let definition: String = row.try_get("definition").expect("decode FK definition");
+        assert!(
+            definition.contains("(bucket_id, application_id)"),
+            "tenant FK must bind bucket and application together: {definition}"
+        );
+    }
 }
 
 async fn bucket_and_idempotency_contract(repository: &PostgresRepository, fixture: &Fixture) {
@@ -139,20 +164,21 @@ async fn bucket_and_idempotency_contract(repository: &PostgresRepository, fixtur
     );
 
     let expires_at = fixture.now + Duration::minutes(10);
-    assert_eq!(
-        repository
-            .claim_idempotency_key(
-                fixture.application_id,
-                "contract.basic",
-                "basic-key",
-                &"a".repeat(64),
-                expires_at,
-                fixture.now,
-            )
-            .await
-            .expect("claim idempotency key"),
-        IdempotencyClaim::Claimed
-    );
+    let basic_claim = repository
+        .claim_idempotency_key(
+            fixture.application_id,
+            "contract.basic",
+            "basic-key",
+            &"a".repeat(64),
+            expires_at,
+            fixture.now,
+        )
+        .await
+        .expect("claim idempotency key");
+    let basic_token = match basic_claim {
+        IdempotencyClaim::Claimed(token) => token,
+        claim => panic!("expected claimed idempotency key, got {claim:?}"),
+    };
     assert_eq!(
         repository
             .claim_idempotency_key(
@@ -192,6 +218,7 @@ async fn bucket_and_idempotency_contract(repository: &PostgresRepository, fixtur
             "contract.basic",
             "basic-key",
             &"a".repeat(64),
+            &basic_token,
             &response,
             fixture.now + Duration::seconds(2),
         )
@@ -220,26 +247,28 @@ async fn bucket_and_idempotency_contract(repository: &PostgresRepository, fixtur
         fixture.now,
     )
     .expect("create atomic bucket");
-    let context = IdempotencyContext {
+    let mut context = IdempotencyContext {
         application_id: fixture.application_id,
         operation_scope: "contract.bucket.create".to_owned(),
         key: "atomic-bucket-key".to_owned(),
         request_hash: "c".repeat(64),
+        claim_token: String::new(),
     };
-    assert_eq!(
-        repository
-            .claim_idempotency_key(
-                context.application_id,
-                &context.operation_scope,
-                &context.key,
-                &context.request_hash,
-                expires_at,
-                fixture.now,
-            )
-            .await
-            .expect("claim atomic bucket key"),
-        IdempotencyClaim::Claimed
-    );
+    let claim = repository
+        .claim_idempotency_key(
+            context.application_id,
+            &context.operation_scope,
+            &context.key,
+            &context.request_hash,
+            expires_at,
+            fixture.now,
+        )
+        .await
+        .expect("claim atomic bucket key");
+    context.claim_token = match claim {
+        IdempotencyClaim::Claimed(token) => token,
+        claim => panic!("expected claimed idempotency key, got {claim:?}"),
+    };
     let response = CompletedIdempotencyResponse {
         status: 201,
         payload: "{\"bucket\":true}".to_owned(),
@@ -276,44 +305,44 @@ async fn bucket_and_idempotency_contract(repository: &PostgresRepository, fixtur
         IdempotencyClaim::Completed(response)
     );
 
-    let release_context = IdempotencyContext {
+    let mut release_context = IdempotencyContext {
         application_id: fixture.application_id,
         operation_scope: "contract.release".to_owned(),
         key: "release-key".to_owned(),
         request_hash: "d".repeat(64),
+        claim_token: String::new(),
     };
-    assert_eq!(
-        repository
-            .claim_idempotency_key(
-                release_context.application_id,
-                &release_context.operation_scope,
-                &release_context.key,
-                &release_context.request_hash,
-                expires_at,
-                fixture.now,
-            )
-            .await
-            .expect("claim releasable key"),
-        IdempotencyClaim::Claimed
-    );
+    let claim = repository
+        .claim_idempotency_key(
+            release_context.application_id,
+            &release_context.operation_scope,
+            &release_context.key,
+            &release_context.request_hash,
+            expires_at,
+            fixture.now,
+        )
+        .await
+        .expect("claim releasable key");
+    release_context.claim_token = match claim {
+        IdempotencyClaim::Claimed(token) => token,
+        claim => panic!("expected claimed idempotency key, got {claim:?}"),
+    };
     repository
         .release_idempotency_key(&release_context)
         .await
         .expect("release in-progress key");
-    assert_eq!(
-        repository
-            .claim_idempotency_key(
-                release_context.application_id,
-                &release_context.operation_scope,
-                &release_context.key,
-                &release_context.request_hash,
-                expires_at,
-                fixture.now,
-            )
-            .await
-            .expect("reclaim released key"),
-        IdempotencyClaim::Claimed
-    );
+    let reclaimed = repository
+        .claim_idempotency_key(
+            release_context.application_id,
+            &release_context.operation_scope,
+            &release_context.key,
+            &release_context.request_hash,
+            expires_at,
+            fixture.now,
+        )
+        .await
+        .expect("reclaim released key");
+    assert!(matches!(reclaimed, IdempotencyClaim::Claimed(_)));
 }
 
 async fn control_plane_repository_contract(repository: &PostgresRepository) {
@@ -445,15 +474,36 @@ async fn control_plane_repository_contract(repository: &PostgresRepository) {
         )
         .await
         .expect("create verification token");
+    repository
+        .create_one_time_token(
+            user_id,
+            OneTimeTokenPurpose::VerifyEmail,
+            "verify-token-hash-2",
+            now + Duration::minutes(11),
+            now + Duration::seconds(1),
+        )
+        .await
+        .expect("rotate verification token");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM one_time_tokens \
+             WHERE user_id = $1 AND purpose = 'verify_email' AND consumed_at IS NULL",
+        )
+        .bind(user_id.as_uuid())
+        .fetch_one(repository.pool())
+        .await
+        .expect("count active verification tokens"),
+        1
+    );
     assert!(
         repository
-            .consume_email_verification_token("verify-token-hash", now + Duration::seconds(1))
+            .consume_email_verification_token("verify-token-hash-2", now + Duration::seconds(2))
             .await
             .expect("consume verification token")
     );
     assert!(
         !repository
-            .consume_email_verification_token("verify-token-hash", now + Duration::seconds(2))
+            .consume_email_verification_token("verify-token-hash", now + Duration::seconds(3))
             .await
             .expect("verification token is one-time")
     );
@@ -621,11 +671,41 @@ async fn control_plane_repository_contract(repository: &PostgresRepository) {
             .expect("revoked key is inactive")
             .is_none()
     );
+    repository
+        .record_audit(&AuditEvent {
+            id: "audit-application-delete-contract".to_owned(),
+            application_id,
+            actor_type: "user".to_owned(),
+            actor_id: user_id.to_string(),
+            action: "application.delete".to_owned(),
+            target_type: "application".to_owned(),
+            target_id: application_id.to_string(),
+            request_id: "request-application-delete-contract".to_owned(),
+            summary: json!({ "retained": true }),
+            created_at: now,
+        })
+        .await
+        .expect("record application audit event");
     assert!(
         repository
             .delete_application_for_user(user_id, "app_control_plane_contract")
             .await
             .expect("delete empty application")
+    );
+    assert!(
+        repository
+            .find_application_by_id(application_id)
+            .await
+            .expect("find deleted application")
+            .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs WHERE application_id = $1",)
+            .bind(application_id.as_uuid())
+            .fetch_one(repository.pool())
+            .await
+            .expect("count retained audit events"),
+        1
     );
 }
 
@@ -975,7 +1055,6 @@ async fn administration_and_webhook_contract(repository: &PostgresRepository, fi
             &WebhookDeliveryHistoryQuery {
                 status: Some(WebhookDeliveryHistoryStatus::Pending),
                 cursor: Some(WebhookDeliveryHistoryCursor {
-                    updated_at: cursor_item.updated_at,
                     row_id: cursor_item.row_id,
                 }),
                 limit: 1,
@@ -1254,12 +1333,16 @@ async fn quota_and_media_contract(repository: &PostgresRepository, fixture: &Fix
         .reserve_quota(fixture.application_id, media.size())
         .await
         .expect("reserve quota");
-    repository
-        .create_uploading(media.clone())
-        .await
-        .expect("create uploading media");
+    let lease_token = create_leased_upload(repository, &media).await;
     assert!(matches!(
-        repository.create_uploading(media.clone()).await,
+        repository
+            .create_uploading(
+                media.clone(),
+                &format!("temporary/{}", media.id()),
+                &lease_token,
+                fixture.now + Duration::hours(1),
+            )
+            .await,
         Err(RepositoryError::Conflict)
     ));
 
@@ -1280,11 +1363,11 @@ async fn quota_and_media_contract(repository: &PostgresRepository, fixture: &Fix
     let committed_at = fixture.now + Duration::seconds(1);
     let event = OutboxEvent::media_uploaded(&media, committed_at);
     media = repository
-        .commit_upload(media.id(), committed_at, event.clone())
+        .commit_upload(media.id(), &lease_token, committed_at, event.clone())
         .await
         .expect("commit upload");
     let replay = repository
-        .commit_upload(media.id(), committed_at, event)
+        .commit_upload(media.id(), &lease_token, committed_at, event)
         .await
         .expect("idempotent commit replay");
     assert_eq!(replay, media);
@@ -1824,13 +1907,11 @@ async fn activate_media(
         .reserve_quota(media.application_id(), media.size())
         .await
         .expect("reserve media quota");
-    repository
-        .create_uploading(media.clone())
-        .await
-        .expect("create uploading media");
+    let lease_token = create_leased_upload(repository, &media).await;
     repository
         .commit_upload(
             media.id(),
+            &lease_token,
             committed_at,
             OutboxEvent::media_uploaded(&media, committed_at),
         )
@@ -1861,26 +1942,28 @@ async fn upload_session_contract(repository: &PostgresRepository, fixture: &Fixt
         fixture.now,
     )
     .expect("create domain session");
-    let idempotency = IdempotencyContext {
+    let mut idempotency = IdempotencyContext {
         application_id: fixture.application_id,
         operation_scope: "contract.upload.create".to_owned(),
         key: "atomic-upload-key".to_owned(),
         request_hash: "e".repeat(64),
+        claim_token: String::new(),
     };
-    assert_eq!(
-        repository
-            .claim_idempotency_key(
-                idempotency.application_id,
-                &idempotency.operation_scope,
-                &idempotency.key,
-                &idempotency.request_hash,
-                fixture.now + Duration::minutes(10),
-                fixture.now,
-            )
-            .await
-            .expect("claim upload idempotency key"),
-        IdempotencyClaim::Claimed
-    );
+    let claim = repository
+        .claim_idempotency_key(
+            idempotency.application_id,
+            &idempotency.operation_scope,
+            &idempotency.key,
+            &idempotency.request_hash,
+            fixture.now + Duration::minutes(10),
+            fixture.now,
+        )
+        .await
+        .expect("claim upload idempotency key");
+    idempotency.claim_token = match claim {
+        IdempotencyClaim::Claimed(token) => token,
+        claim => panic!("expected claimed idempotency key, got {claim:?}"),
+    };
     let response = CompletedIdempotencyResponse {
         status: 201,
         payload: "{\"upload\":true}".to_owned(),
@@ -1929,6 +2012,44 @@ async fn upload_session_contract(repository: &PostgresRepository, fixture: &Fixt
             .await
             .expect("read reservation");
     assert_eq!(reserved, 0);
+    assert!(
+        repository
+            .expire_upload_sessions(fixture.now + Duration::seconds(3), 10)
+            .await
+            .expect("do not clean a still-replayable cancelled target")
+            .is_empty()
+    );
+    let cleanup_at = session.session_expires_at();
+    let cleanup_candidates = repository
+        .expire_upload_sessions(cleanup_at, 10)
+        .await
+        .expect("list cancelled session cleanup");
+    assert_eq!(
+        cleanup_candidates
+            .iter()
+            .map(UploadSession::id)
+            .collect::<Vec<_>>(),
+        vec![session.id()]
+    );
+    assert!(
+        repository
+            .complete_upload_session_cleanup(session.id())
+            .await
+            .expect("mark upload cleanup complete")
+    );
+    assert!(
+        repository
+            .expire_upload_sessions(cleanup_at + Duration::seconds(1), 10)
+            .await
+            .expect("relist cleaned sessions")
+            .is_empty()
+    );
+    assert!(
+        !repository
+            .complete_upload_session_cleanup(session.id())
+            .await
+            .expect("replay cleanup acknowledgement")
+    );
 }
 
 async fn s3_multipart_contract(repository: &PostgresRepository, fixture: &Fixture) {
@@ -1960,7 +2081,12 @@ async fn s3_multipart_contract(repository: &PostgresRepository, fixture: &Fixtur
     assert_eq!(found.object_key, object_key);
     assert!(matches!(
         repository
-            .create_uploading(fixture.media(&object_key, 1))
+            .create_uploading(
+                fixture.media(&object_key, 1),
+                "temporary/multipart-conflict",
+                "multipart-conflict-lease",
+                fixture.now + Duration::hours(1),
+            )
             .await,
         Err(RepositoryError::Conflict)
     ));
@@ -2899,20 +3025,197 @@ async fn reserved_bytes(repository: &PostgresRepository, application_id: Applica
         .expect("read application reserved bytes")
 }
 
+async fn stale_upload_reconciliation_contract(repository: &PostgresRepository, fixture: &Fixture) {
+    let stale_at = fixture.now - Duration::minutes(10);
+    let stale_media = fixture.media_at(
+        &format!("reconciliation/stale-{}.bin", Uuid::new_v4()),
+        2,
+        stale_at,
+        None,
+    );
+    repository
+        .reserve_quota(fixture.application_id, stale_media.size())
+        .await
+        .expect("reserve stale upload quota");
+    let stale_token = Uuid::new_v4().to_string();
+    let stale_temporary_key = format!("temporary/{}", stale_media.id());
+    repository
+        .create_uploading(
+            stale_media.clone(),
+            &stale_temporary_key,
+            &stale_token,
+            fixture.now - Duration::seconds(1),
+        )
+        .await
+        .expect("create stale ordinary upload");
+
+    let fresh_media = fixture.media_at(
+        &format!("reconciliation/fresh-{}.bin", Uuid::new_v4()),
+        2,
+        fixture.now,
+        None,
+    );
+    repository
+        .reserve_quota(fixture.application_id, fresh_media.size())
+        .await
+        .expect("reserve fresh upload quota");
+    let fresh_token = Uuid::new_v4().to_string();
+    repository
+        .create_uploading(
+            fresh_media.clone(),
+            &format!("temporary/{}", fresh_media.id()),
+            &fresh_token,
+            fixture.now + Duration::hours(1),
+        )
+        .await
+        .expect("create fresh ordinary upload");
+
+    let multipart_upload_id = format!("reconciliation-{}", Uuid::new_v4());
+    let multipart_object_key = format!("reconciliation/multipart-{}.bin", Uuid::new_v4());
+    repository
+        .create_multipart_upload(NewS3MultipartUpload {
+            upload_id: multipart_upload_id.clone(),
+            application_id: fixture.application_id,
+            bucket_id: fixture.bucket_id,
+            object_key: multipart_object_key.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            visibility_override: None,
+            expires_at: fixture.now + Duration::minutes(15),
+            created_at: stale_at,
+        })
+        .await
+        .expect("create stale multipart upload");
+    repository
+        .put_multipart_part(
+            &multipart_upload_id,
+            multipart_part(
+                1,
+                3,
+                "reconciliation-etag",
+                &format!("multipart-parts/{}/1", Uuid::new_v4()),
+            ),
+            1_000,
+            stale_at + Duration::seconds(1),
+        )
+        .await
+        .expect("store stale multipart part");
+    let manifest = [mediahub_app::CompletedS3MultipartPart {
+        part_number: 1,
+        etag: "reconciliation-etag".to_owned(),
+    }];
+    let completion_token = "reconciliation-completion-token";
+    assert!(matches!(
+        repository
+            .claim_multipart_completion(
+                &multipart_upload_id,
+                &manifest,
+                completion_token,
+                fixture.now + Duration::minutes(1),
+                stale_at + Duration::seconds(2),
+            )
+            .await
+            .expect("claim stale multipart completion"),
+        S3MultipartCompletionClaim::Claimed(_)
+    ));
+    let multipart_media = fixture.media_at(
+        &multipart_object_key,
+        3,
+        stale_at + Duration::seconds(3),
+        None,
+    );
+    repository
+        .create_uploading_for_multipart(
+            &multipart_upload_id,
+            completion_token,
+            multipart_media.clone(),
+        )
+        .await
+        .expect("create fenced multipart media");
+
+    assert!(
+        repository
+            .claim_stale_uploading(fixture.now, fixture.now + Duration::minutes(2), 0,)
+            .await
+            .expect("zero-limit stale upload scan")
+            .is_empty()
+    );
+    let claimed = repository
+        .claim_stale_uploading(fixture.now, fixture.now + Duration::minutes(2), 10)
+        .await
+        .expect("scan stale ordinary uploads");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|upload| upload.media.id())
+            .collect::<Vec<_>>(),
+        vec![stale_media.id()],
+        "fresh uploads and fenced multipart completions must not be reconciled"
+    );
+    let claimed = claimed.into_iter().next().expect("stale upload claimed");
+    assert_eq!(claimed.temporary_key, stale_temporary_key);
+    assert_ne!(claimed.lease_token, stale_token);
+    assert!(
+        repository
+            .claim_stale_uploading(
+                fixture.now + Duration::seconds(1),
+                fixture.now + Duration::minutes(3),
+                10,
+            )
+            .await
+            .expect("second reconciler claim")
+            .is_empty(),
+        "an active reconciliation lease must be exclusive across instances"
+    );
+    assert!(
+        !repository
+            .renew_upload_lease(
+                stale_media.id(),
+                &stale_token,
+                fixture.now,
+                fixture.now + Duration::minutes(4),
+            )
+            .await
+            .expect("stale owner renewal is fenced")
+    );
+    assert_eq!(
+        repository
+            .commit_upload(
+                stale_media.id(),
+                &stale_token,
+                fixture.now,
+                OutboxEvent::media_uploaded(&stale_media, fixture.now),
+            )
+            .await,
+        Err(RepositoryError::Conflict)
+    );
+    assert_eq!(
+        repository
+            .abort_upload(stale_media.id(), &stale_token, fixture.now)
+            .await,
+        Err(RepositoryError::Conflict)
+    );
+    repository
+        .abort_upload(stale_media.id(), &claimed.lease_token, fixture.now)
+        .await
+        .expect("current reconciler may roll back");
+    repository
+        .abort_upload(fresh_media.id(), &fresh_token, fixture.now)
+        .await
+        .expect("fresh owner cleanup");
+}
+
 async fn async_job_contract(repository: &PostgresRepository, fixture: &Fixture) {
     let media = fixture.media("jobs/target.bin", 1);
     repository
         .reserve_quota(fixture.application_id, media.size())
         .await
         .expect("reserve job target quota");
-    repository
-        .create_uploading(media.clone())
-        .await
-        .expect("create job target");
+    let lease_token = create_leased_upload(repository, &media).await;
     let committed_at = fixture.now + Duration::seconds(20);
     let media = repository
         .commit_upload(
             media.id(),
+            &lease_token,
             committed_at,
             OutboxEvent::media_uploaded(&media, committed_at),
         )
@@ -3019,14 +3322,12 @@ async fn variant_contract(repository: &PostgresRepository, fixture: &Fixture) {
         .reserve_quota(fixture.application_id, media.size())
         .await
         .expect("reserve variant source quota");
-    repository
-        .create_uploading(media.clone())
-        .await
-        .expect("create variant source");
+    let upload_lease_token = create_leased_upload(repository, &media).await;
     let committed_at = fixture.now + Duration::seconds(30);
     let media = repository
         .commit_upload(
             media.id(),
+            &upload_lease_token,
             committed_at,
             OutboxEvent::media_uploaded(&media, committed_at),
         )
@@ -3145,6 +3446,20 @@ impl Fixture {
         )
         .expect("media fixture")
     }
+}
+
+async fn create_leased_upload(repository: &PostgresRepository, media: &Media) -> String {
+    let lease_token = Uuid::new_v4().to_string();
+    repository
+        .create_uploading(
+            media.clone(),
+            &format!("temporary/{}", media.id()),
+            &lease_token,
+            media.created_at() + Duration::hours(1),
+        )
+        .await
+        .expect("create leased uploading media");
+    lease_token
 }
 
 fn postgres_now() -> OffsetDateTime {

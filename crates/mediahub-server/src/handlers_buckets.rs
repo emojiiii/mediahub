@@ -199,13 +199,14 @@ async fn create_bucket(
             operation_scope: context.operation_scope,
             key: context.idempotency_key.expect("filtered idempotency key"),
             request_hash: context.request_hash,
+            claim_token: String::new(),
         });
     if is_hmac && idempotency.is_none() {
         return Err(ApiError::bad_request(
             "Idempotency-Key is required for HMAC bucket creation",
         ));
     }
-    if let Some(idempotency) = idempotency {
+    if let Some(mut idempotency) = idempotency {
         let now = OffsetDateTime::now_utc();
         match state
             .repository
@@ -225,7 +226,7 @@ async fn create_bucket(
                 return Err(ApiError::idempotency_in_progress());
             }
             IdempotencyClaim::Conflict => return Err(ApiError::idempotency_conflict()),
-            IdempotencyClaim::Claimed => {}
+            IdempotencyClaim::Claimed(claim_token) => idempotency.claim_token = claim_token,
         }
         let completed_response = CompletedIdempotencyResponse {
             status: StatusCode::CREATED.as_u16(),

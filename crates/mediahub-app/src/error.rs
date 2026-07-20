@@ -1,7 +1,17 @@
+use std::fmt;
+
 use mediahub_core::DomainError;
 use thiserror::Error;
 
 use crate::{ObjectStoreError, RepositoryError};
+
+pub(crate) struct Redacted<T>(pub T);
+
+impl<T> fmt::Debug for Redacted<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
 
 /// Stable application-level failures. Runtime entries map these errors to their
 /// transport-specific response formats without exposing adapter internals.

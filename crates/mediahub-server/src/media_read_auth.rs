@@ -9,6 +9,14 @@ async fn read_media_bytes(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if let Some(transform) = query.transform()? {
+        // The image adapters enforce the same bound after receiving bytes.
+        // Reject from metadata first so a large source object is never read
+        // fully into the request task only to be discarded by the processor.
+        if media.size() > mediahub_adapter_image::MAX_INPUT_BYTES as u64 {
+            return Err(ApiError::payload_too_large(
+                "source image exceeds the maximum transform input size",
+            ));
+        }
         let _slot = state
             .variant_slots
             .acquire()

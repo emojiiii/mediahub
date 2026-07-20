@@ -29,10 +29,11 @@ impl PostgresRepository {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+        let claim_token = Uuid::new_v4().to_string();
         let inserted = sqlx::query(
             "INSERT INTO idempotency_keys (id, application_id, operation_scope, \
-             idempotency_key, request_hash, status, expires_at, created_at) \
-             VALUES ($1, $2, $3, $4, $5, 'in_progress', $6, $7) \
+             idempotency_key, request_hash, claim_token, status, expires_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'in_progress', $7, $8) \
              ON CONFLICT (application_id, operation_scope, idempotency_key) DO NOTHING",
         )
         .bind(Uuid::new_v4())
@@ -40,6 +41,7 @@ impl PostgresRepository {
         .bind(operation_scope)
         .bind(idempotency_key)
         .bind(request_hash)
+        .bind(&claim_token)
         .bind(postgres_time(expires_at))
         .bind(now)
         .execute(&mut *transaction)
@@ -47,7 +49,7 @@ impl PostgresRepository {
         .map_err(database_error)?;
         if inserted.rows_affected() == 1 {
             transaction.commit().await.map_err(database_error)?;
-            return Ok(IdempotencyClaim::Claimed);
+            return Ok(IdempotencyClaim::Claimed(claim_token));
         }
 
         let row = sqlx::query(
@@ -86,12 +88,14 @@ impl PostgresRepository {
         Ok(claim)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_idempotency_key(
         &self,
         application_id: ApplicationId,
         operation_scope: &str,
         idempotency_key: &str,
         request_hash: &str,
+        claim_token: &str,
         response: &CompletedIdempotencyResponse,
         completed_at: OffsetDateTime,
     ) -> Result<(), RepositoryError> {
@@ -100,6 +104,7 @@ impl PostgresRepository {
             operation_scope: operation_scope.to_owned(),
             key: idempotency_key.to_owned(),
             request_hash: request_hash.to_owned(),
+            claim_token: claim_token.to_owned(),
         };
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         complete_in_transaction(&mut transaction, &context, response, completed_at).await?;
@@ -148,12 +153,14 @@ impl PostgresRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "DELETE FROM idempotency_keys WHERE application_id = $1 AND operation_scope = $2 \
-             AND idempotency_key = $3 AND request_hash = $4 AND status = 'in_progress'",
+             AND idempotency_key = $3 AND request_hash = $4 AND claim_token = $5 \
+             AND status = 'in_progress'",
         )
         .bind(idempotency.application_id.as_uuid())
         .bind(&idempotency.operation_scope)
         .bind(&idempotency.key)
         .bind(&idempotency.request_hash)
+        .bind(&idempotency.claim_token)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
@@ -171,7 +178,7 @@ async fn complete_in_transaction(
         "UPDATE idempotency_keys SET status = 'completed', response_status = $1, \
          response_payload = $2, resource_id = $3, completed_at = $4 \
          WHERE application_id = $5 AND operation_scope = $6 AND idempotency_key = $7 \
-         AND request_hash = $8 AND status = 'in_progress'",
+         AND request_hash = $8 AND claim_token = $9 AND status = 'in_progress'",
     )
     .bind(i32::from(response.status))
     .bind(&response.payload)
@@ -181,6 +188,7 @@ async fn complete_in_transaction(
     .bind(&idempotency.operation_scope)
     .bind(&idempotency.key)
     .bind(&idempotency.request_hash)
+    .bind(&idempotency.claim_token)
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;

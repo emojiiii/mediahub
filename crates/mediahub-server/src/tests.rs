@@ -836,6 +836,74 @@ fn api_timestamps_are_human_readable_strings() {
 }
 
 #[test]
+fn async_job_http_responses_exclude_internal_identity_and_lease_fields() {
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let mut job = mediahub_core::AsyncJob::new(
+        mediahub_core::NewAsyncJob {
+            id: AsyncJobId::new(),
+            application_id: ApplicationId::new(),
+            operation_scope: "media.batch".to_owned(),
+            idempotency_key: "private-idempotency-key".to_owned(),
+            request_hash: "a".repeat(64),
+            request_id: Some("request-123".to_owned()),
+            action: AsyncJobAction::Delete,
+            total_items: 1,
+            max_attempts: 8,
+        },
+        now,
+    )
+    .expect("async job");
+    job.claim(
+        "private-lease-token",
+        now + time::Duration::seconds(30),
+        now,
+    )
+    .expect("running async job");
+
+    fn assert_public_job_shape(payload: &serde_json::Value) {
+        for internal in [
+            "lease_token",
+            "leased_until",
+            "idempotency_key",
+            "request_hash",
+        ] {
+            assert!(
+                payload.get(internal).is_none(),
+                "HTTP async job response exposed internal field {internal}"
+            );
+        }
+        assert_eq!(payload["operation_scope"], "media.batch");
+        assert_eq!(payload["request_id"], "request-123");
+        assert_eq!(payload["state"], "running");
+        assert_eq!(payload["total_items"], 1);
+    }
+
+    let job_payload = serde_json::to_value(AsyncJobResponse::from(job.clone()))
+        .expect("serialize async job HTTP response");
+    assert_public_job_shape(&job_payload);
+
+    let receipt_payload = serde_json::to_value(AsyncJobReceiptResponse::from(
+        mediahub_app::AsyncJobReceipt {
+            job: job.clone(),
+            already_existed: false,
+        },
+    ))
+    .expect("serialize async job receipt HTTP response");
+    assert_public_job_shape(&receipt_payload["job"]);
+    assert_eq!(receipt_payload["already_existed"], false);
+
+    let details_payload = serde_json::to_value(AsyncJobDetailsResponse::from(
+        mediahub_app::AsyncJobDetails {
+            job,
+            item_results: Vec::new(),
+        },
+    ))
+    .expect("serialize async job details HTTP response");
+    assert_public_job_shape(&details_payload["job"]);
+    assert_eq!(details_payload["item_results"], serde_json::json!([]));
+}
+
+#[test]
 fn cors_allows_application_context_and_security_headers() {
     let headers = cors_allowed_headers();
     for expected in [
@@ -2721,6 +2789,30 @@ fn webhook_events_must_be_known_and_are_normalized() {
     assert!(validate_webhook_events(vec!["unknown.event".into()]).is_err());
     assert!(
         validate_webhook_events(vec!["media.uploaded".into(), "media.uploaded".into()]).is_ok()
+    );
+}
+
+#[test]
+fn webhook_delivery_cursor_uses_immutable_history_id_and_accepts_legacy_tokens() {
+    let cursor = WebhookDeliveryHistoryCursor { row_id: 42 };
+    let encoded = encode_webhook_delivery_cursor(cursor);
+    let decoded_bytes = URL_SAFE_NO_PAD.decode(&encoded).expect("cursor encoding");
+    let decoded_json: serde_json::Value =
+        serde_json::from_slice(&decoded_bytes).expect("cursor JSON");
+
+    assert_eq!(decoded_json, serde_json::json!({ "row_id": 42 }));
+    assert_eq!(
+        decode_webhook_delivery_cursor(&encoded).expect("current cursor"),
+        cursor
+    );
+
+    let legacy = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({ "updated_at": 0, "row_id": 42 }))
+            .expect("legacy cursor JSON"),
+    );
+    assert_eq!(
+        decode_webhook_delivery_cursor(&legacy).expect("legacy cursor"),
+        cursor
     );
 }
 

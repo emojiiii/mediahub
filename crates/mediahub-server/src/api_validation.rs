@@ -256,7 +256,7 @@ fn webhook_delivery_status_name(value: WebhookDeliveryHistoryStatus) -> &'static
 fn encode_webhook_delivery_cursor(cursor: WebhookDeliveryHistoryCursor) -> String {
     URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&WebhookDeliveryCursorToken {
-            updated_at: cursor.updated_at.unix_timestamp(),
+            updated_at: None,
             row_id: cursor.row_id,
         })
         .expect("webhook delivery cursor serializes"),
@@ -276,8 +276,6 @@ fn decode_webhook_delivery_cursor(value: &str) -> Result<WebhookDeliveryHistoryC
         return Err(ApiError::bad_request("cursor is invalid"));
     }
     Ok(WebhookDeliveryHistoryCursor {
-        updated_at: OffsetDateTime::from_unix_timestamp(cursor.updated_at)
-            .map_err(|_| ApiError::bad_request("cursor is invalid"))?,
         row_id: cursor.row_id,
     })
 }

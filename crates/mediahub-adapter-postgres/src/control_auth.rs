@@ -170,6 +170,17 @@ impl AuthRepository for PostgresRepository {
     ) -> Result<(), RepositoryError> {
         let now = postgres_time(now);
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // Serialize token rotation per user so concurrent resend/reset
+        // requests cannot both observe the same previous active token and
+        // leave two newly-issued tokens active.
+        let user_exists = sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if user_exists.is_none() {
+            return Err(RepositoryError::NotFound);
+        }
         sqlx::query(
             "UPDATE one_time_tokens SET consumed_at = $1 \
              WHERE user_id = $2 AND purpose = $3 AND consumed_at IS NULL",

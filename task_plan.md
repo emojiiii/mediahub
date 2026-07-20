@@ -57,6 +57,16 @@ Improve the create-application dialog and ensure each Application owns an isolat
 
 | Error | Attempt | Resolution |
 | --- | --- | --- |
+| A parallel source read failed because one exploratory `rg` pattern had no match | 1 | Switched to already located line ranges and `Promise.allSettled`; no code state was changed |
+| Final-verification findings patch used a heading that exists only in `task_plan.md`, not `findings.md` | 1 | No file was changed; re-read both tails and appended findings under a stable end-of-file anchor |
+| A combined code/plan/progress patch used an unstable historical mojibake line as context | 1 | The patch was atomic and changed nothing; split product and record edits, using ASCII anchors |
+| A final test lookup used `rg` without tolerating a legitimate no-match exit code | 1 | No file was changed; switched the lookup to `Select-String` and added a direct cursor compatibility test |
+| The first S3 cleanup regression patch assumed a stale end-of-test assertion | 1 | The patch was atomic and changed nothing; re-read the exact function and split the edit into stable hunks |
+| A cursor test command used `--exact` without the `tests::` module prefix and ran zero tests | 1 | Re-ran with the complete test name and verified one actual passing test |
+| Final-verification findings patch used a heading that exists only in `task_plan.md`, not `findings.md` | 1 | No file was changed; re-read both tails and append findings under a stable end-of-file anchor |
+| Tried to invoke `spawn_agent` through `functions.exec`, where collaboration tools are unavailable | 1 | Spawn/follow up agents directly through the collaboration namespace |
+| New agent slots were occupied by completed review agents | 1 | Reused the completed review agents with `followup_task` for image/local and PostgreSQL/OpenAPI fixes |
+| Accidentally called the exec-cell wait tool without a cell ID while checking agent state | 1 | Used `collaboration.list_agents` and direct follow-up tools instead |
 | apply_patch could not read workspace files because the Windows sandbox ACL helper failed | 1 | Use guarded .NET text replacement for this session |
 | Exact replacement depended on platform newline bytes and did not match applyMockBatch | 1 | Switch to function-boundary and signature-only replacements |
 | In-app browser runtime exited because the Windows sandbox ACL helper failed | 1 | Fall back to the repository Playwright CLI workflow for local visual verification |
@@ -232,3 +242,66 @@ Rewrite the README's opening guide to document executable startup, production de
 | --- | --- | --- |
 | The broad `email` test filter also selected an existing SQLx auth-lifecycle test without `DATABASE_URL` | 1 | Use exact `email::tests` and `tests::resend_` filters for unit/provider coverage, then run database-backed tests with the configured PostgreSQL service |
 | Docker Desktop stopped before final PostgreSQL/image validation | 1 | Complete non-Docker checks first, then restore the local Docker engine if available and rerun the isolated database/image checks |
+
+## Current Task: Pre-release Crates Quality Review
+
+### Goal
+
+Audit every Rust package under `crates/` before release, prioritizing correctness defects, production risks, architecture and ownership boundaries, module cohesion, and missing regression coverage. This is a review-only task unless the user later requests fixes.
+
+### Phases
+
+**Status:** complete
+
+- [completed] 1. Inventory workspace packages, source layout, tests, and dependency boundaries
+- [completed] 2. Run package-level code and architecture reviews in parallel
+- [completed] 3. Audit cross-crate contracts, unsafe/error/concurrency patterns, and release configuration
+- [completed] 4. Run formatting, compilation, lint, and targeted test verification
+- [completed] 5. Corroborate findings and deliver a severity-ordered report with file/line evidence
+
+### Review Rules
+
+- Findings must identify a concrete failure mode or maintainability cost, not merely a style preference.
+- Every reported issue must be verified against current source and include an exact file/line reference.
+- Existing historical changes are preserved; no product code will be changed during this review.
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| PowerShell did not expand the `crates/*/Cargo.toml` glob passed to `rg` | 1 | Use `rg` directory scopes or enumerate manifests with `rg --files` for subsequent scans |
+| PowerShell also passed `webdav*.rs` and `s3_http*.rs` to `rg` literally | 1 | Use `rg crates/mediahub-server/src -g 'webdav*.rs'` / `-g 's3_http*.rs'` instead of path globs |
+| A parallel review batch failed because a no-match `rg` returned exit code 1 | 1 | Re-ran independent reads with per-command error capture; no source output was lost |
+| `docker compose ps` could not interpolate required secret variables in the current shell | 1 | Used direct Docker status plus environment-presence checks; no running database or configured destructive-test URL is available |
+| One late architecture scan again used a PowerShell path wildcard that `rg` received literally | 1 | Re-ran with the crate directory plus `-g 'lib.rs' -g 'main.rs'`; architecture inventory completed |
+
+## Current Task: Pre-release Crates Remediation
+
+### Goal
+
+Implement and verify the confirmed release findings from the crates quality review. Product code changes are authorized for all crates, adapters, migrations, OpenAPI DTOs, server handlers/workers, and focused regression tests. Preserve existing behavior where it is not part of a finding.
+
+### Phases
+
+**Status:** complete
+
+- [completed] 1. Establish repair matrix and cross-crate interface decisions
+- [completed] 2. Repair core/app invariants, upload/session/task recovery, and error semantics
+- [completed] 3. Repair image/local/S3 adapter safety and storage contracts
+- [completed] 4. Repair PostgreSQL aggregate/tenant/idempotency/webhook boundaries and OpenAPI parity
+- [completed] 5. Repair server auth, workers, handlers, and protocol integration
+- [completed] 6. Run focused regressions, full formatting/check/Clippy/tests, and final release audit
+
+### Repair Decisions
+
+- Preserve the existing adapter ports where possible; introduce explicit outcome/state variants only when they prevent destructive rollback or lease ambiguity.
+- Treat object-store promotion as a durable commit boundary: cleanup failures become retryable orphan cleanup, never evidence that the final object is absent.
+- Make durable aggregate operations atomic in the PostgreSQL adapter instead of composing multiple independently committed calls in HTTP handlers.
+- Keep public OpenAPI DTOs separate from internal persistence/domain aggregates; never serialize lease tokens or storage internals directly.
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| Final read-only review found additional upload-reconciliation, 16-bit image, webhook timeout, and OpenAPI timestamp gaps | 1 | Added durable ordinary-upload fencing/heartbeats, byte-accurate image limits, bounded webhook attempts, and explicit public schema contracts; reran the full matrix |
+| A combined final-record patch used an error-row anchor from an earlier plan section | 1 | The patch was atomic and changed nothing; split the final updates by file and current-task heading |

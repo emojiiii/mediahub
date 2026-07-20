@@ -34,7 +34,7 @@ fn transform_image(
     let (source_width, source_height) = image.dimensions();
     let (width, height) = requested_dimensions(transform, source_width, source_height)?;
     let transformed = match transform.fit() {
-        VariantFit::Cover => cover(image, width, height, transform.crop()),
+        VariantFit::Cover => cover(image, width, height, transform.crop())?,
         VariantFit::Contain => contain(image, width, height, transform.background())?,
         VariantFit::Inside => image.resize(width, height, FilterType::Lanczos3),
     };
@@ -85,11 +85,23 @@ fn requested_dimensions(
     Ok(dimensions)
 }
 
-fn cover(image: DynamicImage, width: u32, height: u32, crop: CropPosition) -> DynamicImage {
+fn cover(
+    image: DynamicImage,
+    width: u32,
+    height: u32,
+    crop: CropPosition,
+) -> Result<DynamicImage, ImageProcessorError> {
     let (source_width, source_height) = image.dimensions();
     let scale = (width as f64 / source_width as f64).max(height as f64 / source_height as f64);
     let resized_width = (source_width as f64 * scale).ceil() as u32;
     let resized_height = (source_height as f64 * scale).ceil() as u32;
+    if !allocation_fits(
+        resized_width,
+        resized_height,
+        u64::from(image.color().bytes_per_pixel()),
+    ) {
+        return Err(ImageProcessorError::OutputTooLarge);
+    }
     let resized = image.resize_exact(resized_width, resized_height, FilterType::Lanczos3);
     let max_x = resized_width.saturating_sub(width);
     let max_y = resized_height.saturating_sub(height);
@@ -100,7 +112,7 @@ fn cover(image: DynamicImage, width: u32, height: u32, crop: CropPosition) -> Dy
         CropPosition::Left => (0, max_y / 2),
         CropPosition::Right => (max_x, max_y / 2),
     };
-    resized.crop_imm(x, y, width, height)
+    Ok(resized.crop_imm(x, y, width, height))
 }
 
 fn contain(

@@ -64,6 +64,8 @@ mod tests {
         let variant_formats = include_str!("../migrations/0004_remove_avif_variants.sql");
         let system_settings = include_str!("../migrations/0005_system_settings.sql");
         let s3_multipart = include_str!("../migrations/0006_s3_multipart.sql");
+        let ordinary_upload_fencing =
+            include_str!("../migrations/0010_ordinary_upload_fencing.sql");
         assert!(repository.contains("JSONB"));
         assert!(repository.contains("TIMESTAMPTZ"));
         assert!(repository.contains("async_jobs_claimable_idx"));
@@ -93,6 +95,9 @@ mod tests {
         assert!(s3_multipart.contains("part_number BETWEEN 1 AND 10000"));
         assert!(s3_multipart.contains("completion_lease_until"));
         assert!(s3_multipart.contains("s3_multipart_expiry_idx"));
+        assert!(ordinary_upload_fencing.contains("upload_lease_token"));
+        assert!(ordinary_upload_fencing.contains("mediahub_normalize_upload_lease"));
+        assert!(ordinary_upload_fencing.contains("media_upload_reconciliation_idx"));
     }
 
     #[test]

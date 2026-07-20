@@ -27,6 +27,7 @@ use utoipa::OpenApi;
         dto::AsyncJob,
         dto::AsyncJobAction,
         dto::AsyncJobDetails,
+        dto::AsyncJobItemState,
         dto::AsyncJobItemResult,
         dto::AsyncJobReceipt,
         dto::AuditEvent,
@@ -223,31 +224,241 @@ mod tests {
         let schemas = document["components"]["schemas"]
             .as_object()
             .ok_or_else(|| anyhow!("schemas must be an object"))?;
-        ensure!(
-            schemas.len() == 61,
-            "expected 61 public DTO schemas, got {}",
-            schemas.len()
-        );
-        for required in [
-            "AdminSettings",
-            "AdminUpdateSettings",
-            "AdminUser",
-            "AdminUpdateApplicationQuota",
+        let surfaces: &[(&str, &[&str])] = &[
+            (
+                "administration",
+                &[
+                    "AdminApplication",
+                    "AdminAudit",
+                    "AdminJob",
+                    "AdminSettings",
+                    "AdminStorage",
+                    "AdminUpdateApplicationQuota",
+                    "AdminUpdateSettings",
+                    "AdminUpdateUserStatus",
+                    "AdminUser",
+                ],
+            ),
+            (
+                "authentication",
+                &["Credentials", "Me", "RegistrationResponse", "Session"],
+            ),
+            (
+                "control plane",
+                &[
+                    "AccessKey",
+                    "Application",
+                    "Bucket",
+                    "CreateAccessKeyResponse",
+                    "LifecycleRule",
+                ],
+            ),
+            (
+                "media",
+                &["Media", "MediaPage", "SignedMediaUrl", "UploadMedia"],
+            ),
+            (
+                "upload sessions",
+                &[
+                    "CompleteUploadSessionResponse",
+                    "CreateUploadSession",
+                    "CreateUploadSessionResponse",
+                    "UploadSession",
+                    "UploadTarget",
+                ],
+            ),
+            (
+                "asynchronous jobs",
+                &[
+                    "AsyncJob",
+                    "AsyncJobAction",
+                    "AsyncJobDetails",
+                    "AsyncJobItemResult",
+                    "AsyncJobItemState",
+                    "AsyncJobReceipt",
+                    "BatchMediaRequest",
+                    "BatchMediaResponse",
+                ],
+            ),
+            (
+                "webhooks",
+                &[
+                    "CreateWebhookResponse",
+                    "UpdateWebhookResponse",
+                    "Webhook",
+                    "WebhookDelivery",
+                    "WebhookDeliveryPage",
+                ],
+            ),
+        ];
+        for (surface, required_schemas) in surfaces {
+            for required in *required_schemas {
+                ensure!(
+                    schemas.contains_key(*required),
+                    "{surface} surface is missing DTO schema {required}"
+                );
+            }
+        }
+
+        let assert_schema_ref = |schema: &Value, expected: &str, context: &str| -> Result<()> {
+            let expected_ref = format!("#/components/schemas/{expected}");
+            ensure!(
+                schema["$ref"].as_str() == Some(expected_ref.as_str()),
+                "{context} must reference {expected_ref}"
+            );
+            Ok(())
+        };
+
+        let batch = &document["paths"]["/api/v1/media/batch"]["post"];
+        assert_schema_ref(
+            &batch["requestBody"]["content"]["application/json"]["schema"],
+            "BatchMediaRequest",
+            "media batch request",
+        )?;
+        assert_schema_ref(
+            &batch["responses"]["202"]["content"]["application/json"]["schema"],
+            "AsyncJobReceipt",
+            "media batch asynchronous response",
+        )?;
+
+        let jobs = &document["paths"]["/api/v1/jobs/{job_id}"];
+        assert_schema_ref(
+            &jobs["get"]["responses"]["200"]["content"]["application/json"]["schema"],
             "AsyncJobDetails",
-            "Bucket",
+            "async job read response",
+        )?;
+        assert_schema_ref(
+            &jobs["delete"]["responses"]["200"]["content"]["application/json"]["schema"],
+            "AsyncJob",
+            "async job cancellation response",
+        )?;
+
+        let uploads = &document["paths"]["/api/v1/uploads"]["post"];
+        assert_schema_ref(
+            &uploads["requestBody"]["content"]["application/json"]["schema"],
             "CreateUploadSession",
-            "Error",
-            "LifecycleRule",
-            "Media",
-            "UploadSession",
+            "upload session request",
+        )?;
+        assert_schema_ref(
+            &uploads["responses"]["201"]["content"]["application/json"]["schema"],
+            "CreateUploadSessionResponse",
+            "upload session response",
+        )?;
+
+        let webhook_history = &document["paths"]["/api/v1/webhooks/{webhook_id}/deliveries"]["get"];
+        assert_schema_ref(
+            &webhook_history["responses"]["200"]["content"]["application/json"]["schema"],
             "WebhookDeliveryPage",
+            "webhook delivery history response",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn async_job_contract_matches_the_public_runtime_shape() -> Result<()> {
+        let document = document()?;
+        let job = &document["components"]["schemas"]["AsyncJob"];
+        let job_properties = job["properties"]
+            .as_object()
+            .ok_or_else(|| anyhow!("AsyncJob properties must be an object"))?;
+        for internal in [
+            "lease_token",
+            "leased_until",
+            "idempotency_key",
+            "request_hash",
         ] {
             ensure!(
-                schemas.contains_key(required),
-                "missing DTO schema {required}"
+                !job_properties.contains_key(internal),
+                "AsyncJob must not expose internal field {internal}"
             );
         }
-        Ok(())
+
+        let assert_required = |schema: &Value, fields: &[&str], name: &str| -> Result<()> {
+            let required = schema["required"]
+                .as_array()
+                .ok_or_else(|| anyhow!("{name} required fields must be an array"))?;
+            for field in fields {
+                ensure!(
+                    required.iter().any(|required| required == field),
+                    "{name}.{field} is always serialized and must be required"
+                );
+            }
+            Ok(())
+        };
+        let assert_nullable_datetime =
+            |schema: &Value, fields: &[&str], name: &str| -> Result<()> {
+                for field in fields {
+                    let property = &schema["properties"][field];
+                    ensure!(
+                        property["type"] == serde_json::json!(["string", "null"])
+                            && property["format"] == "date-time",
+                        "{name}.{field} must be a nullable date-time string"
+                    );
+                }
+                Ok(())
+            };
+        let assert_nullable_string = |schema: &Value, fields: &[&str], name: &str| -> Result<()> {
+            for field in fields {
+                ensure!(
+                    schema["properties"][field]["type"] == serde_json::json!(["string", "null"]),
+                    "{name}.{field} must be a nullable string"
+                );
+            }
+            Ok(())
+        };
+        let assert_datetime = |schema: &Value, fields: &[&str], name: &str| -> Result<()> {
+            for field in fields {
+                ensure!(
+                    schema["properties"][field]
+                        == serde_json::json!({ "type": "string", "format": "date-time" }),
+                    "{name}.{field} must be a date-time string"
+                );
+            }
+            Ok(())
+        };
+
+        assert_required(
+            job,
+            &[
+                "request_id",
+                "next_attempt_at",
+                "error_summary",
+                "started_at",
+                "completed_at",
+                "failed_at",
+                "cancelled_at",
+            ],
+            "AsyncJob",
+        )?;
+        assert_nullable_string(job, &["request_id", "error_summary"], "AsyncJob")?;
+        assert_nullable_datetime(
+            job,
+            &[
+                "next_attempt_at",
+                "started_at",
+                "completed_at",
+                "failed_at",
+                "cancelled_at",
+            ],
+            "AsyncJob",
+        )?;
+        assert_datetime(job, &["created_at", "updated_at"], "AsyncJob")?;
+
+        let item = &document["components"]["schemas"]["AsyncJobItemResult"];
+        assert_required(
+            item,
+            &[
+                "result",
+                "error_code",
+                "error_summary",
+                "started_at",
+                "completed_at",
+            ],
+            "AsyncJobItemResult",
+        )?;
+        assert_nullable_string(item, &["error_code", "error_summary"], "AsyncJobItemResult")?;
+        assert_nullable_datetime(item, &["started_at", "completed_at"], "AsyncJobItemResult")?;
+        assert_datetime(item, &["updated_at"], "AsyncJobItemResult")
     }
 
     #[test]
@@ -375,6 +586,88 @@ mod tests {
                 == serde_json::json!(["jpeg", "png", "webp"]),
             "Variant format contract must expose only JPEG, PNG, and WebP"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn request_parameters_match_server_names_and_bounds() -> Result<()> {
+        let document = document()?;
+        let application = &document["components"]["parameters"]["ApplicationContext"];
+        ensure!(
+            application["name"] == serde_json::json!("X-MediaHub-App-Id")
+                && application["schema"] == serde_json::json!({ "type": "string" }),
+            "application selector must use the server's app-id header"
+        );
+        ensure!(
+            document["components"]["parameters"]["AdminLimit"]["schema"]
+                == serde_json::json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 100
+                }),
+            "admin pagination bounds must match the handler"
+        );
+        for name in ["VariantWidth", "VariantHeight"] {
+            ensure!(
+                document["components"]["parameters"][name]["schema"]["minimum"]
+                    == serde_json::json!(1)
+                    && document["components"]["parameters"][name]["schema"]["maximum"]
+                        == serde_json::json!(4_096),
+                "{name} bounds are missing"
+            );
+        }
+        ensure!(
+            document["components"]["parameters"]["ContentLength"]["schema"]
+                == serde_json::json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 2_147_483_648_u64
+                }),
+            "binary content length bounds are missing"
+        );
+        let binary = &document["paths"]["/api/v1/uploads/{upload_session_id}/content"]["put"]["requestBody"]
+            ["content"]["application/octet-stream"]["schema"];
+        ensure!(
+            binary == &serde_json::json!({ "type": "string", "format": "binary" }),
+            "binary upload body must use a binary string schema"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_nullability_matches_server_defaults() -> Result<()> {
+        let document = document()?;
+        for field in ["allowed_mime_types", "lifecycle_rules"] {
+            let schema = &document["components"]["schemas"]["CreateBucket"];
+            ensure!(
+                schema["required"]
+                    .as_array()
+                    .is_none_or(|required| !required.iter().any(|value| value == field)),
+                "CreateBucket {field} must be optional"
+            );
+            ensure!(
+                schema["properties"][field]["type"] == serde_json::json!("array"),
+                "CreateBucket {field} must reject null and use an array"
+            );
+        }
+        for (schema_name, field, default) in [
+            ("CreateWebhook", "enabled", true),
+            ("UpdateWebhook", "rotate_secret", false),
+        ] {
+            let schema = &document["components"]["schemas"][schema_name];
+            ensure!(
+                schema["required"]
+                    .as_array()
+                    .is_none_or(|required| !required.iter().any(|value| value == field)),
+                "{schema_name}.{field} must be optional"
+            );
+            ensure!(
+                schema["properties"][field]
+                    == serde_json::json!({ "type": "boolean", "default": default }),
+                "{schema_name}.{field} must be a non-null boolean default"
+            );
+        }
         Ok(())
     }
 

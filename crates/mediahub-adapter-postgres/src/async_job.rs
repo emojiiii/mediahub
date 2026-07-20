@@ -187,6 +187,37 @@ impl AsyncJobRepository for PostgresRepository {
         Ok(claimed)
     }
 
+    async fn renew_async_job_lease(
+        &self,
+        job_id: AsyncJobId,
+        lease_token: &str,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+    ) -> Result<bool, RepositoryError> {
+        let token = Uuid::parse_str(lease_token)
+            .map_err(|_| RepositoryError::Invariant("async job lease token is invalid".into()))?;
+        let now = postgres_time(now);
+        let leased_until = postgres_time(leased_until);
+        if leased_until <= now {
+            return Err(RepositoryError::Invariant(
+                "async job lease must end in the future".into(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE async_jobs SET leased_until = $1, updated_at = $2 \
+             WHERE id = $3 AND state = 'running' AND lease_token = $4 \
+               AND leased_until > $2",
+        )
+        .bind(leased_until)
+        .bind(now)
+        .bind(job_id.as_uuid())
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn complete_async_job(
         &self,
         job_id: AsyncJobId,

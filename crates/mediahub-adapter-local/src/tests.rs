@@ -75,6 +75,16 @@
             Err(ObjectStoreError::AlreadyExists)
         );
         assert_eq!(store.read("objects/media-1"), Ok(b"first".to_vec()));
+
+        store
+            .put_temporary("temporary/retry", b"first", "text/plain")
+            .await
+            .expect("retry temporary upload");
+        store
+            .commit_temporary("temporary/retry", "objects/media-1")
+            .await
+            .expect("same-content commit retry succeeds");
+        assert!(!store.exists("temporary/retry").await.expect("retry cleanup"));
         fs::remove_dir_all(root).expect("test root cleanup");
     }
 
@@ -86,6 +96,98 @@
             store.put_temporary("../outside", b"no", "text/plain").await,
             Err(ObjectStoreError::Unavailable(_))
         ));
+        fs::remove_dir_all(root).expect("test root cleanup");
+    }
+
+    #[tokio::test]
+    async fn reserved_and_noncanonical_keys_are_rejected() {
+        let root = test_root();
+        let store = LocalObjectStore::new(&root).expect("store initializes");
+        for key in [
+            ".mediahub-metadata/object",
+            ".mediahub-staging/object",
+            "objects//alias",
+            "objects/./alias",
+            "objects\\alias",
+        ] {
+            assert!(matches!(
+                store.put_temporary(key, b"no", "text/plain").await,
+                Err(ObjectStoreError::Unavailable(_))
+            ));
+        }
+        fs::remove_dir_all(root).expect("test root cleanup");
+    }
+
+    #[test]
+    fn windows_ambiguous_storage_components_are_rejected_on_every_platform() {
+        for key in [
+            "CON",
+            "objects/prn.txt",
+            "objects/AUX.data",
+            "objects/nul",
+            "objects/COM1",
+            "objects/com9.log",
+            "objects/LPT1",
+            "objects/lpt9.tmp",
+            ".MEDIAHUB-METADATA/object",
+            ".MediaHub-Staging/object",
+            "objects/file:stream",
+            "objects/directory./file",
+            "objects/directory /file",
+            "objects/file.",
+            "objects/file ",
+        ] {
+            assert!(
+                matches!(
+                    LocalObjectStore::relative_path_for(key),
+                    Err(ObjectStoreError::Unavailable(_))
+                ),
+                "Windows-ambiguous key should be rejected: {key:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_storage_components_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root();
+        let outside = test_root();
+        fs::create_dir_all(&outside).expect("outside directory");
+        let store = LocalObjectStore::new(&root).expect("store initializes");
+        fs::create_dir_all(root.join("objects")).expect("object directory");
+        symlink(&outside, root.join("objects/link")).expect("directory symlink");
+        assert!(matches!(
+            store
+                .put_temporary("objects/link/escaped", b"no", "text/plain")
+                .await,
+            Err(ObjectStoreError::Unavailable(_))
+        ));
+        assert!(!outside.join("escaped").exists());
+        fs::remove_dir_all(root).expect("test root cleanup");
+        fs::remove_dir_all(outside).expect("outside cleanup");
+    }
+
+    #[tokio::test]
+    async fn stale_sidecar_is_repaired_before_installation() {
+        let root = test_root();
+        let store = LocalObjectStore::new(&root).expect("store initializes");
+        let metadata = store
+            .metadata_path_for("objects/recovered")
+            .expect("metadata path");
+        fs::create_dir_all(metadata.parent().expect("metadata parent"))
+            .expect("metadata parent");
+        fs::write(&metadata, b"stale/type").expect("stale sidecar");
+        store
+            .put_temporary("objects/recovered", b"content", "text/plain")
+            .await
+            .expect("stale sidecar is repaired");
+        assert_eq!(store.read("objects/recovered"), Ok(b"content".to_vec()));
+        assert_eq!(
+            store.content_type_for("objects/recovered"),
+            Ok(Some("text/plain".to_owned()))
+        );
         fs::remove_dir_all(root).expect("test root cleanup");
     }
 
@@ -243,6 +345,43 @@
         assert_eq!(
             store.inspect_upload(&session).await,
             Err(ObjectStoreError::NotFound)
+        );
+        fs::remove_dir_all(root).expect("test root cleanup");
+    }
+
+    #[tokio::test]
+    async fn completed_direct_upload_cleanup_preserves_the_final_object() {
+        let root = test_root();
+        let store = LocalObjectStore::new(&root).expect("store initializes");
+        let expires_at = OffsetDateTime::from_unix_timestamp(900).expect("valid timestamp");
+        let prepared = store
+            .prepare_upload(
+                UploadSessionId::new(),
+                MediaId::new(),
+                7,
+                "image/png",
+                expires_at,
+            )
+            .await
+            .expect("upload is prepared");
+        let mut session = upload_session(&prepared, expires_at);
+        store
+            .put_temporary(session.storage_key(), b"content", "image/png")
+            .await
+            .expect("gateway upload succeeds");
+        session
+            .complete(OffsetDateTime::from_unix_timestamp(1).expect("valid completion time"))
+            .expect("session completes");
+
+        store
+            .abort_upload(&session)
+            .await
+            .expect("completed-session cleanup is safe");
+
+        assert_eq!(store.read(session.storage_key()), Ok(b"content".to_vec()));
+        assert_eq!(
+            store.content_type_for(session.storage_key()),
+            Ok(Some("image/png".to_owned()))
         );
         fs::remove_dir_all(root).expect("test root cleanup");
     }

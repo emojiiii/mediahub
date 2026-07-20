@@ -213,18 +213,61 @@ impl UploadSessionRepository for InMemoryMediaRepository {
         let due_ids = state
             .upload_sessions
             .iter()
-            .filter_map(|(id, session)| session.is_expired_at(expired_at).then_some(*id))
+            .filter_map(|(id, session)| {
+                let due = session.is_expired_at(expired_at)
+                    || (expired_at >= session.session_expires_at()
+                        && matches!(
+                            session.state(),
+                            UploadSessionState::Completed
+                                | UploadSessionState::Expired
+                                | UploadSessionState::Cancelled
+                        )
+                        && !state.upload_cleanup_completed.contains(id));
+                due.then_some(*id)
+            })
             .take(limit)
             .collect::<Vec<_>>();
         let mut expired_sessions = Vec::with_capacity(due_ids.len());
         for upload_session_id in due_ids {
-            if let UploadSessionExpiration::Expired(session) =
-                Self::expire_upload_session_locked(&mut state, upload_session_id, expired_at)?
-            {
-                expired_sessions.push(session);
+            match Self::expire_upload_session_locked(&mut state, upload_session_id, expired_at)? {
+                UploadSessionExpiration::Expired(session)
+                | UploadSessionExpiration::AlreadyExpired(session) => {
+                    expired_sessions.push(session)
+                }
+                UploadSessionExpiration::Cancelled => {
+                    if let Some(session) = state.upload_sessions.get(&upload_session_id).cloned() {
+                        expired_sessions.push(session);
+                    }
+                }
+                UploadSessionExpiration::Completed => {
+                    if let Some(session) = state.upload_sessions.get(&upload_session_id).cloned() {
+                        expired_sessions.push(session);
+                    }
+                }
+                UploadSessionExpiration::NotDue => {}
             }
         }
         Ok(expired_sessions)
+    }
+
+    async fn complete_upload_session_cleanup(
+        &self,
+        upload_session_id: UploadSessionId,
+    ) -> Result<bool, RepositoryError> {
+        let mut state = self.lock()?;
+        let session = state
+            .upload_sessions
+            .get(&upload_session_id)
+            .ok_or(RepositoryError::NotFound)?;
+        if !matches!(
+            session.state(),
+            UploadSessionState::Completed
+                | UploadSessionState::Expired
+                | UploadSessionState::Cancelled
+        ) {
+            return Ok(false);
+        }
+        Ok(state.upload_cleanup_completed.insert(upload_session_id))
     }
 }
 

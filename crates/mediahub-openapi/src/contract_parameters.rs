@@ -73,10 +73,10 @@ const PARAMETERS: &[ParameterContract] = &[
     parameter!("AdminLimit", "limit", Query, false, Integer),
     parameter!(
         "ApplicationContext",
-        "X-Application-Id",
+        "X-MediaHub-App-Id",
         Header,
         false,
-        Uuid
+        String
     ),
     parameter!("DeliveryStatus", "status", Query, false, String),
     parameter!("MediaBucket", "bucket", Query, false, String),
@@ -110,14 +110,49 @@ pub fn parameters() -> Value {
                     ParameterSchema::Uuid => json!({ "type": "string", "format": "uuid" }),
                     ParameterSchema::Integer => json!({ "type": "integer" }),
                 };
-                if parameter.component == "Limit" || parameter.component == "AdminLimit" {
+                if parameter.component == "Limit" {
                     schema["minimum"] = json!(1);
                     schema["maximum"] = json!(100);
                     schema["default"] = json!(50);
                 }
+                if parameter.component == "AdminLimit" {
+                    schema["minimum"] = json!(1);
+                    schema["maximum"] = json!(200);
+                    schema["default"] = json!(100);
+                }
                 if parameter.component == "VariantFormat" {
                     schema["enum"] = json!(["jpeg", "png", "webp"]);
                     schema["default"] = json!("webp");
+                }
+                if parameter.component == "VariantFit" {
+                    schema["enum"] = json!(["cover", "contain", "inside"]);
+                    schema["default"] = json!("inside");
+                }
+                if parameter.component == "VariantCrop" {
+                    schema["enum"] = json!(["center", "top", "bottom", "left", "right"]);
+                    schema["default"] = json!("center");
+                }
+                if parameter.component == "VariantBackground" {
+                    schema["pattern"] = json!("^[0-9A-Fa-f]{6}$");
+                    schema["default"] = json!("ffffff");
+                }
+                if matches!(parameter.component, "VariantWidth" | "VariantHeight") {
+                    schema["minimum"] = json!(1);
+                    schema["maximum"] = json!(4_096);
+                }
+                if parameter.component == "VariantQuality" {
+                    schema["minimum"] = json!(1);
+                    schema["maximum"] = json!(100);
+                    schema["default"] = json!(80);
+                }
+                if parameter.component == "VariantBlur" {
+                    schema["minimum"] = json!(0);
+                    schema["maximum"] = json!(100);
+                    schema["default"] = json!(0);
+                }
+                if parameter.component == "ContentLength" {
+                    schema["minimum"] = json!(1);
+                    schema["maximum"] = json!(2_147_483_648_u64);
                 }
                 (
                     parameter.component.into(),

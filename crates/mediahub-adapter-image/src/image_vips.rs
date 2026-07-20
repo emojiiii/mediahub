@@ -14,19 +14,17 @@ fn process_vips_sync(
         u32::try_from(image.get_width()).map_err(|_| ImageProcessorError::UnsupportedInput)?;
     let source_height =
         u32::try_from(image.get_height()).map_err(|_| ImageProcessorError::UnsupportedInput)?;
+    let bytes_per_pixel = vips_bytes_per_pixel(&image)?;
     if source_width == 0
         || source_height == 0
         || source_width > MAX_INPUT_DIMENSION
         || source_height > MAX_INPUT_DIMENSION
-        || u64::from(source_width)
-            .saturating_mul(u64::from(source_height))
-            .saturating_mul(4)
-            > MAX_DECODED_BYTES
+        || !allocation_fits(source_width, source_height, bytes_per_pixel)
     {
         return Err(ImageProcessorError::InputTooLarge);
     }
     let (width, height) = requested_dimensions(transform, source_width, source_height)?;
-    let transformed = transform_vips(image, width, height, transform)?;
+    let transformed = transform_vips(image, width, height, bytes_per_pixel, transform)?;
     let transformed = if transform.blur() == 0 {
         transformed
     } else {
@@ -52,6 +50,7 @@ fn transform_vips(
     image: VipsImage,
     width: u32,
     height: u32,
+    bytes_per_pixel: u64,
     transform: &VariantTransform,
 ) -> Result<VipsImage, ImageProcessorError> {
     let source_width = f64::from(image.get_width());
@@ -66,13 +65,22 @@ fn transform_vips(
             (target_width / source_width).min(target_height / source_height)
         }
     };
+    let predicted_width = (source_width * scale).ceil() as u32;
+    let predicted_height = (source_height * scale).ceil() as u32;
+    if !allocation_fits(predicted_width, predicted_height, bytes_per_pixel) {
+        return Err(ImageProcessorError::OutputTooLarge);
+    }
     let resized = ops::resize(&image, scale).map_err(|_| ImageProcessorError::ProcessingFailed)?;
+    let resized_width = u32::try_from(resized.get_width())
+        .map_err(|_| ImageProcessorError::ProcessingFailed)?;
+    let resized_height = u32::try_from(resized.get_height())
+        .map_err(|_| ImageProcessorError::ProcessingFailed)?;
+    let resized_bytes_per_pixel = vips_bytes_per_pixel(&resized)?;
+    if !allocation_fits(resized_width, resized_height, resized_bytes_per_pixel) {
+        return Err(ImageProcessorError::OutputTooLarge);
+    }
     match transform.fit() {
         VariantFit::Cover => {
-            let resized_width = u32::try_from(resized.get_width())
-                .map_err(|_| ImageProcessorError::ProcessingFailed)?;
-            let resized_height = u32::try_from(resized.get_height())
-                .map_err(|_| ImageProcessorError::ProcessingFailed)?;
             if resized_width < width || resized_height < height {
                 return Err(ImageProcessorError::ProcessingFailed);
             }
@@ -95,10 +103,6 @@ fn transform_vips(
             .map_err(|_| ImageProcessorError::ProcessingFailed)
         }
         VariantFit::Contain => {
-            let resized_width = u32::try_from(resized.get_width())
-                .map_err(|_| ImageProcessorError::ProcessingFailed)?;
-            let resized_height = u32::try_from(resized.get_height())
-                .map_err(|_| ImageProcessorError::ProcessingFailed)?;
             let x = width.saturating_sub(resized_width) / 2;
             let y = height.saturating_sub(resized_height) / 2;
             let color = parse_background(transform.background())?;
@@ -117,6 +121,26 @@ fn transform_vips(
         }
         VariantFit::Inside => Ok(resized),
     }
+}
+
+#[cfg(all(feature = "libvips", target_os = "linux"))]
+fn vips_bytes_per_pixel(image: &VipsImage) -> Result<u64, ImageProcessorError> {
+    let bands = u64::try_from(image.get_bands()).map_err(|_| ImageProcessorError::UnsupportedInput)?;
+    let bytes_per_sample = match image
+        .get_format()
+        .map_err(|_| ImageProcessorError::UnsupportedInput)?
+    {
+        ops::BandFormat::Uchar | ops::BandFormat::Char => 1,
+        ops::BandFormat::Ushort | ops::BandFormat::Short => 2,
+        ops::BandFormat::Uint | ops::BandFormat::Int | ops::BandFormat::Float => 4,
+        ops::BandFormat::Complex | ops::BandFormat::Double => 8,
+        ops::BandFormat::Dpcomplex => 16,
+        ops::BandFormat::Notset => return Err(ImageProcessorError::UnsupportedInput),
+    };
+    bands
+        .checked_mul(bytes_per_sample)
+        .filter(|value| *value > 0)
+        .ok_or(ImageProcessorError::UnsupportedInput)
 }
 
 #[cfg(all(feature = "libvips", target_os = "linux"))]

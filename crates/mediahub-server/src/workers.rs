@@ -1,5 +1,9 @@
 // Background workers and asynchronous batch execution.
 
+const WEBHOOK_DELIVERY_LEASE_SECONDS: i64 = 30;
+const WEBHOOK_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WEBHOOK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 pub(super) async fn validate_referenced_key_versions(
     repository: &(impl SecretKeyVersionRepository + ?Sized),
     cipher: &AccessKeyCipher,
@@ -68,6 +72,7 @@ pub(super) async fn run_lifecycle_worker(repository: PostgresRepository, object_
         if let Err(error) = upload_sessions.expire_due(100).await {
             warn!(error = %error, "upload session expiry scan failed");
         }
+        reconcile_stale_uploads(&repository, &object_store, now).await;
         match repository.expire_multipart_uploads(now, 100).await {
             Ok(expired) => {
                 for expired_upload in expired {
@@ -209,6 +214,174 @@ pub(super) async fn run_lifecycle_worker(repository: PostgresRepository, object_
     }
 }
 
+async fn reconcile_stale_uploads(
+    repository: &PostgresRepository,
+    object_store: &RuntimeObjectStore,
+    now: OffsetDateTime,
+) {
+    let leased_until = now + time::Duration::seconds(MEDIA_UPLOAD_LEASE_SECONDS);
+    let uploads = match repository
+        .claim_stale_uploading(now, leased_until, 100)
+        .await
+    {
+        Ok(uploads) => uploads,
+        Err(error) => {
+            warn!(error = %error, "stale upload reconciliation scan failed");
+            return;
+        }
+    };
+    for leased in uploads {
+        let media = &leased.media;
+        let metadata = match run_reconciliation_storage_operation(
+            repository,
+            media.id(),
+            &leased.lease_token,
+            object_store.head(media.storage_key()),
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(ReconciliationOperationError::Storage(ObjectStoreError::NotFound)) => {
+                if run_reconciliation_storage_operation(
+                    repository,
+                    media.id(),
+                    &leased.lease_token,
+                    object_store.delete(&leased.temporary_key),
+                )
+                .await
+                .is_ok()
+                    && let Err(error) = repository
+                        .abort_upload(media.id(), &leased.lease_token, OffsetDateTime::now_utc())
+                        .await
+                {
+                    warn!(media_id = %media.id(), error = %error, "missing upload reconciliation rollback failed");
+                }
+                continue;
+            }
+            Err(error) => {
+                warn!(media_id = %media.id(), error = %error, "stale upload storage inspection failed");
+                continue;
+            }
+        };
+        let checksum = match run_reconciliation_storage_operation(
+            repository,
+            media.id(),
+            &leased.lease_token,
+            object_store.checksum_sha256(media.storage_key()),
+        )
+        .await
+        {
+            Ok(checksum) => checksum,
+            Err(error) => {
+                warn!(media_id = %media.id(), error = %error, "stale upload checksum verification failed");
+                continue;
+            }
+        };
+        let matches = metadata.size == media.size()
+            && metadata.content_type.as_deref() == Some(media.mime())
+            && checksum.eq_ignore_ascii_case(media.sha256());
+        if matches {
+            if let Err(error) = run_reconciliation_storage_operation(
+                repository,
+                media.id(),
+                &leased.lease_token,
+                object_store.delete(&leased.temporary_key),
+            )
+            .await
+            {
+                warn!(media_id = %media.id(), error = %error, "promoted upload temporary cleanup failed");
+                continue;
+            }
+            let committed_at = OffsetDateTime::now_utc();
+            let event = OutboxEvent::media_uploaded(media, committed_at);
+            if let Err(error) = repository
+                .commit_upload(media.id(), &leased.lease_token, committed_at, event)
+                .await
+            {
+                warn!(media_id = %media.id(), error = %error, "promoted upload reconciliation failed");
+            }
+            continue;
+        }
+
+        let final_deleted = run_reconciliation_storage_operation(
+            repository,
+            media.id(),
+            &leased.lease_token,
+            object_store.delete(media.storage_key()),
+        )
+        .await
+        .is_ok();
+        let temporary_deleted = run_reconciliation_storage_operation(
+            repository,
+            media.id(),
+            &leased.lease_token,
+            object_store.delete(&leased.temporary_key),
+        )
+        .await
+        .is_ok();
+        if final_deleted
+            && temporary_deleted
+            && let Err(error) = repository
+                .abort_upload(media.id(), &leased.lease_token, OffsetDateTime::now_utc())
+                .await
+        {
+            warn!(media_id = %media.id(), error = %error, "corrupt upload reconciliation rollback failed");
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReconciliationOperationError {
+    #[error(transparent)]
+    Storage(#[from] ObjectStoreError),
+    #[error(transparent)]
+    Repository(#[from] mediahub_app::RepositoryError),
+    #[error("ordinary upload reconciliation lease was lost")]
+    LeaseLost,
+}
+
+async fn run_reconciliation_storage_operation<T>(
+    repository: &PostgresRepository,
+    media_id: MediaId,
+    lease_token: &str,
+    operation: impl std::future::Future<Output = Result<T, ObjectStoreError>>,
+) -> Result<T, ReconciliationOperationError> {
+    tokio::pin!(operation);
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        MEDIA_UPLOAD_HEARTBEAT_SECONDS,
+    ));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => {
+                renew_reconciliation_lease(repository, media_id, lease_token).await?;
+                return result.map_err(Into::into);
+            }
+            _ = interval.tick() => {
+                renew_reconciliation_lease(repository, media_id, lease_token).await?;
+            }
+        }
+    }
+}
+
+async fn renew_reconciliation_lease(
+    repository: &PostgresRepository,
+    media_id: MediaId,
+    lease_token: &str,
+) -> Result<(), ReconciliationOperationError> {
+    let now = OffsetDateTime::now_utc();
+    let leased_until = now + time::Duration::seconds(MEDIA_UPLOAD_LEASE_SECONDS);
+    if repository
+        .renew_upload_lease(media_id, lease_token, now, leased_until)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(ReconciliationOperationError::LeaseLost)
+    }
+}
+
 pub(super) async fn run_outbox_worker(
     repository: PostgresRepository,
     access_key_cipher: Arc<AccessKeyCipher>,
@@ -220,9 +393,9 @@ pub(super) async fn run_outbox_worker(
         if let Err(error) = repository.finalize_unsubscribed_outbox_events(100).await {
             warn!(error = %error, "unsubscribed outbox cleanup failed");
         }
-        let lease_until = now + time::Duration::seconds(30);
+        let lease_until = now + time::Duration::seconds(WEBHOOK_DELIVERY_LEASE_SECONDS);
         let leased = match repository
-            .claim_webhook_deliveries(now, lease_until, 32)
+            .claim_webhook_deliveries(now, lease_until, 1)
             .await
         {
             Ok(deliveries) => deliveries,
@@ -235,7 +408,7 @@ pub(super) async fn run_outbox_worker(
             let delivery = &leased_delivery.delivery;
             let event = &delivery.event;
             let endpoint = &delivery.endpoint;
-            match deliver_webhook_delivery(&access_key_cipher, delivery).await {
+            match deliver_webhook_delivery_with_timeout(&access_key_cipher, delivery).await {
                 Ok(response_status) => {
                     match repository
                         .mark_webhook_delivery_delivered_with_status(
@@ -302,7 +475,7 @@ pub(super) async fn run_async_job_worker(repository: PostgresRepository) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         interval.tick().await;
-        let leased_jobs = match service.claim(8).await {
+        let leased_jobs = match service.claim(1).await {
             Ok(jobs) => jobs,
             Err(error) => {
                 warn!(error = %error, "async job claim failed");
@@ -310,7 +483,6 @@ pub(super) async fn run_async_job_worker(repository: PostgresRepository) {
             }
         };
         for leased in leased_jobs {
-            let started_at = OffsetDateTime::now_utc();
             let job_id = leased.job.id();
             let application_id = leased.job.application_id();
             let attempt_count = leased.job.attempt_count();
@@ -318,17 +490,57 @@ pub(super) async fn run_async_job_worker(repository: PostgresRepository) {
             let action_effective_at = leased.job.created_at();
             let mut item_results = Vec::with_capacity(leased.pending_media_ids.len());
             let mut result_error = None;
-            for (ordinal, media_id) in leased.pending_media_ids.into_iter().enumerate() {
-                let completed_at = OffsetDateTime::now_utc();
-                let result = match execute_batch_action(
+            let mut lease_lost = false;
+            'items: for (ordinal, media_id) in
+                leased.pending_media_ids.into_iter().enumerate()
+            {
+                match service.renew(job_id, &leased.lease_token).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        lease_lost = true;
+                        warn!(job_id = %job_id, "async job lease was lost before item execution");
+                        break;
+                    }
+                    Err(error) => {
+                        lease_lost = true;
+                        warn!(job_id = %job_id, error = %error, "async job lease renewal failed");
+                        break;
+                    }
+                }
+                let started_at = OffsetDateTime::now_utc();
+                let execution = execute_batch_action(
                     &repository,
                     application_id,
                     media_id,
                     &action,
                     action_effective_at,
-                )
-                .await
-                {
+                );
+                tokio::pin!(execution);
+                let heartbeat_period = std::time::Duration::from_secs(10);
+                let mut heartbeat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + heartbeat_period,
+                    heartbeat_period,
+                );
+                let execution_result = loop {
+                    tokio::select! {
+                        result = &mut execution => break result,
+                        _ = heartbeat.tick() => match service.renew(job_id, &leased.lease_token).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                lease_lost = true;
+                                warn!(job_id = %job_id, "async job lease was lost during item execution");
+                                break 'items;
+                            }
+                            Err(error) => {
+                                lease_lost = true;
+                                warn!(job_id = %job_id, error = %error, "async job lease heartbeat failed");
+                                break 'items;
+                            }
+                        }
+                    }
+                };
+                let completed_at = OffsetDateTime::now_utc();
+                let result = match execution_result {
                     Ok(value) => AsyncJobItemResult::succeeded(
                         job_id,
                         application_id,
@@ -358,6 +570,10 @@ pub(super) async fn run_async_job_worker(repository: PostgresRepository) {
                         break;
                     }
                 }
+            }
+
+            if lease_lost {
+                continue;
             }
 
             if let Some(error_summary) = result_error {
@@ -567,6 +783,26 @@ async fn deliver_webhook_delivery(
     Ok(response_status)
 }
 
+async fn deliver_webhook_delivery_with_timeout(
+    access_key_cipher: &AccessKeyCipher,
+    delivery: &WebhookDelivery,
+) -> Result<u16, WebhookAttemptError> {
+    webhook_attempt_with_timeout(
+        WEBHOOK_ATTEMPT_TIMEOUT,
+        deliver_webhook_delivery(access_key_cipher, delivery),
+    )
+    .await
+}
+
+async fn webhook_attempt_with_timeout<T>(
+    timeout: std::time::Duration,
+    attempt: impl std::future::Future<Output = Result<T, WebhookAttemptError>>,
+) -> Result<T, WebhookAttemptError> {
+    tokio::time::timeout(timeout, attempt)
+        .await
+        .map_err(|_| WebhookAttemptError::without_response("webhook delivery attempt timed out"))?
+}
+
 struct WebhookAttemptError {
     summary: String,
     response_status: Option<u16>,
@@ -589,8 +825,12 @@ async fn webhook_client_for_url(value: &str) -> Result<(reqwest::Client, Url), S
         .host_str()
         .ok_or_else(|| "webhook endpoint URL has no host".to_owned())?;
     let port = url.port_or_known_default().unwrap_or(443);
-    let addresses = tokio::net::lookup_host((host, port))
+    let addresses = tokio::time::timeout(
+        WEBHOOK_DNS_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
         .await
+        .map_err(|_| "webhook endpoint DNS lookup timed out".to_owned())?
         .map_err(|_| "webhook endpoint DNS lookup failed".to_owned())?
         .collect::<Vec<_>>();
     if addresses.is_empty() {
@@ -611,5 +851,32 @@ async fn webhook_client_for_url(value: &str) -> Result<(reqwest::Client, Url), S
         .build()
         .map_err(|_| "webhook HTTP client initialization failed".to_owned())?;
     Ok((client, url))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn webhook_attempt_timeout_is_strictly_shorter_than_its_lease() {
+        let lease = std::time::Duration::from_secs(
+            WEBHOOK_DELIVERY_LEASE_SECONDS
+                .try_into()
+                .expect("positive webhook lease"),
+        );
+        assert!(WEBHOOK_DNS_TIMEOUT < WEBHOOK_ATTEMPT_TIMEOUT);
+        assert!(WEBHOOK_ATTEMPT_TIMEOUT < lease);
+
+        let result = webhook_attempt_with_timeout(
+            std::time::Duration::ZERO,
+            std::future::pending::<Result<u16, WebhookAttemptError>>(),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("a stalled webhook attempt must time out");
+        };
+        assert_eq!(error.summary, "webhook delivery attempt timed out");
+        assert_eq!(error.response_status, None);
+    }
 }
 

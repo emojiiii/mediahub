@@ -91,6 +91,7 @@ async fn create_upload_session(
             operation_scope: context.operation_scope,
             key: context.idempotency_key.expect("filtered idempotency key"),
             request_hash: context.request_hash,
+            claim_token: String::new(),
         });
     if is_hmac && idempotency.is_none() {
         return Err(ApiError::bad_request(
@@ -150,15 +151,16 @@ async fn create_upload_session(
         media_expires_at,
         metadata,
     };
-    if let Some(idempotency) = &idempotency {
+    let mut idempotency = idempotency;
+    if let Some(idempotency_context) = &mut idempotency {
         let now = OffsetDateTime::now_utc();
         match state
             .repository
             .claim_idempotency_key(
-                idempotency.application_id,
-                &idempotency.operation_scope,
-                &idempotency.key,
-                &idempotency.request_hash,
+                idempotency_context.application_id,
+                &idempotency_context.operation_scope,
+                &idempotency_context.key,
+                &idempotency_context.request_hash,
                 now + time::Duration::seconds(IDEMPOTENCY_SECONDS),
                 now,
             )
@@ -168,7 +170,7 @@ async fn create_upload_session(
             IdempotencyClaim::Completed(response) => return idempotency_response(response),
             IdempotencyClaim::InProgress => return Err(ApiError::idempotency_in_progress()),
             IdempotencyClaim::Conflict => return Err(ApiError::idempotency_conflict()),
-            IdempotencyClaim::Claimed => {}
+            IdempotencyClaim::Claimed(claim_token) => idempotency_context.claim_token = claim_token,
         }
     }
     let service = upload_session_service(&state);
@@ -356,6 +358,18 @@ async fn put_upload_content(
         .await
     {
         Ok(()) => {
+            let current = state
+                .repository
+                .find_upload_session(session.id())
+                .await
+                .map_err(ApiError::from_repository)?
+                .ok_or_else(|| ApiError::not_found("upload session not found"))?;
+            if current.state() != UploadSessionState::Pending
+                || current.is_expired_at(OffsetDateTime::now_utc())
+            {
+                let _ = state.object_store.abort_upload(&current).await;
+                return Err(ApiError::conflict("upload session is not writable"));
+            }
             state
                 .http_metrics
                 .uploaded_bytes

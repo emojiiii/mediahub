@@ -261,7 +261,6 @@ async fn list_webhook_deliveries(
     let next_cursor = if page.has_more {
         page.items.last().map(|item| {
             encode_webhook_delivery_cursor(WebhookDeliveryHistoryCursor {
-                updated_at: item.updated_at,
                 row_id: item.row_id,
             })
         })

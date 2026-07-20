@@ -81,10 +81,21 @@ async fn batch_media(
             })
             .await
             .map_err(ApiError::from_async_job)?;
-        return Ok((StatusCode::ACCEPTED, Json(receipt)).into_response());
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(AsyncJobReceiptResponse::from(receipt)),
+        )
+            .into_response());
     }
 
     let now = OffsetDateTime::now_utc();
+    let mut idempotency = IdempotencyContext {
+        application_id: auth.application.id,
+        operation_scope: "media.batch.sync".to_owned(),
+        key: idempotency_key.clone(),
+        request_hash: request_hash.clone(),
+        claim_token: String::new(),
+    };
     match state
         .repository
         .claim_idempotency_key(
@@ -101,7 +112,7 @@ async fn batch_media(
         IdempotencyClaim::Completed(response) => return idempotency_response(response),
         IdempotencyClaim::InProgress => return Err(ApiError::idempotency_in_progress()),
         IdempotencyClaim::Conflict => return Err(ApiError::idempotency_conflict()),
-        IdempotencyClaim::Claimed => {}
+        IdempotencyClaim::Claimed(claim_token) => idempotency.claim_token = claim_token,
     }
 
     let mut results = Vec::with_capacity(media_ids.len());
@@ -142,6 +153,7 @@ async fn batch_media(
             "media.batch.sync",
             &idempotency_key,
             &request_hash,
+            &idempotency.claim_token,
             &CompletedIdempotencyResponse {
                 status: StatusCode::OK.as_u16(),
                 payload: payload.clone(),
@@ -173,7 +185,7 @@ async fn get_async_job(
     Path(job_id): Path<String>,
     headers: HeaderMap,
     hmac_identity: Option<Extension<HmacIdentity>>,
-) -> Result<Json<mediahub_app::AsyncJobDetails>, ApiError> {
+) -> Result<Json<AsyncJobDetailsResponse>, ApiError> {
     let auth =
         authenticated_application(&state, &headers, hmac_identity.map(|value| value.0)).await?;
     auth.authorize("media:list")?;
@@ -182,7 +194,7 @@ async fn get_async_job(
         .get(auth.application.id, job_id)
         .await
         .map_err(ApiError::from_async_job)?;
-    Ok(Json(details))
+    Ok(Json(details.into()))
 }
 
 async fn cancel_async_job(
@@ -190,7 +202,7 @@ async fn cancel_async_job(
     Path(job_id): Path<String>,
     headers: HeaderMap,
     hmac_identity: Option<Extension<HmacIdentity>>,
-) -> Result<Json<mediahub_core::AsyncJob>, ApiError> {
+) -> Result<Json<AsyncJobResponse>, ApiError> {
     let auth =
         authenticated_application(&state, &headers, hmac_identity.map(|value| value.0)).await?;
     auth.verify_mutation_csrf(&state, &headers).await?;
@@ -203,6 +215,6 @@ async fn cancel_async_job(
         })
         .await
         .map_err(ApiError::from_async_job)?;
-    Ok(Json(job))
+    Ok(Json(job.into()))
 }
 

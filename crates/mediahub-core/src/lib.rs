@@ -17,8 +17,9 @@ mod visibility;
 pub use async_job::{
     AsyncJob, AsyncJobAction, AsyncJobError, AsyncJobFailureDisposition, AsyncJobId,
     AsyncJobItemResult, AsyncJobItemState, AsyncJobResult, AsyncJobState, AsyncJobTransition,
-    MAX_ASYNC_JOB_ERROR_BYTES, MAX_ASYNC_JOB_IDEMPOTENCY_KEY_BYTES,
-    MAX_ASYNC_JOB_OPERATION_SCOPE_BYTES, NewAsyncJob, PersistedAsyncJob,
+    MAX_ASYNC_JOB_ATTEMPTS, MAX_ASYNC_JOB_ERROR_BYTES, MAX_ASYNC_JOB_IDEMPOTENCY_KEY_BYTES,
+    MAX_ASYNC_JOB_ITEMS, MAX_ASYNC_JOB_LEASE_SECONDS, MAX_ASYNC_JOB_OPERATION_SCOPE_BYTES,
+    MAX_ASYNC_JOB_REQUEST_ID_BYTES, NewAsyncJob, PersistedAsyncJob,
 };
 pub use bucket::{Bucket, BucketPolicy, LifecycleRule, MAX_LIFECYCLE_RULES};
 pub use error::{DomainError, DomainResult};

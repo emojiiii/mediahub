@@ -1,5 +1,35 @@
 # Progress Log
 
+## Pre-release crates remediation (2026-07-20)
+
+- Re-read the planning skill, recovered the completed review context, and confirmed only review records were dirty before implementation.
+- Added a six-phase remediation plan and dispatched core/app, image/local, and PostgreSQL/OpenAPI work in parallel.
+- Agreed on a persistent upload-session storage-cleanup acknowledgement shared by app and PostgreSQL work.
+- Began S3 storage-contract redesign and server integration review.
+
+## Pre-release crates quality review (2026-07-20)
+
+- Read the `planning-with-files` instructions and recovered the existing project review history.
+- Confirmed the worktree was clean before starting this review.
+- Added a review-only plan covering package-level, cross-crate, and tool-assisted validation.
+- Inventoried all eight workspace packages and their source files/dependency metadata.
+- Dispatched three read-only parallel reviews; the primary review is covering `mediahub-server` and cross-crate contracts.
+- Ranked server modules by size and began scanning panic markers, module composition, and production entrypoints.
+- Traced router middleware, HMAC replay protection, session/application authentication, CSRF helpers, and auth-rate-limit state.
+- Built an initial HTTP handler matrix for authentication, permissions, and CSRF checks; no missing check has been accepted as a finding without following delegated helper calls.
+- Scanned production code for ignored errors, unbounded buffering, task supervision, outbound URL handling, and SSRF defenses.
+- Correlated server worker loops with application lease contracts and PostgreSQL lease fencing; identified a reproducible design mismatch between maximum batch size, sequential execution, and the fixed 30-second lease.
+- Traced Application deletion through the server, repository method, schema foreign keys, contract tests, and UI-facing behavior; found incomplete aggregate cleanup and audit-retention drift.
+- Audited transformed media loading against adapter-side image limits and found the limit is enforced after full-object allocation.
+- Merged delegated core/app and adapter reviews; corroborated upload commit ambiguity, expired-session cleanup, S3 presigned replay/race, image intermediate-allocation, and metadata quota findings against current source.
+- Received and recorded the PostgreSQL/OpenAPI review: tenant composite-FK gaps, mutable webhook cursors, idempotency fencing, and multiple generated-contract mismatches are now corroborated candidates/findings.
+- Completed all four package-review ownership groups; started cross-crate validation and quality-tool execution.
+- Format, workspace check, all-target/all-feature Clippy, and workspace test compilation passed.
+- All locally runnable package/unit suites passed (81 unit tests plus the S3 wrapper contract); OpenAPI generated-file check passed.
+- Destructive PostgreSQL and real-S3 contracts were not run because their isolated test environment variables/services are unavailable.
+- Corroborated every release-blocking finding against current source and completed the severity-ordered review.
+- No product source was modified; only `task_plan.md`, `findings.md`, and `progress.md` contain review records.
+
 ## Real backend wiring
 
 - Acknowledged that the prior validation covered Mock behavior only and did not validate the completed backend integration.
@@ -190,4 +220,25 @@
 - Began live new-Application creation from app_marketing to verify the empty initial state.
 - Live create dialog reopened from marketing with empty input and disabled submit, confirming cancellation reset.
 - Live create dialog enabled submit only after a non-empty Application name was entered.
+
+## Pre-release crates remediation
+
+- Resumed the implementation after the cross-crate repair pass and recovered the current plan, findings, worktree, and isolated PostgreSQL environment.
+- Reused the three completed review agents for non-overlapping OpenAPI/server, S3/upload-session, and core/local regression coverage.
+- Confirmed ordinary stale-upload reconciliation is wired into the lifecycle worker and added a PostgreSQL contract for cutoff handling and multipart completion fencing.
+- Added S3 and application tests for signed overwrite protection, delayed terminal cleanup, temporary-object removal, and final-object retention.
+- A final storage review found that Local completed direct-upload cleanup could delete the active final object; the Local owner is fixing it with a focused regression test.
+- Local completed cleanup is now guarded and its regression test confirms the final object and MIME sidecar survive terminal cleanup.
+- The destructive PostgreSQL repository contract passed against the isolated database, including the new stale ordinary-upload cutoff and multipart fencing assertions.
+- Final read-only reviews found and closed four additional release risks: slow-upload reconciliation races, high-bit-depth image allocation undercounting, unbounded webhook DNS/attempt time, and incomplete AsyncJob date-time/nullability schemas.
+- Added migration `0010_ordinary_upload_fencing.sql`: ordinary uploads now persist the actual temporary key, lease token, and expiry; upload and reconciliation owners heartbeat; PostgreSQL claims use `FOR UPDATE SKIP LOCKED`; stale tokens cannot renew, commit, or abort.
+- Reconciliation now requires final size, MIME, and a trustworthy SHA-256. S3 stores digest metadata and falls back to an ETag/version-fenced streaming hash when metadata is absent.
+- S3 and Local promotion cleanup failures remain in the durable `uploading` recovery protocol; the final object survives and temporary deletion is retried before activation.
+- Image intermediate limits now account for actual sample width/bands, including RGBA16 cover operations.
+- Webhook DNS is bounded to 5 seconds and the whole attempt to 25 seconds, strictly below its 30-second lease.
+- Webhook pagination cursors now contain only immutable `history_id`; legacy tokens containing `updated_at` remain accepted.
+- OpenAPI AsyncJob/Item time fields, required nullable fields, enums, bounds, and sensitive-field exclusions now match the runtime response DTOs.
+- Final validation passed: formatting, workspace check, all-target/all-feature Clippy with warnings denied, test compilation, OpenAPI generation/check, `git diff --check`, and the complete workspace test suite.
+- Final test counts: Image 11, Local 10, PostgreSQL unit 6 plus destructive contract 1, S3 unit 6 plus wrapper contract 1, App 21, Core 35, OpenAPI 10, Server lib 8, Server binary 75. The real S3 contract remains the single expected ignored test because `MEDIAHUB_TEST_S3_*` is not configured.
+- Removed the isolated `mediahub-codex-test` PostgreSQL container, network, and test volume after all destructive/server database tests passed.
 - Live creation of 空白测试应用 navigated to a dashboard with 0 objects, 0 Buckets, and 0 B usage.

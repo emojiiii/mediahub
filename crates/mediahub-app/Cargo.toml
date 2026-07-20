@@ -10,6 +10,8 @@ object-store-contract-tests = []
 
 [dependencies]
 async-trait = { workspace = true }
+futures-timer = { workspace = true }
+futures-util = { workspace = true }
 hex = { workspace = true }
 mediahub-core = { path = "../mediahub-core" }
 serde = { workspace = true }

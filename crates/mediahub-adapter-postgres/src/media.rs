@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use mediahub_app::{
-    BucketRepository, MediaDirectoryListCursor, MediaDirectoryListQuery, MediaDirectoryPage,
-    MediaListQuery, MediaPage, MediaRepository, OutboxEvent, RepositoryError, S3MediaListQuery,
-    S3MediaPage,
+    BucketRepository, LeasedMediaUpload, MediaDirectoryListCursor, MediaDirectoryListQuery,
+    MediaDirectoryPage, MediaListQuery, MediaPage, MediaRepository, OutboxEvent, RepositoryError,
+    S3MediaListQuery, S3MediaPage,
 };
 use mediahub_core::{
     ApplicationId, Bucket, BucketId, BucketPolicy, Media, MediaId, MediaState, OffsetDateTime,

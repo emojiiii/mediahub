@@ -27,8 +27,17 @@ pub const VIPS_PROCESSOR_VERSION: &str = concat!(
 pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_INPUT_DIMENSION: u32 = 16_384;
 pub const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_INTERMEDIATE_BYTES: u64 = MAX_DECODED_BYTES;
 pub const PROCESSING_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_BLOCKING_IMAGE_TASKS: usize = 4;
+
+fn allocation_fits(width: u32, height: u32, bytes_per_pixel: u64) -> bool {
+    bytes_per_pixel > 0
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+            .is_some_and(|bytes| bytes <= MAX_INTERMEDIATE_BYTES)
+}
 
 static BLOCKING_IMAGE_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_BLOCKING_IMAGE_TASKS)));
@@ -36,6 +45,7 @@ static BLOCKING_IMAGE_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
 static VIPS_APP: LazyLock<Option<VipsApp>> = LazyLock::new(|| {
     VipsApp::new("mediahub", false).ok().inspect(|app| {
         app.concurrency_set(MAX_BLOCKING_IMAGE_TASKS as i32);
+        app.cache_set_max_mem(MAX_DECODED_BYTES);
     })
 });
 
@@ -56,9 +66,10 @@ impl ImageProcessor for RustImageProcessor {
         if input.is_empty() || input.len() > MAX_INPUT_BYTES {
             return Err(ImageProcessorError::InputTooLarge);
         }
+        let permit = acquire_blocking_slot().await?;
         let input = input.to_vec();
         let transform = transform.clone();
-        run_blocking(move || process_sync(&input, &transform)).await
+        run_blocking_with_permit(permit, move || process_sync(&input, &transform)).await
     }
 }
 
@@ -82,9 +93,10 @@ impl ImageProcessor for VipsImageProcessor {
         if input.is_empty() || input.len() > MAX_INPUT_BYTES {
             return Err(ImageProcessorError::InputTooLarge);
         }
+        let permit = acquire_blocking_slot().await?;
         let input = input.to_vec();
         let transform = transform.clone();
-        run_blocking(move || process_vips_sync(&input, &transform)).await
+        run_blocking_with_permit(permit, move || process_vips_sync(&input, &transform)).await
     }
 }
 

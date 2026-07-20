@@ -9,12 +9,21 @@ pub struct InMemoryMediaRepository {
 struct MediaRepositoryState {
     quotas: HashMap<ApplicationId, QuotaSnapshot>,
     media: HashMap<MediaId, Media>,
+    upload_leases: HashMap<MediaId, MediaUploadLease>,
     locations: HashMap<(ApplicationId, BucketId, String), MediaId>,
     upload_sessions: HashMap<UploadSessionId, UploadSession>,
     upload_session_locations: HashMap<(ApplicationId, BucketId, String), UploadSessionId>,
     completed_upload_media: HashMap<UploadSessionId, MediaId>,
+    upload_cleanup_completed: HashSet<UploadSessionId>,
     outbox: HashMap<String, OutboxEvent>,
     fail_next_commit: Option<RepositoryError>,
+}
+
+#[derive(Clone)]
+struct MediaUploadLease {
+    temporary_key: String,
+    lease_token: String,
+    leased_until: OffsetDateTime,
 }
 
 impl InMemoryMediaRepository {
@@ -173,6 +182,62 @@ impl MediaRepository for InMemoryMediaRepository {
             .cloned())
     }
 
+    async fn claim_stale_uploading(
+        &self,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<LeasedMediaUpload>, RepositoryError> {
+        if leased_until <= now {
+            return Err(RepositoryError::Invariant(
+                "upload reconciliation lease must end in the future".into(),
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut state = self.lock()?;
+        let mut media_ids = state
+            .upload_leases
+            .iter()
+            .filter(|(media_id, lease)| {
+                lease.leased_until <= now
+                    && state
+                        .media
+                        .get(media_id)
+                        .is_some_and(|media| media.state() == MediaState::Uploading)
+            })
+            .map(|(media_id, lease)| (*media_id, lease.leased_until))
+            .collect::<Vec<_>>();
+        media_ids.sort_by_key(|(media_id, lease_until)| (*lease_until, *media_id));
+        media_ids.truncate(limit);
+        let mut claimed = Vec::with_capacity(media_ids.len());
+        for (media_id, _) in media_ids {
+            let lease_token = MediaId::new().to_string();
+            let media = state
+                .media
+                .get(&media_id)
+                .expect("selected uploading media exists")
+                .clone();
+            let temporary_key = {
+                let lease = state
+                    .upload_leases
+                    .get_mut(&media_id)
+                    .expect("selected upload lease exists");
+                lease.lease_token.clone_from(&lease_token);
+                lease.leased_until = leased_until;
+                lease.temporary_key.clone()
+            };
+            claimed.push(LeasedMediaUpload {
+                media,
+                temporary_key,
+                lease_token,
+                leased_until,
+            });
+        }
+        Ok(claimed)
+    }
+
     async fn reserve_quota(
         &self,
         application_id: ApplicationId,
@@ -193,10 +258,25 @@ impl MediaRepository for InMemoryMediaRepository {
         Ok(())
     }
 
-    async fn create_uploading(&self, media: Media) -> Result<(), RepositoryError> {
+    async fn create_uploading(
+        &self,
+        media: Media,
+        temporary_key: &str,
+        lease_token: &str,
+        leased_until: OffsetDateTime,
+    ) -> Result<(), RepositoryError> {
         if media.state() != MediaState::Uploading {
             return Err(RepositoryError::Invariant(
                 "only uploading media can be created by this operation".into(),
+            ));
+        }
+        if temporary_key.is_empty()
+            || lease_token.is_empty()
+            || lease_token.len() > 255
+            || leased_until <= media.updated_at()
+        {
+            return Err(RepositoryError::Invariant(
+                "ordinary upload lease is invalid".into(),
             ));
         }
         let location = (
@@ -209,13 +289,49 @@ impl MediaRepository for InMemoryMediaRepository {
             return Err(RepositoryError::Conflict);
         }
         state.locations.insert(location, media.id());
+        state.upload_leases.insert(
+            media.id(),
+            MediaUploadLease {
+                temporary_key: temporary_key.to_owned(),
+                lease_token: lease_token.to_owned(),
+                leased_until,
+            },
+        );
         state.media.insert(media.id(), media);
         Ok(())
+    }
+
+    async fn renew_upload_lease(
+        &self,
+        media_id: MediaId,
+        lease_token: &str,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+    ) -> Result<bool, RepositoryError> {
+        if leased_until <= now {
+            return Err(RepositoryError::Invariant(
+                "ordinary upload lease must end in the future".into(),
+            ));
+        }
+        let mut state = self.lock()?;
+        let is_uploading = state
+            .media
+            .get(&media_id)
+            .is_some_and(|media| media.state() == MediaState::Uploading);
+        let Some(lease) = state.upload_leases.get_mut(&media_id) else {
+            return Ok(false);
+        };
+        if !is_uploading || lease.lease_token != lease_token || lease.leased_until <= now {
+            return Ok(false);
+        }
+        lease.leased_until = leased_until;
+        Ok(true)
     }
 
     async fn commit_upload(
         &self,
         media_id: MediaId,
+        lease_token: &str,
         committed_at: OffsetDateTime,
         event: OutboxEvent,
     ) -> Result<Media, RepositoryError> {
@@ -239,6 +355,12 @@ impl MediaRepository for InMemoryMediaRepository {
                 "outbox event application differs from media application".into(),
             ));
         }
+        let owns_lease = state.upload_leases.get(&media_id).is_some_and(|lease| {
+            lease.lease_token == lease_token && lease.leased_until > committed_at
+        });
+        if !owns_lease {
+            return Err(RepositoryError::Conflict);
+        }
 
         let quota = state
             .quotas
@@ -260,11 +382,17 @@ impl MediaRepository for InMemoryMediaRepository {
             .checked_add(committed.size())
             .ok_or_else(|| RepositoryError::Invariant("used quota overflow".into()))?;
         state.outbox.entry(event.id.clone()).or_insert(event);
+        state.upload_leases.remove(&media_id);
         state.media.insert(media_id, committed.clone());
         Ok(committed)
     }
 
-    async fn abort_upload(&self, media_id: MediaId) -> Result<(), RepositoryError> {
+    async fn abort_upload(
+        &self,
+        media_id: MediaId,
+        lease_token: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), RepositoryError> {
         let mut state = self.lock()?;
         let Some(media) = state.media.get(&media_id).cloned() else {
             return Ok(());
@@ -272,7 +400,13 @@ impl MediaRepository for InMemoryMediaRepository {
         if media.state() != MediaState::Uploading {
             return Ok(());
         }
+        if !state.upload_leases.get(&media_id).is_some_and(|lease| {
+            lease.lease_token == lease_token && lease.leased_until > now
+        }) {
+            return Err(RepositoryError::Conflict);
+        }
         state.media.remove(&media_id);
+        state.upload_leases.remove(&media_id);
         state.locations.remove(&(
             media.application_id(),
             media.bucket_id(),
@@ -363,3 +497,159 @@ impl MediaRepository for InMemoryMediaRepository {
     }
 }
 
+#[cfg(test)]
+mod memory_media_lease_tests {
+    use futures::executor::block_on;
+    use mediahub_core::{ClientMetadata, NewMedia, SystemMetadata};
+
+    use super::*;
+
+    fn uploading_media(
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        object_key: &str,
+        created_at: OffsetDateTime,
+    ) -> Media {
+        Media::new(
+            NewMedia {
+                id: MediaId::new(),
+                application_id,
+                bucket_id,
+                object_key: object_key.to_owned(),
+                original_name: None,
+                display_name: object_key.to_owned(),
+                extension: Some("bin".to_owned()),
+                storage_backend: MEMORY_BACKEND.to_owned(),
+                storage_key: format!("objects/{object_key}"),
+                visibility_override: None,
+                expire_at: None,
+                system_metadata: SystemMetadata::new(
+                    "application/octet-stream",
+                    2,
+                    None,
+                    None,
+                    None,
+                    "a".repeat(64),
+                )
+                .expect("valid system metadata"),
+                client_metadata: ClientMetadata::default(),
+            },
+            created_at,
+        )
+        .expect("valid uploading media")
+    }
+
+    #[test]
+    fn stale_upload_claim_rotates_token_and_fences_previous_owner() {
+        block_on(async {
+            let now = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(10);
+            let application_id = ApplicationId::new();
+            let bucket_id = BucketId::new();
+            let repository = InMemoryMediaRepository::with_quota(application_id, 10);
+
+            let stale = uploading_media(
+                application_id,
+                bucket_id,
+                "stale.bin",
+                now - time::Duration::minutes(2),
+            );
+            repository
+                .reserve_quota(application_id, stale.size())
+                .await
+                .expect("reserve stale upload quota");
+            let stale_token = "stale-owner";
+            repository
+                .create_uploading(
+                    stale.clone(),
+                    "temporary/stale",
+                    stale_token,
+                    now - time::Duration::seconds(1),
+                )
+                .await
+                .expect("create expired upload lease");
+
+            let fresh = uploading_media(application_id, bucket_id, "fresh.bin", now);
+            repository
+                .reserve_quota(application_id, fresh.size())
+                .await
+                .expect("reserve fresh upload quota");
+            let fresh_token = "fresh-owner";
+            repository
+                .create_uploading(
+                    fresh.clone(),
+                    "temporary/fresh",
+                    fresh_token,
+                    now + time::Duration::minutes(5),
+                )
+                .await
+                .expect("create active upload lease");
+
+            let claimed_until = now + time::Duration::minutes(2);
+            let claimed = repository
+                .claim_stale_uploading(now, claimed_until, 10)
+                .await
+                .expect("claim expired upload");
+            assert_eq!(claimed.len(), 1);
+            let claimed = &claimed[0];
+            assert_eq!(claimed.media.id(), stale.id());
+            assert_eq!(claimed.temporary_key, "temporary/stale");
+            assert_eq!(claimed.leased_until, claimed_until);
+            assert_ne!(claimed.lease_token, stale_token);
+
+            assert!(
+                repository
+                    .claim_stale_uploading(
+                        now + time::Duration::seconds(1),
+                        now + time::Duration::minutes(3),
+                        10,
+                    )
+                    .await
+                    .expect("active leases are not claimable")
+                    .is_empty()
+            );
+            assert!(
+                !repository
+                    .renew_upload_lease(
+                        stale.id(),
+                        stale_token,
+                        now,
+                        now + time::Duration::minutes(4),
+                    )
+                    .await
+                    .expect("old owner renewal is fenced")
+            );
+            assert!(matches!(
+                repository
+                    .commit_upload(
+                        stale.id(),
+                        stale_token,
+                        now,
+                        OutboxEvent::media_uploaded(&stale, now),
+                    )
+                    .await,
+                Err(RepositoryError::Conflict)
+            ));
+            assert_eq!(
+                repository.abort_upload(stale.id(), stale_token, now).await,
+                Err(RepositoryError::Conflict)
+            );
+
+            repository
+                .abort_upload(stale.id(), &claimed.lease_token, now)
+                .await
+                .expect("current owner may abort");
+            repository
+                .abort_upload(fresh.id(), fresh_token, now)
+                .await
+                .expect("fresh owner cleanup");
+            assert_eq!(repository.media_count(), 0);
+            assert_eq!(
+                repository
+                    .quota(application_id)
+                    .expect("quota snapshot")
+                    .reserved_bytes,
+                0
+            );
+        });
+    }
+}

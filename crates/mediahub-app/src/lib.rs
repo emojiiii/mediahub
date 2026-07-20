@@ -44,17 +44,18 @@ pub use data_plane::{
     PendingMediaDeletion, S3MediaListQuery, S3MediaPage,
 };
 pub use error::ApplicationError;
+pub(crate) use error::Redacted;
 pub use image::{ImageProcessor, ImageProcessorError, ProcessedVariant, variant_cache_key};
 pub use memory::{
     FixedClock, InMemoryBucketRepository, InMemoryMediaRepository, InMemoryObjectStore,
     QuotaSnapshot,
 };
 pub use ports::{
-    BucketRepository, Clock, ComposedObject, LeasedWebhookDelivery, MediaRepository,
-    ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, OutboxEvent, OutboxRepository,
-    RepositoryError, UploadSessionCancellation, UploadSessionCompletion, UploadSessionExpiration,
-    UploadSessionRepository, UploadSessionStorage, WebhookDelivery, WebhookDeliveryEndpoint,
-    WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
+    BucketRepository, Clock, ComposedObject, LeasedMediaUpload, LeasedWebhookDelivery,
+    MediaRepository, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, OutboxEvent,
+    OutboxRepository, RepositoryError, UploadSessionCancellation, UploadSessionCompletion,
+    UploadSessionExpiration, UploadSessionRepository, UploadSessionStorage, WebhookDelivery,
+    WebhookDeliveryEndpoint, WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
 };
 pub use s3_multipart::{
     CompletedS3MultipartPart, MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION,
@@ -64,7 +65,10 @@ pub use s3_multipart::{
     S3MultipartManifest, S3MultipartManifestError, S3MultipartPart, S3MultipartPartPut,
     S3MultipartRepository, S3MultipartUpload, S3MultipartUploadState,
 };
-pub use upload::{StagedUploadMediaRequest, UploadMediaRequest, UploadMediaService, UploadReceipt};
+pub use upload::{
+    MEDIA_UPLOAD_HEARTBEAT_SECONDS, MEDIA_UPLOAD_LEASE_SECONDS, StagedUploadMediaRequest,
+    UploadMediaRequest, UploadMediaService, UploadReceipt,
+};
 pub use upload_session::{
     CancelUploadSessionReceipt, CancelUploadSessionRequest, CompleteUploadSessionRequest,
     CompletedUploadSessionReceipt, CreateUploadSessionRequest, DEFAULT_UPLOAD_SESSION_TTL,

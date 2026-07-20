@@ -1,21 +1,22 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use async_trait::async_trait;
 use mediahub_core::{
     ApplicationId, AsyncJob, AsyncJobAction, AsyncJobError, AsyncJobId, AsyncJobItemResult,
-    MediaId, NewAsyncJob, OffsetDateTime,
+    MAX_ASYNC_JOB_ITEMS, MediaId, NewAsyncJob, OffsetDateTime,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Duration;
 
+use crate::Redacted;
 use crate::{Clock, RepositoryError};
 
 pub const DEFAULT_ASYNC_JOB_MAX_ATTEMPTS: u32 = 8;
 pub const DEFAULT_ASYNC_JOB_LEASE_SECONDS: i64 = 30;
 pub const MAX_ASYNC_JOB_CLAIM_LIMIT: usize = 100;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateAsyncJobRequest {
     pub application_id: ApplicationId,
     pub operation_scope: String,
@@ -28,14 +29,14 @@ pub struct CreateAsyncJobRequest {
     pub max_attempts: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompleteAsyncJobRequest {
     pub job_id: AsyncJobId,
     pub lease_token: String,
     pub item_results: Vec<AsyncJobItemResult>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailAsyncJobRequest {
     pub job_id: AsyncJobId,
     pub lease_token: String,
@@ -61,11 +62,61 @@ pub struct AsyncJobDetails {
     pub item_results: Vec<AsyncJobItemResult>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LeasedAsyncJob {
     pub job: AsyncJob,
     pub lease_token: String,
     pub pending_media_ids: Vec<MediaId>,
+}
+
+impl fmt::Debug for CreateAsyncJobRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateAsyncJobRequest")
+            .field("application_id", &self.application_id)
+            .field("operation_scope", &self.operation_scope)
+            .field("idempotency_key", &Redacted(&self.idempotency_key))
+            .field("request_hash", &Redacted(&self.request_hash))
+            .field("request_id", &self.request_id)
+            .field("action", &self.action)
+            .field("media_ids", &self.media_ids)
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CompleteAsyncJobRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompleteAsyncJobRequest")
+            .field("job_id", &self.job_id)
+            .field("lease_token", &Redacted(&self.lease_token))
+            .field("item_results", &self.item_results)
+            .finish()
+    }
+}
+
+impl fmt::Debug for FailAsyncJobRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailAsyncJobRequest")
+            .field("job_id", &self.job_id)
+            .field("lease_token", &Redacted(&self.lease_token))
+            .field("error_summary", &self.error_summary)
+            .field("retry_at", &self.retry_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for LeasedAsyncJob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeasedAsyncJob")
+            .field("job", &self.job)
+            .field("lease_token", &Redacted(&self.lease_token))
+            .field("pending_media_ids", &self.pending_media_ids)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +182,15 @@ pub trait AsyncJobRepository: Send + Sync {
         leased_until: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<LeasedAsyncJob>, RepositoryError>;
+
+    /// Extends a still-valid lease while fencing by the current token.
+    async fn renew_async_job_lease(
+        &self,
+        job_id: AsyncJobId,
+        lease_token: &str,
+        now: OffsetDateTime,
+        leased_until: OffsetDateTime,
+    ) -> Result<bool, RepositoryError>;
 
     /// Stores every item result and completes the job in one transaction. The
     /// repository must verify that results cover all unfinished targets and
@@ -277,6 +337,19 @@ where
         }
     }
 
+    pub async fn renew(
+        &self,
+        job_id: AsyncJobId,
+        lease_token: &str,
+    ) -> Result<bool, AsyncJobApplicationError> {
+        let now = self.clock.now();
+        let leased_until = now + Duration::seconds(DEFAULT_ASYNC_JOB_LEASE_SECONDS);
+        Ok(self
+            .repository
+            .renew_async_job_lease(job_id, lease_token, now, leased_until)
+            .await?)
+    }
+
     pub async fn fail(
         &self,
         request: &FailAsyncJobRequest,
@@ -347,6 +420,9 @@ fn validate_unique_media_ids(media_ids: &[MediaId]) -> Result<(), AsyncJobApplic
     if media_ids.is_empty() {
         return Err(AsyncJobError::EmptyBatch.into());
     }
+    if media_ids.len() > MAX_ASYNC_JOB_ITEMS as usize {
+        return Err(AsyncJobApplicationError::TooManyItems);
+    }
     let unique = media_ids.iter().copied().collect::<HashSet<_>>();
     if unique.len() != media_ids.len() {
         return Err(AsyncJobApplicationError::DuplicateMediaIds);
@@ -404,6 +480,16 @@ mod tests {
             _limit: usize,
         ) -> Result<Vec<LeasedAsyncJob>, RepositoryError> {
             Ok(Vec::new())
+        }
+
+        async fn renew_async_job_lease(
+            &self,
+            _job_id: AsyncJobId,
+            _lease_token: &str,
+            _now: OffsetDateTime,
+            _leased_until: OffsetDateTime,
+        ) -> Result<bool, RepositoryError> {
+            Ok(false)
         }
 
         async fn complete_async_job(

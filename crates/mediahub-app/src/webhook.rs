@@ -1,9 +1,11 @@
+use std::fmt;
+
 use async_trait::async_trait;
 use mediahub_core::{ApplicationId, OffsetDateTime};
 
-use crate::RepositoryError;
+use crate::{Redacted, RepositoryError};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewWebhookEndpoint {
     pub id: String,
     pub application_id: ApplicationId,
@@ -15,7 +17,7 @@ pub struct NewWebhookEndpoint {
     pub created_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebhookEndpoint {
     pub id: String,
     pub application_id: ApplicationId,
@@ -28,7 +30,7 @@ pub struct WebhookEndpoint {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebhookEndpointUpdate {
     pub url: String,
     pub secret_ciphertext: String,
@@ -36,6 +38,53 @@ pub struct WebhookEndpointUpdate {
     pub subscribed_events: Vec<String>,
     pub enabled: bool,
     pub updated_at: OffsetDateTime,
+}
+
+impl fmt::Debug for NewWebhookEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewWebhookEndpoint")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("url", &self.url)
+            .field("secret_ciphertext", &Redacted(&self.secret_ciphertext))
+            .field("secret_key_version", &self.secret_key_version)
+            .field("subscribed_events", &self.subscribed_events)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for WebhookEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebhookEndpoint")
+            .field("id", &self.id)
+            .field("application_id", &self.application_id)
+            .field("url", &self.url)
+            .field("secret_ciphertext", &Redacted(&self.secret_ciphertext))
+            .field("secret_key_version", &self.secret_key_version)
+            .field("subscribed_events", &self.subscribed_events)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for WebhookEndpointUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebhookEndpointUpdate")
+            .field("url", &self.url)
+            .field("secret_ciphertext", &Redacted(&self.secret_ciphertext))
+            .field("secret_key_version", &self.secret_key_version)
+            .field("subscribed_events", &self.subscribed_events)
+            .field("enabled", &self.enabled)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +96,6 @@ pub enum WebhookDeliveryHistoryStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WebhookDeliveryHistoryCursor {
-    pub updated_at: OffsetDateTime,
     pub row_id: i64,
 }
 

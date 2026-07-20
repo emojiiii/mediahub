@@ -38,8 +38,13 @@ pub enum Permission {
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AsyncJobAction {
-    UpdateTtlSeconds { ttl_seconds: Option<u64> },
-    UpdateVisibility { visibility: Visibility },
+    UpdateTtlSeconds {
+        #[schema(minimum = 1)]
+        ttl_seconds: Option<u64>,
+    },
+    UpdateVisibility {
+        visibility: Visibility,
+    },
     Delete,
 }
 
@@ -110,6 +115,15 @@ pub enum AsyncJobState {
 
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum AsyncJobItemState {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum AuditActorType {
     User,
     AccessKey,
@@ -145,6 +159,7 @@ pub struct AdminApplication {
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdminUpdateApplicationQuota {
+    #[schema(maximum = 9_223_372_036_854_775_807_u64)]
     pub quota_bytes: u64,
 }
 
@@ -251,23 +266,30 @@ pub struct AsyncJob {
     pub id: String,
     pub application_id: String,
     pub operation_scope: String,
-    pub idempotency_key: String,
-    pub request_hash: String,
+    #[schema(required = true)]
     pub request_id: Option<String>,
     pub action: AsyncJobAction,
-    pub state: String,
+    pub state: AsyncJobState,
     pub total_items: u64,
     pub succeeded_items: u64,
     pub failed_items: u64,
     pub attempt_count: u64,
     pub max_attempts: u64,
+    #[schema(required = true, format = DateTime)]
     pub next_attempt_at: Option<String>,
+    #[schema(required = true)]
     pub error_summary: Option<String>,
+    #[schema(required = true, format = DateTime)]
     pub started_at: Option<String>,
+    #[schema(required = true, format = DateTime)]
     pub completed_at: Option<String>,
+    #[schema(required = true, format = DateTime)]
     pub failed_at: Option<String>,
+    #[schema(required = true, format = DateTime)]
     pub cancelled_at: Option<String>,
+    #[schema(format = DateTime)]
     pub created_at: String,
+    #[schema(format = DateTime)]
     pub updated_at: String,
 }
 
@@ -278,13 +300,19 @@ pub struct AsyncJobItemResult {
     pub application_id: String,
     pub media_id: String,
     pub ordinal: u32,
-    pub state: String,
+    pub state: AsyncJobItemState,
     pub attempt_count: u32,
+    #[schema(required = true)]
     pub result: Option<Value>,
+    #[schema(required = true)]
     pub error_code: Option<String>,
+    #[schema(required = true)]
     pub error_summary: Option<String>,
+    #[schema(required = true, format = DateTime)]
     pub started_at: Option<String>,
+    #[schema(required = true, format = DateTime)]
     pub completed_at: Option<String>,
+    #[schema(format = DateTime)]
     pub updated_at: String,
 }
 
@@ -343,7 +371,8 @@ pub struct BatchItemResult {
 #[serde(deny_unknown_fields)]
 pub struct BatchMediaRequest {
     pub action: AsyncJobAction,
-    pub media_ids: Vec<String>,
+    #[schema(min_items = 1, max_items = 1000)]
+    pub media_ids: Vec<uuid::Uuid>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -412,7 +441,9 @@ pub struct CreateBucket {
     pub visibility: Option<Visibility>,
     pub default_ttl_seconds: Option<u64>,
     pub max_object_size: Option<u64>,
+    #[schema(nullable = false)]
     pub allowed_mime_types: Option<Vec<String>>,
+    #[schema(nullable = false)]
     pub lifecycle_rules: Option<Vec<LifecycleRule>>,
 }
 
@@ -461,6 +492,8 @@ pub struct CreateUploadSessionResponse {
 pub struct CreateWebhook {
     pub url: String,
     pub events: Vec<String>,
+    #[serde(default)]
+    #[schema(nullable = false, default = true)]
     pub enabled: Option<bool>,
 }
 
@@ -651,6 +684,8 @@ pub struct UpdateWebhook {
     pub url: Option<String>,
     pub events: Option<Vec<String>>,
     pub enabled: Option<bool>,
+    #[serde(default)]
+    #[schema(nullable = false, default = false)]
     pub rotate_secret: Option<bool>,
 }
 

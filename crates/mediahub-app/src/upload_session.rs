@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use mediahub_core::{
     ApplicationId, Bucket, BucketId, ClientMetadata, Media, MediaId, NewMedia, OffsetDateTime,
@@ -7,7 +7,7 @@ use mediahub_core::{
 use time::Duration;
 
 use crate::{
-    ApplicationError, BucketRepository, Clock, OutboxEvent, RepositoryError,
+    ApplicationError, BucketRepository, Clock, OutboxEvent, Redacted, RepositoryError,
     UploadSessionCancellation, UploadSessionCompletion, UploadSessionExpiration,
     UploadSessionRepository, UploadSessionStorage,
 };
@@ -15,7 +15,7 @@ use crate::{
 pub const DEFAULT_UPLOAD_SESSION_TTL: Duration = Duration::minutes(15);
 
 /// Transport-neutral input for creating a direct upload intent.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CreateUploadSessionRequest {
     pub application_id: ApplicationId,
     pub bucket_id: BucketId,
@@ -30,14 +30,45 @@ pub struct CreateUploadSessionRequest {
     pub metadata: ClientMetadata,
 }
 
+impl fmt::Debug for CreateUploadSessionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateUploadSessionRequest")
+            .field("application_id", &self.application_id)
+            .field("bucket_id", &self.bucket_id)
+            .field("object_key", &self.object_key)
+            .field("original_name", &self.original_name)
+            .field("display_name", &self.display_name)
+            .field("extension", &self.extension)
+            .field("expected_size", &self.expected_size)
+            .field("expected_mime", &self.expected_mime)
+            .field("visibility_override", &self.visibility_override)
+            .field("media_expires_at", &self.media_expires_at)
+            .field("metadata", &Redacted(&self.metadata))
+            .finish()
+    }
+}
+
 /// Opaque upload target returned to a transport layer. `url` can represent a
 /// MediaHub endpoint, S3-compatible presigned URL, or R2 upload target.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UploadTarget {
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub expires_at: OffsetDateTime,
+}
+
+impl fmt::Debug for UploadTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UploadTarget")
+            .field("method", &self.method)
+            .field("url", &Redacted(&self.url))
+            .field("headers", &Redacted(&self.headers))
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Adapter-created storage location and client upload target.
@@ -232,9 +263,9 @@ where
             UploadSessionState::Pending => {}
         }
 
-        let now = self.clock.now();
-        if session.is_expired_at(now) {
-            self.expire_one(&session, now).await?;
+        let initial_now = self.clock.now();
+        if session.is_expired_at(initial_now) {
+            self.expire_one(&session, initial_now).await?;
             return Err(ApplicationError::UploadSessionExpired);
         }
 
@@ -251,17 +282,45 @@ where
                 }
                 error => ApplicationError::ObjectStore(error),
             })?;
-        let media = match self.build_media(&session, &bucket, &stored, &request.sha256, now) {
+        // Inspection can be slow enough to cross the session TTL. Re-read the
+        // clock after the remote operation and fence completion before any
+        // durable media/session transition.
+        let verification_now = self.clock.now();
+        if session.is_expired_at(verification_now) {
+            self.expire_one(&session, verification_now).await?;
+            return Err(ApplicationError::UploadSessionExpired);
+        }
+        let final_storage_key = format!("objects/{}", session.media_id());
+        let media = match self.build_media(
+            &session,
+            &bucket,
+            &stored,
+            &request.sha256,
+            &final_storage_key,
+            verification_now,
+        ) {
             Ok(media) => media,
             Err(error) => {
-                self.cancel_uncommitted(&session, now).await?;
+                self.cancel_uncommitted(&session, verification_now).await?;
                 return Err(error);
             }
         };
-        let event = OutboxEvent::media_uploaded(&media, now);
+        // Storage promotion is deliberately separate from the DB transaction.
+        // A failed/uncertain promotion leaves the session pending so a later
+        // completion attempt can recover it without deleting a possible final
+        // object.
+        self.storage
+            .finalize_upload(&session, &final_storage_key)
+            .await?;
+        let commit_now = self.clock.now();
+        if session.is_expired_at(commit_now) {
+            self.expire_one(&session, commit_now).await?;
+            return Err(ApplicationError::UploadSessionExpired);
+        }
+        let event = OutboxEvent::media_uploaded(&media, commit_now);
         match self
             .repository
-            .complete_upload_session(session.id(), media, now, event)
+            .complete_upload_session(session.id(), media, commit_now, event)
             .await?
         {
             UploadSessionCompletion::Completed(media) => {
@@ -308,14 +367,14 @@ where
             .await?
         {
             UploadSessionCancellation::Cancelled(session) => {
-                let _ = self.storage.abort_upload(&session).await;
+                self.cleanup_if_target_expired(&session).await?;
                 Ok(CancelUploadSessionReceipt {
                     session,
                     already_cancelled: false,
                 })
             }
             UploadSessionCancellation::AlreadyCancelled(session) => {
-                let _ = self.storage.abort_upload(&session).await;
+                self.cleanup_if_target_expired(&session).await?;
                 Ok(CancelUploadSessionReceipt {
                     session,
                     already_cancelled: true,
@@ -336,10 +395,17 @@ where
             .repository
             .expire_upload_sessions(self.clock.now(), limit)
             .await?;
+        let mut first_error = None;
         for session in &expired_sessions {
             // Durable expiry and quota release have already succeeded. Object
-            // cleanup is idempotent and can be retried by a later worker pass.
-            let _ = self.storage.abort_upload(session).await;
+            // cleanup is idempotent and is acknowledged only after success;
+            // failed cleanup leaves this terminal row eligible for retry.
+            if let Err(error) = self.cleanup_storage(session).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(ExpireUploadSessionsReceipt { expired_sessions })
     }
@@ -410,7 +476,7 @@ where
         {
             UploadSessionExpiration::Expired(session)
             | UploadSessionExpiration::AlreadyExpired(session) => {
-                let _ = self.storage.abort_upload(&session).await;
+                self.cleanup_storage(&session).await?;
                 Ok(())
             }
             UploadSessionExpiration::Completed => {
@@ -433,9 +499,27 @@ where
         {
             UploadSessionCancellation::Cancelled(session)
             | UploadSessionCancellation::AlreadyCancelled(session) => {
-                let _ = self.storage.abort_upload(&session).await;
+                self.cleanup_if_target_expired(&session).await?;
             }
             UploadSessionCancellation::Completed | UploadSessionCancellation::Expired => {}
+        }
+        Ok(())
+    }
+
+    async fn cleanup_storage(&self, session: &UploadSession) -> Result<(), ApplicationError> {
+        self.storage.abort_upload(session).await?;
+        self.repository
+            .complete_upload_session_cleanup(session.id())
+            .await?;
+        Ok(())
+    }
+
+    async fn cleanup_if_target_expired(
+        &self,
+        session: &UploadSession,
+    ) -> Result<(), ApplicationError> {
+        if session.is_expired_at(self.clock.now()) {
+            self.cleanup_storage(session).await?;
         }
         Ok(())
     }
@@ -446,6 +530,7 @@ where
         bucket: &Bucket,
         stored: &StoredUpload,
         submitted_sha256: &str,
+        final_storage_key: &str,
         now: OffsetDateTime,
     ) -> Result<Media, ApplicationError> {
         let system_metadata =
@@ -470,7 +555,7 @@ where
                 display_name: session.display_name().to_owned(),
                 extension: session.extension().map(str::to_owned),
                 storage_backend: session.storage_backend().to_owned(),
-                storage_key: session.storage_key().to_owned(),
+                storage_key: final_storage_key.to_owned(),
                 visibility_override: session.visibility_override(),
                 expire_at: session.media_expires_at(),
                 system_metadata,
@@ -491,16 +576,72 @@ fn map_create_session_error(error: RepositoryError) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
     use futures::executor::block_on;
     use mediahub_core::{BucketPolicy, UploadSessionState};
     use sha2::{Digest, Sha256};
 
     use crate::{
-        FixedClock, InMemoryBucketRepository, InMemoryMediaRepository, InMemoryObjectStore,
-        QuotaSnapshot, UploadSessionExpiration, UploadSessionRepository,
+        Clock, FixedClock, InMemoryBucketRepository, InMemoryMediaRepository, InMemoryObjectStore,
+        ObjectStoreError, PreparedUpload, QuotaSnapshot, StoredUpload, UploadSessionExpiration,
+        UploadSessionRepository, UploadSessionStorage,
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct AdvancingClock {
+        now: Arc<Mutex<OffsetDateTime>>,
+    }
+
+    impl Clock for AdvancingClock {
+        fn now(&self) -> OffsetDateTime {
+            *self.now.lock().expect("clock lock")
+        }
+    }
+
+    #[derive(Clone)]
+    struct AdvancingInspectStorage {
+        inner: InMemoryObjectStore,
+        clock: Arc<Mutex<OffsetDateTime>>,
+    }
+
+    #[async_trait]
+    impl UploadSessionStorage for AdvancingInspectStorage {
+        async fn prepare_upload(
+            &self,
+            upload_session_id: UploadSessionId,
+            media_id: MediaId,
+            expected_size: u64,
+            expected_mime: &str,
+            expires_at: OffsetDateTime,
+        ) -> Result<PreparedUpload, ObjectStoreError> {
+            self.inner
+                .prepare_upload(
+                    upload_session_id,
+                    media_id,
+                    expected_size,
+                    expected_mime,
+                    expires_at,
+                )
+                .await
+        }
+
+        async fn inspect_upload(
+            &self,
+            session: &UploadSession,
+        ) -> Result<StoredUpload, ObjectStoreError> {
+            let result = self.inner.inspect_upload(session).await;
+            *self.clock.lock().expect("clock lock") += Duration::seconds(2);
+            result
+        }
+
+        async fn abort_upload(&self, session: &UploadSession) -> Result<(), ObjectStoreError> {
+            self.inner.abort_upload(session).await
+        }
+    }
 
     fn setup() -> (
         ApplicationId,
@@ -649,6 +790,134 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_session_is_not_cleaned_or_acknowledged_before_target_expiry() {
+        let application_id = ApplicationId::new();
+        let bucket_id = BucketId::new();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let session_ttl = Duration::seconds(60);
+        let bucket = Bucket::new(
+            bucket_id,
+            application_id,
+            "cancel-cleanup-delay",
+            BucketPolicy::unrestricted(Visibility::Private),
+            now,
+        )
+        .expect("fixture bucket");
+        let storage = InMemoryObjectStore::default();
+        let repository = InMemoryMediaRepository::with_quota(application_id, 32);
+        let service = UploadSessionService::with_session_ttl(
+            storage.clone(),
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket.clone()),
+            FixedClock::new(now),
+            session_ttl,
+        );
+        let receipt = block_on(service.create(&request(application_id, bucket_id)))
+            .expect("upload session created");
+        storage
+            .put_upload(&receipt.session, b"data", "image/png")
+            .expect("client upload");
+
+        block_on(service.cancel(&CancelUploadSessionRequest {
+            application_id,
+            upload_session_id: receipt.session.id(),
+        }))
+        .expect("cancel upload session");
+        let before_expiry = UploadSessionService::with_session_ttl(
+            storage.clone(),
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket),
+            FixedClock::new(receipt.session.session_expires_at() - Duration::seconds(1)),
+            session_ttl,
+        );
+        let scan = block_on(before_expiry.expire_due(10)).expect("pre-expiry cleanup scan");
+
+        assert!(scan.expired_sessions.is_empty());
+        assert!(
+            storage
+                .object_content(receipt.session.storage_key())
+                .is_some()
+        );
+        assert!(
+            block_on(repository.complete_upload_session_cleanup(receipt.session.id()))
+                .expect("cleanup was not acknowledged early")
+        );
+    }
+
+    #[test]
+    fn completed_session_is_cleaned_after_target_expiry_without_deleting_final_object() {
+        let application_id = ApplicationId::new();
+        let bucket_id = BucketId::new();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let session_ttl = Duration::seconds(60);
+        let bucket = Bucket::new(
+            bucket_id,
+            application_id,
+            "completed-cleanup-delay",
+            BucketPolicy::unrestricted(Visibility::Private),
+            now,
+        )
+        .expect("fixture bucket");
+        let storage = InMemoryObjectStore::default();
+        let repository = InMemoryMediaRepository::with_quota(application_id, 32);
+        let service = UploadSessionService::with_session_ttl(
+            storage.clone(),
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket.clone()),
+            FixedClock::new(now),
+            session_ttl,
+        );
+        let receipt = block_on(service.create(&request(application_id, bucket_id)))
+            .expect("upload session created");
+        storage
+            .put_upload(&receipt.session, b"data", "image/png")
+            .expect("client upload");
+        block_on(service.complete(&CompleteUploadSessionRequest {
+            application_id,
+            upload_session_id: receipt.session.id(),
+            sha256: hex::encode(Sha256::digest(b"data")),
+        }))
+        .expect("complete upload session");
+
+        let before_expiry = UploadSessionService::with_session_ttl(
+            storage.clone(),
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket.clone()),
+            FixedClock::new(receipt.session.session_expires_at() - Duration::seconds(1)),
+            session_ttl,
+        );
+        assert!(
+            block_on(before_expiry.expire_due(10))
+                .expect("pre-expiry cleanup scan")
+                .expired_sessions
+                .is_empty()
+        );
+
+        let after_expiry = UploadSessionService::with_session_ttl(
+            storage.clone(),
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket),
+            FixedClock::new(receipt.session.session_expires_at()),
+            session_ttl,
+        );
+        let scan = block_on(after_expiry.expire_due(10)).expect("post-expiry cleanup scan");
+
+        assert_eq!(scan.expired_sessions.len(), 1);
+        assert_eq!(
+            scan.expired_sessions[0].state(),
+            UploadSessionState::Completed
+        );
+        assert_eq!(
+            storage.object_content(receipt.session.storage_key()),
+            Some(b"data".to_vec())
+        );
+        assert!(
+            !block_on(repository.complete_upload_session_cleanup(receipt.session.id()))
+                .expect("cleanup was already acknowledged")
+        );
+    }
+
+    #[test]
     fn expiry_is_idempotent_and_releases_reserved_quota_once() {
         let application_id = ApplicationId::new();
         let bucket_id = BucketId::new();
@@ -760,5 +1029,109 @@ mod tests {
             result,
             Err(ApplicationError::UploadSessionVerificationFailed)
         ));
+    }
+
+    #[test]
+    fn completion_rechecks_expiry_after_slow_object_inspection() {
+        let application_id = ApplicationId::new();
+        let bucket_id = BucketId::new();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let bucket = Bucket::new(
+            bucket_id,
+            application_id,
+            "slow-inspection",
+            BucketPolicy::unrestricted(Visibility::Private),
+            now,
+        )
+        .expect("fixture bucket");
+        let clock_now = Arc::new(Mutex::new(now));
+        let inner = InMemoryObjectStore::default();
+        let storage = AdvancingInspectStorage {
+            inner: inner.clone(),
+            clock: clock_now.clone(),
+        };
+        let repository = InMemoryMediaRepository::with_quota(application_id, 32);
+        let service = UploadSessionService::with_session_ttl(
+            storage,
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket),
+            AdvancingClock { now: clock_now },
+            Duration::seconds(1),
+        );
+        let receipt = block_on(service.create(&request(application_id, bucket_id)))
+            .expect("upload session created");
+        inner
+            .put_upload(&receipt.session, b"data", "image/png")
+            .expect("client upload");
+
+        let result = block_on(service.complete(&CompleteUploadSessionRequest {
+            application_id,
+            upload_session_id: receipt.session.id(),
+            sha256: hex::encode(Sha256::digest(b"data")),
+        }));
+
+        assert!(matches!(
+            result,
+            Err(ApplicationError::UploadSessionExpired)
+        ));
+        assert_eq!(
+            repository
+                .upload_session(receipt.session.id())
+                .expect("session")
+                .state(),
+            UploadSessionState::Expired
+        );
+    }
+
+    #[test]
+    fn failed_expired_object_cleanup_is_retried_on_the_next_scan() {
+        let application_id = ApplicationId::new();
+        let bucket_id = BucketId::new();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let bucket = Bucket::new(
+            bucket_id,
+            application_id,
+            "cleanup-retry",
+            BucketPolicy::unrestricted(Visibility::Private),
+            now,
+        )
+        .expect("fixture bucket");
+        let storage = InMemoryObjectStore::default();
+        let repository = InMemoryMediaRepository::with_quota(application_id, 32);
+        let service = UploadSessionService::with_session_ttl(
+            storage.clone(),
+            repository.clone(),
+            InMemoryBucketRepository::with_bucket(bucket),
+            FixedClock::new(now),
+            Duration::seconds(1),
+        );
+        let receipt = block_on(service.create(&request(application_id, bucket_id)))
+            .expect("upload session created");
+        let expires_at = receipt.session.session_expires_at();
+
+        storage.fail_next_abort(ObjectStoreError::Unavailable("temporary outage".to_owned()));
+        assert!(matches!(
+            block_on(repository.expire_upload_sessions(expires_at, 10)),
+            Ok(sessions) if sessions.len() == 1
+        ));
+        let cleanup_service = UploadSessionService::with_session_ttl(
+            storage,
+            repository.clone(),
+            service.bucket_repository.clone(),
+            FixedClock::new(expires_at),
+            Duration::seconds(1),
+        );
+        let first = block_on(cleanup_service.expire_due(10));
+        assert!(
+            matches!(first, Err(ApplicationError::ObjectStore(_))),
+            "unexpected cleanup result: {first:?}"
+        );
+
+        let second = block_on(cleanup_service.expire_due(10)).expect("retry cleanup");
+        assert_eq!(second.expired_sessions.len(), 1);
+        assert!(
+            !block_on(repository.complete_upload_session_cleanup(receipt.session.id()))
+                .expect("cleanup ack")
+        );
     }
 }

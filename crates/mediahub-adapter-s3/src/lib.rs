@@ -23,7 +23,7 @@ use mediahub_app::{
     ComposedObject, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, PreparedUpload,
     StoredUpload, UploadSessionStorage, UploadTarget,
 };
-use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId};
+use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId, UploadSessionState};
 use object_store::{
     Attribute, Attributes, Error as BackendError, GetOptions, ObjectStore as BackendObjectStore,
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, WriteMultipart,
@@ -36,8 +36,9 @@ use sha2::{Digest, Sha256};
 const S3_BACKEND: &str = "s3";
 const MAX_PRESIGNED_PUT_TTL: Duration = Duration::from_secs(15 * 60);
 const COMMIT_COMPARE_CHUNK_SIZE: u64 = 1024 * 1024;
+const SHA256_METADATA_KEY: &str = "mediahub-sha256";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
@@ -48,6 +49,29 @@ pub struct S3Config {
     pub allow_http: bool,
     pub virtual_hosted_style: bool,
     pub prefix: Option<String>,
+}
+
+impl fmt::Debug for S3Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allow_http", &self.allow_http)
+            .field("virtual_hosted_style", &self.virtual_hosted_style)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -173,6 +197,7 @@ impl AwsPresignedPutSigner {
         let headers = [
             ("content-length", content_length.as_str()),
             ("content-type", content_type),
+            ("if-none-match", "*"),
         ];
         let signable = SignableRequest::new(
             "PUT",
@@ -305,6 +330,11 @@ impl S3ObjectStore {
         if left.size != right.size {
             return Ok(false);
         }
+        let left_type = self.object_content_type(left_path, left).await?;
+        let right_type = self.object_content_type(right_path, right).await?;
+        if left_type != right_type {
+            return Ok(false);
+        }
 
         let mut start = 0;
         while start < left.size {
@@ -347,6 +377,91 @@ impl S3ObjectStore {
         }
         Ok(true)
     }
+
+    async fn object_content_type(
+        &self,
+        path: &Path,
+        metadata: &object_store::ObjectMeta,
+    ) -> Result<Option<String>, ObjectStoreError> {
+        let result = self
+            .backend
+            .get_opts(
+                path,
+                GetOptions::new()
+                    .with_head(true)
+                    .with_if_match(metadata.e_tag.clone())
+                    .with_version(metadata.version.clone()),
+            )
+            .await
+            .map_err(map_commit_comparison_error)?;
+        Ok(result
+            .attributes
+            .get(&Attribute::ContentType)
+            .map(|value| value.as_ref().to_owned()))
+    }
+
+    async fn promote_temporary(
+        &self,
+        temporary_key: &str,
+        final_key: &str,
+        delete_temporary: bool,
+    ) -> Result<(), ObjectStoreError> {
+        let temporary_path = self.path_for(temporary_key)?;
+        let final_path = self.path_for(final_key)?;
+        let temporary = self
+            .backend
+            .head(&temporary_path)
+            .await
+            .map_err(map_backend_error)?;
+
+        match self.backend.head(&final_path).await {
+            Ok(final_object) => {
+                if !self
+                    .object_contents_match(&temporary_path, &temporary, &final_path, &final_object)
+                    .await?
+                {
+                    return Err(ObjectStoreError::AlreadyExists);
+                }
+            }
+            Err(BackendError::NotFound { .. }) => match self
+                .backend
+                .copy_if_not_exists(&temporary_path, &final_path)
+                .await
+            {
+                Ok(()) => {}
+                Err(BackendError::AlreadyExists { .. }) => {
+                    let final_object = self
+                        .backend
+                        .head(&final_path)
+                        .await
+                        .map_err(map_backend_error)?;
+                    if !self
+                        .object_contents_match(
+                            &temporary_path,
+                            &temporary,
+                            &final_path,
+                            &final_object,
+                        )
+                        .await?
+                    {
+                        return Err(ObjectStoreError::AlreadyExists);
+                    }
+                }
+                Err(error) => return Err(map_backend_error(error)),
+            },
+            Err(error) => return Err(map_backend_error(error)),
+        }
+        if delete_temporary {
+            // Promotion is the commit point. Returning a cleanup failure keeps
+            // the durable Media row in `uploading` so reconciliation can retry
+            // without rolling back the already-visible final object.
+            self.backend
+                .delete(&temporary_path)
+                .await
+                .map_err(map_backend_error)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -354,12 +469,15 @@ impl UploadSessionStorage for S3ObjectStore {
     async fn prepare_upload(
         &self,
         _upload_session_id: UploadSessionId,
-        media_id: MediaId,
+        _media_id: MediaId,
         expected_size: u64,
         expected_mime: &str,
         expires_at: OffsetDateTime,
     ) -> Result<PreparedUpload, ObjectStoreError> {
-        let storage_key = format!("objects/{media_id}");
+        // Presigned clients must never write the immutable final object key.
+        // The upload session id makes the target one-shot and prevents URL
+        // replay from overwriting a completed media object.
+        let storage_key = format!("temporary/uploads/{_upload_session_id}");
         let path = self.path_for(&storage_key)?;
         let signer = self.upload_signer.as_ref().ok_or_else(|| {
             ObjectStoreError::Unavailable(
@@ -376,6 +494,7 @@ impl UploadSessionStorage for S3ObjectStore {
                 headers: BTreeMap::from([
                     ("content-length".to_owned(), expected_size.to_string()),
                     ("content-type".to_owned(), expected_mime.to_owned()),
+                    ("if-none-match".to_owned(), "*".to_owned()),
                 ]),
                 expires_at,
             },
@@ -388,8 +507,23 @@ impl UploadSessionStorage for S3ObjectStore {
         &self,
         session: &UploadSession,
     ) -> Result<StoredUpload, ObjectStoreError> {
-        let path = self.path_for(session.storage_key())?;
-        let head = self.backend.head(&path).await.map_err(map_backend_error)?;
+        let temporary_path = self.path_for(session.storage_key())?;
+        let (path, head) = match self.backend.head(&temporary_path).await {
+            Ok(head) => (temporary_path, head),
+            Err(BackendError::NotFound { .. }) => {
+                // A repository failure can happen after promotion but before
+                // the session row is marked complete. Inspect the final key so
+                // the next completion attempt can recover idempotently.
+                let final_path = self.path_for(&format!("objects/{}", session.media_id()))?;
+                let head = self
+                    .backend
+                    .head(&final_path)
+                    .await
+                    .map_err(map_backend_error)?;
+                (final_path, head)
+            }
+            Err(error) => return Err(map_backend_error(error)),
+        };
         if head.e_tag.is_none() && head.version.is_none() {
             return Err(ObjectStoreError::Unavailable(
                 "S3 upload inspection requires an ETag or object version to fence the GET".into(),
@@ -446,11 +580,41 @@ impl UploadSessionStorage for S3ObjectStore {
         })
     }
 
+    async fn finalize_upload(
+        &self,
+        session: &UploadSession,
+        final_storage_key: &str,
+    ) -> Result<(), ObjectStoreError> {
+        match self
+            .promote_temporary(session.storage_key(), final_storage_key, false)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotFound) => {
+                let metadata = ObjectStore::head(self, final_storage_key).await?;
+                if metadata.size == session.expected_size()
+                    && metadata.content_type.as_deref() == Some(session.expected_mime())
+                {
+                    Ok(())
+                } else {
+                    Err(ObjectStoreError::NotFound)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn abort_upload(&self, session: &UploadSession) -> Result<(), ObjectStoreError> {
         // This adapter currently issues one complete presigned PUT and never
         // creates multipart state. If multipart is introduced, its upload ID
         // must be persisted and explicitly aborted before this delete.
-        self.delete(session.storage_key()).await
+        self.delete(session.storage_key()).await?;
+        if session.state() == UploadSessionState::Completed {
+            Ok(())
+        } else {
+            self.delete(&format!("objects/{}", session.media_id()))
+                .await
+        }
     }
 }
 
@@ -468,6 +632,10 @@ impl ObjectStore for S3ObjectStore {
     ) -> Result<(), ObjectStoreError> {
         let mut attributes = Attributes::new();
         attributes.insert(Attribute::ContentType, content_type.to_owned().into());
+        attributes.insert(
+            Attribute::Metadata(SHA256_METADATA_KEY.into()),
+            hex::encode(Sha256::digest(content)).into(),
+        );
         self.put_create(&self.path_for(temporary_key)?, content.to_vec(), attributes)
             .await
     }
@@ -557,34 +725,7 @@ impl ObjectStore for S3ObjectStore {
         temporary_key: &str,
         final_key: &str,
     ) -> Result<(), ObjectStoreError> {
-        let temporary_path = self.path_for(temporary_key)?;
-        let final_path = self.path_for(final_key)?;
-        let temporary = self
-            .backend
-            .head(&temporary_path)
-            .await
-            .map_err(map_backend_error)?;
-
-        match self.backend.head(&final_path).await {
-            Ok(final_object) => {
-                if !self
-                    .object_contents_match(&temporary_path, &temporary, &final_path, &final_object)
-                    .await?
-                {
-                    return Err(ObjectStoreError::AlreadyExists);
-                }
-            }
-            Err(BackendError::NotFound { .. }) => self
-                .backend
-                .copy(&temporary_path, &final_path)
-                .await
-                .map_err(map_backend_error)?,
-            Err(error) => return Err(map_backend_error(error)),
-        }
-        self.backend
-            .delete(&temporary_path)
-            .await
-            .map_err(map_backend_error)
+        self.promote_temporary(temporary_key, final_key, true).await
     }
 
     async fn read(&self, key: &str) -> Result<Vec<u8>, ObjectStoreError> {
@@ -626,9 +767,43 @@ impl ObjectStore for S3ObjectStore {
                 .map(|value| value.as_ref().to_owned()),
             etag: result.meta.e_tag,
             version: result.meta.version,
-            checksum_sha256: None,
+            checksum_sha256: result
+                .attributes
+                .get(&Attribute::Metadata(SHA256_METADATA_KEY.into()))
+                .map(|value| value.as_ref().to_owned()),
             provider_metadata: BTreeMap::new(),
         })
+    }
+
+    async fn checksum_sha256(&self, key: &str) -> Result<String, ObjectStoreError> {
+        let path = self.path_for(key)?;
+        let head = self
+            .backend
+            .get_opts(&path, GetOptions::new().with_head(true))
+            .await
+            .map_err(map_backend_error)?;
+        if let Some(checksum) = head
+            .attributes
+            .get(&Attribute::Metadata(SHA256_METADATA_KEY.into()))
+        {
+            return Ok(checksum.as_ref().to_owned());
+        }
+        let result = self
+            .backend
+            .get_opts(
+                &path,
+                GetOptions::new()
+                    .with_if_match(head.meta.e_tag)
+                    .with_version(head.meta.version),
+            )
+            .await
+            .map_err(map_commit_comparison_error)?;
+        let mut digest = Sha256::new();
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(map_backend_error)? {
+            digest.update(&chunk);
+        }
+        Ok(hex::encode(digest.finalize()))
     }
 
     async fn list(

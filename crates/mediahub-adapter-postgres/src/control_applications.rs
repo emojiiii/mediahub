@@ -149,10 +149,8 @@ impl ApplicationRepository for PostgresRepository {
     ) -> Result<bool, RepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
-            "SELECT id, \
-                    EXISTS(SELECT 1 FROM buckets WHERE application_id = applications.id) AS has_buckets, \
-                    EXISTS(SELECT 1 FROM media WHERE application_id = applications.id) AS has_media \
-             FROM applications WHERE user_id = $1 AND app_id = $2 FOR UPDATE",
+            "SELECT id FROM applications \
+             WHERE user_id = $1 AND app_id = $2 FOR UPDATE",
         )
         .bind(user_id.as_uuid())
         .bind(app_id)
@@ -163,16 +161,25 @@ impl ApplicationRepository for PostgresRepository {
             transaction.commit().await.map_err(database_error)?;
             return Ok(false);
         };
-        if row
-            .try_get::<bool, _>("has_buckets")
-            .map_err(database_error)?
-            || row
-                .try_get::<bool, _>("has_media")
-                .map_err(database_error)?
-        {
+        let application_id = row.try_get::<Uuid, _>("id").map_err(database_error)?;
+        let has_storage_contents = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM media \
+                 WHERE application_id = $1 AND state <> 'deleted') \
+             OR EXISTS(SELECT 1 FROM upload_sessions \
+                 WHERE application_id = $1 AND (state = 'pending' \
+                     OR storage_cleanup_completed_at IS NULL)) \
+             OR EXISTS(SELECT 1 FROM s3_multipart_uploads upload \
+                 WHERE upload.application_id = $1 AND (upload.state IN ('pending', 'completing') \
+                     OR EXISTS(SELECT 1 FROM s3_multipart_parts part \
+                         WHERE part.upload_id = upload.upload_id)))",
+        )
+        .bind(application_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if has_storage_contents {
             return Err(RepositoryError::Conflict);
         }
-        let application_id = row.try_get::<Uuid, _>("id").map_err(database_error)?;
         sqlx::query(
             "DELETE FROM replay_nonces WHERE access_key_id IN \
              (SELECT access_key_id FROM access_keys WHERE application_id = $1)",
@@ -186,7 +193,42 @@ impl ApplicationRepository for PostgresRepository {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-        sqlx::query("DELETE FROM audit_logs WHERE application_id = $1")
+        sqlx::query("DELETE FROM idempotency_keys WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM async_jobs WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM upload_sessions WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM s3_multipart_uploads WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM webhook_endpoints WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM outbox_events WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM media WHERE application_id = $1")
+            .bind(application_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query("DELETE FROM buckets WHERE application_id = $1")
             .bind(application_id)
             .execute(&mut *transaction)
             .await

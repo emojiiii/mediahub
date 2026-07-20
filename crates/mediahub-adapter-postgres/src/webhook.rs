@@ -151,16 +151,13 @@ impl WebhookEndpointRepository for PostgresRepository {
             None => {}
         }
         if let Some(cursor) = query.cursor {
-            let updated_at = postgres_time(cursor.updated_at);
-            sql.push(" AND (delivery.updated_at < ")
-                .push_bind(updated_at)
-                .push(" OR (delivery.updated_at = ")
-                .push_bind(updated_at)
-                .push(" AND delivery.history_id < ")
-                .push_bind(cursor.row_id)
-                .push("))");
+            // history_id is immutable. updated_at is deliberately excluded
+            // from the resume predicate so replay/delivery mutations between
+            // page requests cannot move a row across the cursor boundary.
+            sql.push(" AND delivery.history_id < ")
+                .push_bind(cursor.row_id);
         }
-        sql.push(" ORDER BY delivery.updated_at DESC, delivery.history_id DESC LIMIT ")
+        sql.push(" ORDER BY delivery.history_id DESC LIMIT ")
             .push_bind(as_i64(u64::try_from(query.limit + 1).map_err(|_| {
                 RepositoryError::Invariant("webhook delivery page limit is too large".into())
             })?)?);

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{DomainError, DomainResult, bucket::canonical_mime_type};
@@ -81,13 +81,23 @@ impl SystemMetadata {
 
 /// Untrusted metadata accepted from clients. It intentionally has no `system`
 /// field, and unknown namespaces are rejected during deserialization.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientMetadata {
     #[serde(default)]
     user: Map<String, Value>,
     #[serde(default)]
     ai: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for ClientMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_value(value).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ClientMetadata {
@@ -132,8 +142,17 @@ impl ClientMetadata {
     }
 
     fn validate_content(&self) -> DomainResult<()> {
-        validate_value(&Value::Object(self.user.clone()), 1, &mut 0)?;
-        validate_value(&Value::Object(self.ai.clone()), 1, &mut 0)
+        let mut key_count = 0;
+        validate_value(&Value::Object(self.user.clone()), 1, &mut key_count)?;
+        validate_value(&Value::Object(self.ai.clone()), 1, &mut key_count)?;
+        let serialized =
+            serde_json::to_vec(self).expect("metadata is serializable by construction");
+        if serialized.len() > MAX_METADATA_BYTES {
+            return Err(DomainError::MetadataTooLarge {
+                max_bytes: MAX_METADATA_BYTES,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -184,8 +203,9 @@ impl MediaMetadata {
     }
 
     fn validate(&self) -> DomainResult<()> {
-        validate_value(&Value::Object(self.user.clone()), 1, &mut 0)?;
-        validate_value(&Value::Object(self.ai.clone()), 1, &mut 0)?;
+        let mut key_count = 0;
+        validate_value(&Value::Object(self.user.clone()), 1, &mut key_count)?;
+        validate_value(&Value::Object(self.ai.clone()), 1, &mut key_count)?;
         let serialized =
             serde_json::to_vec(self).expect("metadata is serializable by construction");
         if serialized.len() > MAX_METADATA_BYTES {
@@ -313,5 +333,48 @@ mod tests {
                 max_depth: MAX_METADATA_DEPTH
             })
         );
+    }
+
+    #[test]
+    fn client_metadata_enforces_key_limit_across_namespaces() {
+        let user = (0..128)
+            .map(|index| (format!("user-{index}"), json!(index)))
+            .collect::<Map<_, _>>();
+        let ai = (0..129)
+            .map(|index| (format!("ai-{index}"), json!(index)))
+            .collect::<Map<_, _>>();
+
+        assert_eq!(
+            ClientMetadata::new(user, ai),
+            Err(DomainError::MetadataTooManyKeys {
+                max_keys: MAX_METADATA_KEYS
+            })
+        );
+    }
+
+    #[test]
+    fn client_metadata_enforces_aggregate_byte_limit_on_all_construction_paths() {
+        let payload = json!({
+            "user": {
+                "values": vec!["x".repeat(4_096); 17]
+            }
+        });
+        assert_eq!(
+            ClientMetadata::from_value(payload.clone()),
+            Err(DomainError::MetadataTooLarge {
+                max_bytes: MAX_METADATA_BYTES
+            })
+        );
+        assert!(serde_json::from_value::<ClientMetadata>(payload).is_err());
+    }
+
+    #[test]
+    fn serde_deserialization_cannot_bypass_domain_validation() {
+        let excessively_long = "x".repeat(MAX_METADATA_STRING_BYTES + 1);
+        let result = serde_json::from_value::<ClientMetadata>(json!({
+            "user": {"prompt": excessively_long}
+        }));
+
+        assert!(result.is_err());
     }
 }

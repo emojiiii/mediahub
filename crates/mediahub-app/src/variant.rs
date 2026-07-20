@@ -1,3 +1,5 @@
+use std::fmt;
+
 use async_trait::async_trait;
 use mediahub_core::{MediaId, OffsetDateTime, VariantFormat, VariantId, VariantTransform};
 use serde::{Deserialize, Serialize};
@@ -5,8 +7,8 @@ use thiserror::Error;
 use time::Duration;
 
 use crate::{
-    Clock, ImageProcessor, ImageProcessorError, ObjectStore, ObjectStoreError, RepositoryError,
-    variant_cache_key,
+    Clock, ImageProcessor, ImageProcessorError, ObjectStore, ObjectStoreError, Redacted,
+    RepositoryError, variant_cache_key,
 };
 
 pub const DEFAULT_VARIANT_LEASE_SECONDS: i64 = 60;
@@ -53,7 +55,7 @@ pub struct VariantRecord {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum VariantClaim {
     Generate {
         variant: VariantRecord,
@@ -98,7 +100,7 @@ pub trait VariantRepository: Send + Sync {
     ) -> Result<(), RepositoryError>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GenerateVariantRequest {
     pub media_id: MediaId,
     pub media_sha256: String,
@@ -106,11 +108,51 @@ pub struct GenerateVariantRequest {
     pub transform: VariantTransform,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VariantReceipt {
     pub variant: VariantRecord,
     pub content: Vec<u8>,
     pub cache_hit: bool,
+}
+
+impl fmt::Debug for VariantClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Generate {
+                variant,
+                lease_token,
+            } => formatter
+                .debug_struct("Generate")
+                .field("variant", variant)
+                .field("lease_token", &Redacted(lease_token))
+                .finish(),
+            Self::Ready(variant) => formatter.debug_tuple("Ready").field(variant).finish(),
+            Self::InProgress => formatter.write_str("InProgress"),
+        }
+    }
+}
+
+impl fmt::Debug for GenerateVariantRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenerateVariantRequest")
+            .field("media_id", &self.media_id)
+            .field("media_sha256", &self.media_sha256)
+            .field("source_content_bytes", &self.source_content.len())
+            .field("transform", &self.transform)
+            .finish()
+    }
+}
+
+impl fmt::Debug for VariantReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VariantReceipt")
+            .field("variant", &self.variant)
+            .field("content_bytes", &self.content.len())
+            .field("cache_hit", &self.cache_hit)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
