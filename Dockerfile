@@ -66,7 +66,34 @@ ENV PKG_CONFIG_PATH=/opt/libvips/lib/pkgconfig
 ENV LD_LIBRARY_PATH=/opt/libvips/lib
 ENV LIBRARY_PATH=/opt/libvips/lib
 WORKDIR /app
-COPY . .
+
+# Keep dependency compilation independent from application source changes.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/mediahub-adapter-image/Cargo.toml crates/mediahub-adapter-image/Cargo.toml
+COPY crates/mediahub-adapter-local/Cargo.toml crates/mediahub-adapter-local/Cargo.toml
+COPY crates/mediahub-adapter-postgres/Cargo.toml crates/mediahub-adapter-postgres/Cargo.toml
+COPY crates/mediahub-adapter-s3/Cargo.toml crates/mediahub-adapter-s3/Cargo.toml
+COPY crates/mediahub-app/Cargo.toml crates/mediahub-app/Cargo.toml
+COPY crates/mediahub-core/Cargo.toml crates/mediahub-core/Cargo.toml
+COPY crates/mediahub-openapi/Cargo.toml crates/mediahub-openapi/Cargo.toml
+COPY crates/mediahub-server/Cargo.toml crates/mediahub-server/Cargo.toml
+RUN for crate in \
+        mediahub-adapter-image \
+        mediahub-adapter-local \
+        mediahub-adapter-postgres \
+        mediahub-adapter-s3 \
+        mediahub-app \
+        mediahub-core \
+        mediahub-openapi \
+        mediahub-server; do \
+        mkdir --parents "crates/${crate}/src"; \
+        printf 'pub fn dependency_placeholder() {}\n' > "crates/${crate}/src/lib.rs"; \
+    done \
+    && printf 'fn main() {}\n' > crates/mediahub-openapi/src/main.rs \
+    && printf 'fn main() {}\n' > crates/mediahub-server/src/main.rs
+RUN cargo build --release --package mediahub-server --features docker-libvips
+
+COPY crates ./crates
 RUN cargo build --release --package mediahub-server --features docker-libvips
 
 FROM debian:bookworm-slim AS runtime

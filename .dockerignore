@@ -1,7 +1,15 @@
 .git
+.github
 target
 web
 data
+logs
+docs
+openapi
+scripts
+*.md
+LICENSE
+CONTRIBUTING.md
+SECURITY.md
 .env
 .env.*
-!.env.example
