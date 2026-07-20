@@ -7,16 +7,208 @@
 
 ## 快速开始
 
-MediaHub 的发布镜像包含 API 与 Worker，Web 控制台位于 `web/`，需要单独部署。先复制环境模板并填写其中所有必填密钥与邮件服务配置：
+MediaHub 的发布镜像只包含 API 和后台 Worker。Web 控制台位于 `web/`，由 Cloudflare Pages 或其他静态托管平台单独部署。服务器需要 Docker Engine 和 Docker Compose v2。
+
+### 使用已发布镜像部署服务器
+
+这是生产环境推荐方式。GitHub Actions 会构建并发布多架构镜像，服务器只拉取与自身架构匹配的镜像，不需要安装 Rust 或编译 libvips。
+
+在服务器上执行，且必须位于包含 `docker-compose.yml` 的仓库根目录：
 
 ```bash
+git clone https://github.com/emojiiii/mediahub.git /opt/mediahub
+cd /opt/mediahub
 cp .env.example .env
-docker compose pull
+chmod 600 .env
+```
+
+编辑 `.env`，填写所有必填密钥、Resend 和前端域名配置，然后启动：
+
+```bash
+docker compose config
+docker compose pull mediahub
 docker compose up -d --no-build
+docker compose ps
 curl --fail http://127.0.0.1:3000/health/ready
 ```
 
-默认镜像为 `ghcr.io/emojiiii/mediahub:latest`。生产环境应将 `MEDIAHUB_IMAGE` 固定到版本标签或镜像摘要，并在反向代理处终止 TLS。需要从源码构建时执行 `docker compose up -d --build`。完整配置、前端启动、备份恢复与 S3 后端说明见 [`docs/runbook.md`](docs/runbook.md)。
+`docker compose config` 用于提前检查 Compose 文件和必填环境变量。不要在 `web/`、家目录或其他没有 `docker-compose.yml` 的目录执行 Compose 命令。
+
+默认镜像为 `ghcr.io/emojiiii/mediahub:latest`。生产环境建议将 `MEDIAHUB_IMAGE` 固定到版本标签、提交标签（例如 `sha-abc1234`）或镜像摘要：
+
+```dotenv
+MEDIAHUB_IMAGE=ghcr.io/emojiiii/mediahub:sha-abc1234
+```
+
+如果 GHCR 包是私有的，先使用具有 `read:packages` 权限的 Token 登录：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+```
+
+更新已运行的服务器：
+
+```bash
+cd /opt/mediahub
+docker compose pull mediahub
+docker compose up -d --no-build
+docker compose logs --tail=100 mediahub
+```
+
+### 从源码构建服务器
+
+只有在服务器无法访问 GHCR，或需要测试未发布代码时才使用源码构建：
+
+```bash
+docker compose up -d --build
+```
+
+这会在 Docker builder 中编译 Rust Release 二进制和固定版本的 libvips，首次构建会明显慢于拉取镜像。仅拉取已发布镜像时不要使用 `--build`。
+
+### 部署 Web 控制台
+
+Web 控制台不在 API 镜像中。Cloudflare Pages 的项目目录设置为 `web`，构建命令为：
+
+```bash
+pnpm install --frozen-lockfile && pnpm build
+```
+
+输出目录为 `dist`（仓库路径为 `web/dist`），构建环境使用 pnpm 11（版本由 `web/package.json` 的 `packageManager` 字段声明）。设置 API 地址：
+
+```dotenv
+VITE_API_BASE_URL=https://api.example.com
+```
+
+API 服务器对应设置：
+
+```dotenv
+MEDIAHUB_WEB_URL=https://console.example.com
+MEDIAHUB_CORS_ALLOWED_ORIGINS=https://console.example.com
+```
+
+`MEDIAHUB_WEB_URL` 用于生成验证邮箱和重置密码链接；`VITE_API_BASE_URL` 才是浏览器访问 API 的地址。两者通常分别对应 Cloudflare 前端域名和 API 域名。
+
+本地启动 Web：
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+VITE_API_BASE_URL=http://localhost:3000 pnpm dev
+```
+
+### 配置
+
+从 `.env.example` 开始配置。`.env` 只放在服务器或 Secret 管理系统中，不要提交到 Git。完整配置、备份恢复和测试命令见 [`docs/runbook.md`](docs/runbook.md)。
+
+| 配置 | 作用 |
+| --- | --- |
+| `MEDIAHUB_IMAGE` | API/Worker 镜像地址，生产环境建议固定版本或摘要 |
+| `MEDIAHUB_POSTGRES_DB`、`MEDIAHUB_POSTGRES_USER`、`MEDIAHUB_POSTGRES_PASSWORD` | Compose PostgreSQL 配置；共享环境必须替换默认密码 |
+| `MEDIAHUB_DATABASE_URL` | 可选，覆盖 Compose 自动生成的连接串，用于外部 PostgreSQL |
+| `MEDIAHUB_STORAGE_BACKEND` | `local` 或 `s3`，默认是 `local` |
+| `MEDIAHUB_STORAGE_ROOT` | Local 模式的对象目录，Compose 中为 `/data/storage` |
+| `MEDIAHUB_S3_*` | S3 兼容后端的 Bucket、Region、Endpoint、凭证、前缀和寻址方式 |
+| `MEDIAHUB_ACCESS_KEY_MASTER_KEY` | 独立的 Base64 32 字节 AES-256-GCM 主密钥，用于加密 Access Key 和 Webhook Secret |
+| `MEDIAHUB_ACCESS_KEY_MASTER_KEY_VERSION`、`MEDIAHUB_ACCESS_KEY_MASTER_KEYRING` | 主密钥轮换时的版本和旧密钥环，旧密钥不能立即删除 |
+| `MEDIAHUB_MEDIA_SIGNING_KEY` | 另一个独立的 Base64 密钥，用于签发短期媒体和上传链接，不能与主密钥复用 |
+| `MEDIAHUB_RESEND_API_KEY` | Resend 服务端 API Key，只放在 API 容器，不要暴露给 Web |
+| `MEDIAHUB_EMAIL_FROM` | Resend 中已验证域名的发件人地址 |
+| `MEDIAHUB_WEB_URL` | Web 控制台的纯 HTTPS Origin，用于验证和重置链接 |
+| `MEDIAHUB_REGISTRATION_ENABLED` | 是否开放注册；完成首个管理员初始化后建议设为 `false` |
+| `MEDIAHUB_CORS_ALLOWED_ORIGINS` | 前端 Origin 的精确逗号分隔白名单 |
+| `MEDIAHUB_COOKIE_SAME_SITE`、`MEDIAHUB_ALLOW_INSECURE_COOKIES` | Cookie 跨站策略；生产 HTTPS 不要启用不安全 Cookie |
+| `MEDIAHUB_BOOTSTRAP_ADMIN_EMAIL` | 一次性将已验证用户提升为系统管理员，成功后必须删除 |
+| `MEDIAHUB_METRICS_BEARER_TOKEN` | 可选的 Prometheus `/metrics` Bearer Token |
+
+三个关键密钥必须分别生成并持久保存：数据库密码用于登录 PostgreSQL，Access Key 主密钥用于解密存储的凭证，媒体签名密钥用于验证短期 URL。重新部署镜像时必须继续使用原值；丢失 Access Key 主密钥会导致已加密的 Secret 无法恢复。
+
+Resend 需要先验证发件域名。MediaHub 直接调用 `https://api.resend.com/emails` 发送邮箱验证和密码重置邮件；如果没有配置 Resend，只能在隔离开发环境启用 `MEDIAHUB_EXPOSE_AUTH_TOKENS=true`，不能用于公网部署。
+
+### 首次管理员初始化
+
+1. 临时设置 `MEDIAHUB_REGISTRATION_ENABLED=true`，启动 API。
+2. 从 Web 控制台注册账号，并通过 Resend 邮件完成验证。
+3. 设置 `MEDIAHUB_BOOTSTRAP_ADMIN_EMAIL` 为该账号邮箱，执行 `docker compose up -d --no-build` 一次。
+4. 确认日志显示管理员提升成功后，立即删除 `MEDIAHUB_BOOTSTRAP_ADMIN_EMAIL`，并将 `MEDIAHUB_REGISTRATION_ENABLED=false`。
+
+重复保留 Bootstrap 变量会让后续启动主动失败，这是设计上的 fail-closed 保护。
+
+## 支持的协议与入口
+
+### JSON 控制面 API
+
+`/api/v1/*` 是 Web 控制台和业务后端使用的 JSON API，包含认证、Application、Access Key、Bucket、媒体、上传、Webhook、AsyncJob、审计和管理员接口。完整请求/响应契约见 [`openapi/openapi.json`](openapi/openapi.json)。
+
+浏览器通常使用 Session Cookie；程序化客户端使用 Application 级 Access Key 和 HMAC-SHA256 签名。写操作需要新鲜的 `X-MediaHub-Nonce`，创建 Bucket 和 UploadSession 还需要 `Idempotency-Key`。
+
+### 原生路径对象 API
+
+路径入口用于直接操作 Application、Bucket 和对象：
+
+```text
+GET    /{app_id}
+GET    /{app_id}/{bucket}
+PUT    /{app_id}/{bucket}/{object_key}
+GET    /{app_id}/{bucket}/{object_key}
+HEAD   /{app_id}/{bucket}/{object_key}
+PATCH  /{app_id}/{bucket}/{object_key}
+POST   /{app_id}/{bucket}/{object_key}
+DELETE /{app_id}/{bucket}/{object_key}
+```
+
+对象内容不可覆盖；重复写入同一 Object Key 会返回冲突。可见性、Metadata、生命周期、预签名访问和异步删除仍由 MediaHub 的 Application/Bucket 策略控制。
+
+### WebDAV
+
+WebDAV 挂载在 `/dav`：
+
+```text
+/dav/{app_id}/{bucket}/...
+```
+
+使用 Application Access Key ID 作为 Basic Auth 用户名，创建时返回的一次性 Secret 作为密码。支持 `PROPFIND`、`GET`、`HEAD`、Range、受限 `PUT`、`MKCOL`、`COPY`、`MOVE`、`DELETE` 和锁发现。WebDAV 使用与 JSON API 相同的 PostgreSQL、配额、Bucket 策略、Local/S3 存储、审计和异步删除流程，不会直接暴露本地文件目录。
+
+### S3 兼容存储后端
+
+将 `MEDIAHUB_STORAGE_BACKEND=s3` 后，MediaHub 使用外部 S3 或 S3 兼容服务保存对象二进制，PostgreSQL 仍保存 Metadata、权限、配额、Variant 和任务状态。需要配置：
+
+```dotenv
+MEDIAHUB_STORAGE_BACKEND=s3
+MEDIAHUB_S3_BUCKET=mediahub-production
+MEDIAHUB_S3_REGION=us-east-1
+MEDIAHUB_S3_ENDPOINT=https://s3.example.com
+MEDIAHUB_S3_ACCESS_KEY_ID=...
+MEDIAHUB_S3_SECRET_ACCESS_KEY=...
+MEDIAHUB_S3_PREFIX=mediahub
+MEDIAHUB_S3_VIRTUAL_HOSTED_STYLE=false
+MEDIAHUB_S3_ALLOW_HTTP=false
+```
+
+生产 S3 Endpoint 必须使用 HTTPS。AWS S3 可省略 `MEDIAHUB_S3_ENDPOINT`；只有要求 Bucket 出现在域名中的服务才启用 `MEDIAHUB_S3_VIRTUAL_HOSTED_STYLE=true`。Local 模式则使用 Compose 的 `mediahub-data` Volume。
+
+### 受限 S3 网关
+
+`/s3` 是给受控 SDK 集成使用的路径式网关，不是完整的通用 S3 服务：
+
+```text
+/s3/{bucket}
+/s3/{bucket}/{object_key}
+```
+
+当前支持对象的 `PutObject`、`GetObject`、`HeadObject`、删除和受限列表，单次 PUT 上限为 64 MiB。客户端使用 Application Access Key，要求至少具备 `media:upload` 和 `media:read`，并使用 `force_path_style=true`。是否启用网关可以通过 `GET /api/v1/capabilities` 的 `s3_gateway` 字段发现。它不能替代完整的 AWS S3 管理 API、Multipart Upload 或 Bucket 管理服务。
+
+### 健康检查和运行边界
+
+```text
+GET /health/live
+GET /health/ready
+GET /api/v1/capabilities
+GET /metrics
+```
+
+`/metrics` 不是匿名接口，需要管理员 Session 或 `MEDIAHUB_METRICS_BEARER_TOKEN`。生产环境应在 Nginx、Caddy、Cloudflare Tunnel 等反向代理处终止 TLS，不要将 PostgreSQL 端口暴露到公网。Compose 默认只把 PostgreSQL 绑定到 `127.0.0.1`。
+
+PostgreSQL 元数据、Local 对象、密钥环和部署 Secret 必须作为一个整体备份。详细的 WAL/PITR、对象快照、S3 配置、HMAC 和测试命令见 [`docs/runbook.md`](docs/runbook.md)。
 
 本项目采用 MIT 许可证。安全问题请按 [`SECURITY.md`](SECURITY.md) 私下报告，贡献流程见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
@@ -46,7 +238,7 @@ MediaHub 负责：
 - 对象 Metadata，包括 AI 产物的扩展信息
 - TTL、保留数量、归档和异步删除
 - 配额、审计、Webhook、后台管理
-- 本地存储，以及后续兼容 S3 的存储后端
+- 本地存储，以及兼容 S3 的存储后端
 
 MediaHub 不负责：
 
@@ -649,7 +841,7 @@ GET  /api/v1/auth/me
 安全要求：
 
 - 密码使用 Argon2id，并允许未来提升参数后重新哈希。
-- 注册必须验证邮箱；邮件发送通过可配置 Provider 完成。
+- 注册必须验证邮箱；邮件发送通过 Resend API 完成。
 - 登录、注册、验证码和密码重置均需限流。
 - 登录失败统一返回模糊错误，避免枚举已注册邮箱。
 - 重置 Token 一次性使用且短时有效。

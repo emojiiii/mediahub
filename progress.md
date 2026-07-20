@@ -158,6 +158,12 @@
 - Workspace Clippy with all targets/features, format check, diff check, and Compose configuration validation passed.
 - Built `mediahub:resend`; runtime smoke passed as non-root user with Docker health `healthy` and HTTP 200 live/readiness responses. No real Resend request was sent.
 
+## README usage and deployment guide
+
+- Rewrote the README opening guide with prebuilt-image deployment, source builds, Cloudflare Pages/pnpm Web deployment, configuration categories, and first-admin bootstrap steps.
+- Documented Local and external S3 storage profiles, Resend email settings, JSON control-plane routes, native path API, WebDAV, bounded S3 gateway, health endpoints, and production TLS/backup boundaries.
+- Corrected historical README/runbook wording that described supported S3 or Resend behavior as future/generic provider functionality.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

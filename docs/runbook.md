@@ -1,7 +1,8 @@
 # Local Runbook
 
-This repository's `readme.md` is the product design specification. This file
-documents the currently implemented local Docker-profile foundation.
+The repository README is the operational entry point. This file documents the
+currently implemented local Docker profile, storage integrations, API contracts,
+backup guidance, and verification commands in more detail.
 
 ## Run
 

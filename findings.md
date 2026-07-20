@@ -299,3 +299,14 @@
 - Compose and `.env.example` currently expose the generic provider URL/token contract; these should become Resend-specific API key plus a public Web URL while retaining the verified sender setting.
 - The implementation uses the existing Web routes, a fixed Resend HTTPS endpoint, a 10-second request timeout, and a token-hash idempotency key. It validates the Resend response ID before treating a send as accepted.
 - Runtime configuration now requires `MEDIAHUB_RESEND_API_KEY`, a verified `MEDIAHUB_EMAIL_FROM`, and a clean HTTPS `MEDIAHUB_WEB_URL`; the development-only exposed-token mode can still run without Resend.
+
+## README deployment documentation
+
+- The repository's published image contains the API and background workers only; the React Web console is a separate pnpm/Cloudflare Pages deployment configured with `VITE_API_BASE_URL`.
+- The implemented HTTP surface has four distinct entry points: JSON control-plane routes under `/api/v1/*`, native path-style object routes under `/{app_id}/...`, WebDAV under `/dav/{app_id}/...`, and a bounded S3 gateway under `/s3/{bucket}/{object_key}`.
+- The S3 gateway supports the PutObject, presigned/header-signed GetObject, and HeadObject operations needed by the documented sub2api integration; it is intentionally not a full S3-compatible administration/API implementation.
+- Docker Compose persists PostgreSQL metadata in `mediahub-postgres-data` and Local object bytes in `mediahub-data`; S3 mode stores bytes in the configured external backend while retaining PostgreSQL metadata locally.
+- The compose file also includes a `build` target, but prebuilt deployments should run from the repository root with `docker compose pull mediahub` and `docker compose up -d --no-build`; source builds use `docker compose up -d --build`.
+- The API router confirms the S3 gateway supports GET/HEAD/PUT/POST/DELETE at `/s3/{bucket}/{object_key}` plus bucket listing/POST at `/s3/{bucket}`, while WebDAV is mounted at `/dav`, `/dav/`, and `/dav/{*path}`.
+- The existing runbook contains the authoritative backup, PostgreSQL, S3, WebDAV, HMAC, and verification details; the README should be a concise operational front door linking to it rather than duplicating every contract.
+- README review found two historical phrases that described S3 and email as future/configurable provider features; the implementation now documents S3 as supported and Resend as the concrete email service.

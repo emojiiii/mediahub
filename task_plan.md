@@ -21,6 +21,7 @@ Improve structure across the Rust workspace without changing behavior. Reduce ov
 
 | Error | Attempt | Resolution |
 | --- | --- | --- |
+| README replacement patch omitted `+` prefixes on code-block lines | 1 | No partial write occurred; split the documentation edit into smaller validated hunks |
 | `cargo outdated` is not installed | 1 | Install the current locked `cargo-outdated` CLI, then inventory direct major upgrades |
 | Action tag parser rejected one-segment tags such as `v1` as `System.Version` | 1 | Ignore one-segment aliases; use the highest complete semantic tag returned for each official action repository |
 | pnpm 11 rejected the pnpm 10 project declaration and ignored package.json overrides | 1 | Update `packageManager` to 11.15.0 and move the xlsx override to `pnpm-workspace.yaml` before resolving dependencies |
@@ -210,5 +211,24 @@ Replace the custom email-provider webhook contract with a direct, production-rea
 | Error | Attempt | Resolution |
 | --- | --- | --- |
 | A parallel source scan included nonexistent `crates/mediahub-server/tests` | 1 | Read the existing `src/tests.rs` and `server_config.rs` paths directly; no implementation state was changed |
+
+## Current Task: README Usage and Deployment Guide
+
+### Goal
+
+Rewrite the README's opening guide to document executable startup, production deployment, configuration, storage profiles, and the supported HTTP/WebDAV/S3 protocol boundaries without changing product behavior.
+
+### Phases
+
+**Status:** complete
+
+- [completed] 1. Inventory actual startup commands, environment requirements, storage profiles, and protocol routes
+- [completed] 2. Replace the README opening guide with accurate Chinese documentation
+- [completed] 3. Verify every documented command and route against repository configuration
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
 | The broad `email` test filter also selected an existing SQLx auth-lifecycle test without `DATABASE_URL` | 1 | Use exact `email::tests` and `tests::resend_` filters for unit/provider coverage, then run database-backed tests with the configured PostgreSQL service |
 | Docker Desktop stopped before final PostgreSQL/image validation | 1 | Complete non-Docker checks first, then restore the local Docker engine if available and rerun the isolated database/image checks |
