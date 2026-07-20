@@ -5,15 +5,19 @@
   "packageManager": "pnpm@11.15.0",
   "type": "module",
   "scripts": {
-    "api:generate": "node scripts/generate-openapi-client.mjs",
-    "api:check": "node scripts/verify-openapi.mjs && node scripts/generate-openapi-client.mjs --check",
+    "dev": "vite",
+    "dev:test": "vite --mode test",
+    "build": "pnpm api:check && pnpm typecheck && vite build && pnpm verify:viewer-chunks",
+    "preview": "vite preview",
+    "typecheck": "tsc -b",
+    "cf:dev": "wrangler dev --env=\"\"",
+    "deploy": "pnpm build && wrangler deploy --env=\"\"",
+    "deploy:test": "pnpm build && wrangler deploy --env test",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test",
-    "dev": "vite",
-    "build": "pnpm api:check && tsc -b && vite build && pnpm verify:viewer-chunks",
-    "verify:viewer-chunks": "node scripts/verify-viewer-chunks.mjs",
-    "preview": "vite preview"
+    "api:generate": "node scripts/generate-openapi-client.mjs",
+    "api:check": "node scripts/verify-openapi.mjs && node scripts/generate-openapi-client.mjs --check",
+    "verify:viewer-chunks": "node scripts/verify-viewer-chunks.mjs"
   },
   "dependencies": {
     "@heroui/react": "^3.2.2",
@@ -38,7 +42,6 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.3.3",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -53,6 +56,7 @@
     "typescript": "^5.9.3",
     "vite": "^8.1.5",
     "vite-plugin-static-copy": "^4.1.1",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "wrangler": "^4.112.0"
   }
 }

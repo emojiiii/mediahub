@@ -670,7 +670,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1137,7 +1137,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1162,7 +1162,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                     "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
                 };
                 path?: never;
@@ -1211,7 +1211,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     name: components["parameters"]["BucketName"];
@@ -1241,7 +1241,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     name: components["parameters"]["BucketName"];
@@ -1270,7 +1270,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     name: components["parameters"]["BucketName"];
@@ -1348,7 +1348,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     job_id: components["parameters"]["JobId"];
@@ -1378,7 +1378,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     job_id: components["parameters"]["JobId"];
@@ -1466,7 +1466,7 @@ export interface paths {
                     cursor?: components["parameters"]["Cursor"];
                 };
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1494,7 +1494,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1538,7 +1538,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                     "Idempotency-Key": components["parameters"]["BatchIdempotencyKey"];
                 };
                 path?: never;
@@ -1596,7 +1596,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1644,7 +1644,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     upload_session_id: components["parameters"]["UploadSessionId"];
@@ -1675,7 +1675,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     upload_session_id: components["parameters"]["UploadSessionId"];
@@ -1717,7 +1717,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     upload_session_id: components["parameters"]["UploadSessionId"];
@@ -1825,7 +1825,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1851,7 +1851,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path?: never;
                 cookie?: never;
@@ -1897,7 +1897,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     webhook_id: components["parameters"]["WebhookId"];
@@ -1925,7 +1925,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     webhook_id: components["parameters"]["WebhookId"];
@@ -1971,7 +1971,7 @@ export interface paths {
                     cursor?: components["parameters"]["Cursor"];
                 };
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     webhook_id: components["parameters"]["WebhookId"];
@@ -2017,7 +2017,7 @@ export interface paths {
             parameters: {
                 query?: never;
                 header?: {
-                    "X-Application-Id"?: components["parameters"]["ApplicationContext"];
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
                 };
                 path: {
                     webhook_id: components["parameters"]["WebhookId"];
@@ -2724,27 +2724,32 @@ export interface components {
             application_id: string;
             /** Format: int64 */
             attempt_count: number;
-            cancelled_at?: string | null;
-            completed_at?: string | null;
+            /** Format: date-time */
+            cancelled_at: string | null;
+            /** Format: date-time */
+            completed_at: string | null;
+            /** Format: date-time */
             created_at: string;
-            error_summary?: string | null;
-            failed_at?: string | null;
+            error_summary: string | null;
+            /** Format: date-time */
+            failed_at: string | null;
             /** Format: int64 */
             failed_items: number;
             id: string;
-            idempotency_key: string;
             /** Format: int64 */
             max_attempts: number;
-            next_attempt_at?: string | null;
+            /** Format: date-time */
+            next_attempt_at: string | null;
             operation_scope: string;
-            request_hash: string;
-            request_id?: string | null;
-            started_at?: string | null;
-            state: string;
+            request_id: string | null;
+            /** Format: date-time */
+            started_at: string | null;
+            state: components["schemas"]["AsyncJobState"];
             /** Format: int64 */
             succeeded_items: number;
             /** Format: int64 */
             total_items: number;
+            /** Format: date-time */
             updated_at: string;
         };
         AsyncJobAction: {
@@ -2768,22 +2773,29 @@ export interface components {
             application_id: string;
             /** Format: int32 */
             attempt_count: number;
-            completed_at?: string | null;
-            error_code?: string | null;
-            error_summary?: string | null;
+            /** Format: date-time */
+            completed_at: string | null;
+            error_code: string | null;
+            error_summary: string | null;
             job_id: string;
             media_id: string;
             /** Format: int32 */
             ordinal: number;
-            result?: unknown;
-            started_at?: string | null;
-            state: string;
+            result: unknown;
+            /** Format: date-time */
+            started_at: string | null;
+            state: components["schemas"]["AsyncJobItemState"];
+            /** Format: date-time */
             updated_at: string;
         };
+        /** @enum {string} */
+        AsyncJobItemState: "pending" | "succeeded" | "failed" | "cancelled";
         AsyncJobReceipt: {
             already_existed: boolean;
             job: components["schemas"]["AsyncJob"];
         };
+        /** @enum {string} */
+        AsyncJobState: "pending" | "running" | "completed" | "failed" | "cancelled";
         AuditEvent: {
             action: string;
             actor_id: string;
@@ -2858,10 +2870,10 @@ export interface components {
             name: string;
         };
         CreateBucket: {
-            allowed_mime_types?: string[] | null;
+            allowed_mime_types?: string[];
             /** Format: int64 */
             default_ttl_seconds?: number | null;
-            lifecycle_rules?: components["schemas"]["LifecycleRule"][] | null;
+            lifecycle_rules?: components["schemas"]["LifecycleRule"][];
             /** Format: int64 */
             max_object_size?: number | null;
             name: string;
@@ -2897,7 +2909,8 @@ export interface components {
             url: string;
         };
         CreateWebhook: {
-            enabled?: boolean | null;
+            /** @default true */
+            enabled: boolean;
             events: string[];
             url: string;
         };
@@ -3040,7 +3053,8 @@ export interface components {
         UpdateWebhook: {
             enabled?: boolean | null;
             events?: string[] | null;
-            rotate_secret?: boolean | null;
+            /** @default false */
+            rotate_secret: boolean;
             url?: string | null;
         };
         UpdateWebhookResponse: {
@@ -3244,8 +3258,8 @@ export interface components {
         UserId: string;
         VariantBackground: string;
         VariantBlur: number;
-        VariantCrop: string;
-        VariantFit: string;
+        VariantCrop: "center" | "top" | "bottom" | "left" | "right";
+        VariantFit: "cover" | "contain" | "inside";
         VariantFormat: "jpeg" | "png" | "webp";
         VariantHeight: number;
         VariantQuality: number;

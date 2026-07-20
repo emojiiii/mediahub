@@ -7,7 +7,7 @@
 
 ## 快速开始
 
-MediaHub 的发布镜像只包含 API 和后台 Worker。Web 控制台位于 `web/`，由 Cloudflare Pages 或其他静态托管平台单独部署。服务器需要 Docker Engine 和 Docker Compose v2。
+MediaHub 的发布镜像只包含 API 和后台 Worker。Web 控制台位于 `web/`，通过 Wrangler 部署到 Cloudflare Workers Static Assets，也可以部署到其他静态托管平台。服务器需要 Docker Engine 和 Docker Compose v2。
 
 ### 使用已发布镜像部署服务器
 
@@ -67,17 +67,21 @@ docker compose up -d --build
 
 ### 部署 Web 控制台
 
-Web 控制台不在 API 镜像中。Cloudflare Pages 的项目目录设置为 `web`，构建命令为：
+Web 控制台不在 API 镜像中。仓库已提供 `web/wrangler.jsonc`，它会发布 `dist` 静态资源，并为 React Router 深层路由启用 SPA 回退。首次部署前先通过 Wrangler 登录 Cloudflare，然后执行：
 
 ```bash
-pnpm install --frozen-lockfile && pnpm build
+cd web
+pnpm install --frozen-lockfile
+VITE_API_BASE_URL=https://api.example.com pnpm deploy
 ```
 
-输出目录为 `dist`（仓库路径为 `web/dist`），构建环境使用 pnpm 11（版本由 `web/package.json` 的 `packageManager` 字段声明）。设置 API 地址：
+`pnpm deploy` 会先执行完整生产构建，再调用 `wrangler deploy`。生产配置默认关闭 `workers.dev` 和预览 URL，应在 Cloudflare 中为 `mediahub-web` Worker 绑定正式自定义域名。需要临时的 `workers.dev` 测试地址时执行：
 
-```dotenv
-VITE_API_BASE_URL=https://api.example.com
+```bash
+VITE_API_BASE_URL=https://api.example.com pnpm deploy:test
 ```
+
+输出目录为 `dist`（仓库路径为 `web/dist`），构建环境使用 pnpm 11（版本由 `web/package.json` 的 `packageManager` 字段声明）。`VITE_API_BASE_URL` 是构建期变量，更改 API 地址后必须重新构建和部署。
 
 API 服务器对应设置：
 
@@ -87,6 +91,14 @@ MEDIAHUB_CORS_ALLOWED_ORIGINS=https://console.example.com
 ```
 
 `MEDIAHUB_WEB_URL` 用于生成验证邮箱和重置密码链接；`VITE_API_BASE_URL` 才是浏览器访问 API 的地址。两者通常分别对应 Cloudflare 前端域名和 API 域名。
+
+如需在本地检查 Cloudflare 静态资源行为（包括 SPA 回退），先构建再启动 Wrangler：
+
+```bash
+cd web
+VITE_API_BASE_URL=http://localhost:3000 pnpm build
+pnpm cf:dev
+```
 
 本地启动 Web：
 

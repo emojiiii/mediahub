@@ -392,3 +392,24 @@
 - Promotion cleanup remains inside the durable recovery protocol: final creation followed by temporary-delete failure returns an ambiguous result, retains the uploading row, and is retried before activation.
 - Webhook DNS and the complete delivery attempt are bounded below the lease lifetime; AsyncJob OpenAPI time formats, required nullable properties, and sensitive-field exclusions match the explicit server response DTOs.
 - Image intermediate allocation limits use actual bytes per pixel/sample in both Rust and libvips paths; the RGBA16 extreme-cover regression is covered.
+# Web Wrangler Deployment Refactor Findings
+
+- The Web application is a client-rendered Vite SPA that currently builds to `web/dist`; the reference project is SSR and therefore its Worker entry point cannot be copied directly.
+- `web/vite.config.ts` currently mixes production build, Vitest, static PDF.js assets, Web Worker format, and a Vite 8/Rolldown DOCX chunk compatibility rule.
+- The existing build contract explicitly verifies the DOCX lazy chunk and copied PDF.js CMaps/fonts, so the refactor must preserve both behaviors.
+- `web/package.json` still exposes Playwright E2E configuration/dependency and has no Wrangler scripts or dependency.
+- The worktree was clean before this task began.
+- The app uses `BrowserRouter`, so Cloudflare static assets require `not_found_handling: "single-page-application"` for deep-link refreshes.
+- The README still documents Cloudflare Pages dashboard deployment; it should be updated to the new repository-owned Wrangler commands.
+- The reference project needs a Worker entry because it is React Router SSR. MediaHub's Web app is client-only, so an assets-only Wrangler configuration is the appropriate equivalent.
+- The committed generated OpenAPI client is stale against `openapi/openapi.json`; the baseline `pnpm build` fails in `api:check` before reaching TypeScript or Vite.
+- The current latest Wrangler release from the official npm registry is `4.112.0`.
+- Wrangler 4.112.0 accepts the assets-only production and test configurations; both dry-runs read all 296 generated files with no bindings or configuration errors.
+- The separated Vitest configuration discovers the same 26 files and all 128 tests pass.
+- The refactored Vite build preserves the dedicated DOCX chunk, all viewer Web Workers/WASM assets, 169 PDF.js CMaps, and 16 PDF.js standard fonts.
+- pnpm 11 requires explicit install-script approval for Wrangler's `esbuild`/`workerd` dependencies and the existing `sharp` dependency; the narrow allowlist mirrors the reference project.
+- Regenerating the stale OpenAPI client changes 100 lines, primarily aligning the application-context header with `X-MediaHub-App-Id` and tightening AsyncJob schemas; this is required for `pnpm build`/deployment to be executable.
+- A live Wrangler server accepts the pinned `2026-07-20` compatibility date and serves the SPA entry for `/app/example/dashboard` with HTTP 200.
+- The complete `pnpm build` now passes OpenAPI verification/generation checks, TypeScript, Vite, and the viewer chunk/asset verifier.
+- Ordinary Webhook edits now explicitly send `rotate_secret: false`; a facade regression test proves the request body and application header.
+- Final coverage is 27 Vitest files and 129 passing tests; frozen installation, both Wrangler dry-runs, live deep-route serving, and `git diff --check` all pass.

@@ -1,7 +1,4 @@
 node_modules/
 dist/
+.wrangler/
 *.tsbuildinfo
-vite.config.js
-vite.config.d.ts
-e2e/
-test-results/

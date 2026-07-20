@@ -305,3 +305,34 @@ Implement and verify the confirmed release findings from the crates quality revi
 | --- | --- | --- |
 | Final read-only review found additional upload-reconciliation, 16-bit image, webhook timeout, and OpenAPI timestamp gaps | 1 | Added durable ordinary-upload fencing/heartbeats, byte-accurate image limits, bounded webhook attempts, and explicit public schema contracts; reran the full matrix |
 | A combined final-record patch used an error-row anchor from an earlier plan section | 1 | The patch was atomic and changed nothing; split the final updates by file and current-task heading |
+# Current Task: Web Wrangler Deployment Refactor
+
+## Goal
+
+Remove obsolete local Nginx and Playwright configuration, add a production-ready Cloudflare Wrangler deployment for the Vite SPA, and separate/refactor the overloaded Vite configuration without regressing viewer assets or chunking contracts.
+
+## Phases
+
+**Status:** complete
+
+- [completed] 1. Audit current Web build, routing, asset, and deployment contracts
+- [completed] 2. Refactor Vite/Vitest configuration and add Wrangler deployment configuration/scripts
+- [completed] 3. Remove obsolete Nginx/Playwright files and dependencies
+- [completed] 4. Regenerate lockfile and run focused/full Web verification
+- [completed] 5. Review deployment behavior and document the resulting commands
+
+## Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| A parallel read-only inspection aborted when one `rg` query legitimately returned no matches | 1 | Re-run independent checks with `Promise.allSettled`/match-tolerant PowerShell and keep the worktree unchanged |
+| Baseline `pnpm build` stops before TypeScript/Vite because the committed generated OpenAPI client is stale | 1 | Treat it as a pre-existing unrelated blocker; validate TypeScript, Vite, viewer assets, and Wrangler independently without silently regenerating API code |
+| `pnpm install` resolved dependencies but rejected build scripts for `esbuild`, `sharp`, and `workerd` | 1 | Inspect the repository/reference pnpm policy and add a narrow non-interactive build allowlist for required packages |
+| Hoisting static-copy targets widened `stripBase: true` to `boolean`, failing Vite config type-checking | 1 | Preserve the required literal type with `as const` and rerun the node-config type check |
+| Combined background Wrangler startup and health polling exceeded the shell command's 30-second limit | 1 | Inspect the detached process/port/logs separately, then retry with direct Wrangler invocation and bounded polling |
+| Wrangler local runtime rejected `2026-07-21` because its UTC clock was still on `2026-07-20` | 1 | Pin the compatibility date to the latest already-supported UTC date and repeat live SPA routing checks |
+| Full build after API regeneration found `updateWebhook` omitted newly required `rotate_secret` | 1 | Map the existing ordinary-edit action to `rotate_secret: false`, add a request-body regression assertion, and rerun build/tests |
+| Parallel Webhook source lookup aborted when one test search had no matches | 1 | Repeat with `Promise.allSettled` and inspect the API facade/test boundaries independently |
+| Generated Webhook response-schema lookup used obsolete schema names and returned no match | 1 | Test the stable facade behavior through its actual fetch request/response instead of coupling the regression to generated type names |
+| Initial facade regression test stubbed `fetch` after the module-level client had captured it | 1 | Stub `fetch` before dynamically importing the facade and reset the module cache after the test |
+| Live Wrangler returned 404 after Vite atomically replaced the watched `dist` directory | 1 | Restart the task-owned local Wrangler process after the final build and verify the newly mounted assets |

@@ -242,3 +242,20 @@
 - Final test counts: Image 11, Local 10, PostgreSQL unit 6 plus destructive contract 1, S3 unit 6 plus wrapper contract 1, App 21, Core 35, OpenAPI 10, Server lib 8, Server binary 75. The real S3 contract remains the single expected ignored test because `MEDIAHUB_TEST_S3_*` is not configured.
 - Removed the isolated `mediahub-codex-test` PostgreSQL container, network, and test volume after all destructive/server database tests passed.
 - Live creation of 空白测试应用 navigated to a dashboard with 0 objects, 0 Buckets, and 0 B usage.
+# Web Wrangler Deployment Refactor Progress
+
+- Started audit of the Web build and Cloudflare deployment contract.
+- Confirmed the reference Wrangler configuration uses Worker static assets, while this repository is a Vite SPA producing `dist`.
+- Confirmed the current Vite configuration has separable production and test responsibilities.
+- Confirmed SPA route fallback is a deployment requirement and the existing README deployment instructions need updating.
+- Baseline full build stopped at the pre-existing stale OpenAPI client check; continuing with isolated TypeScript/Vite/viewer-contract checks.
+- Added the Vite/Vitest split, Wrangler assets configuration/scripts, documentation, and obsolete-file removals; dependency installation now needs an explicit pnpm build-script policy.
+- Dependency installation passes; all 26 Vitest files/128 tests and both Wrangler dry-runs pass. Fixing one hoisted config literal type and the explicit top-level environment selector warning.
+- TypeScript now passes, Vite production output rebuilds successfully, the viewer chunk/asset verifier passes, and both final Wrangler dry-runs pass without environment-selection warnings.
+- Final repository checks pass; investigating a timed-out local Wrangler live-server smoke-test command before handoff.
+- Wrangler logs identified a UTC compatibility-date boundary issue; pinned the date to 2026-07-20 before retrying the live server.
+- Live Wrangler serves the deep SPA route successfully on port 8787. Regenerated the previously stale TypeScript API client so the complete deployment build can now be tested.
+- The regenerated contract exposed one required Webhook update field; implementing an explicit non-rotating update before the final full build.
+- Full production build, 27 test files/129 tests, frozen install, diff checks, and both final Wrangler dry-runs pass. Restarting the local dev server after Vite replaced its watched output directory.
+- Restarted Wrangler after the final build; the latest SPA is available at http://127.0.0.1:8787 and deep routes resolve correctly.
+- Completed the Web Wrangler deployment and Vite/Vitest configuration refactor.

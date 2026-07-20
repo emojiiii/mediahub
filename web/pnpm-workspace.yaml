@@ -15,3 +15,13 @@ minimumReleaseAgeExclude:
 
 trustPolicyExclude:
   - "xlsx@0.20.3"
+
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true
+
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - workerd
