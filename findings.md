@@ -234,7 +234,6 @@
 - `readme.md` still labels the project as being in a design phase and functions primarily as a long product specification rather than a public project entry point.
 - The README deployment configuration table contains stale generic names such as `STORAGE_BACKEND`, `SESSION_SECRET`, and `MASTER_KEY_V1`; the implementation and Compose file use `MEDIAHUB_*` names documented in `docs/runbook.md`.
 - The executable deployment instructions are in the English-only runbook and currently teach source builds (`docker compose up --build`), not pulling a published image.
-- The README intentionally documents the web console as a separate Cloudflare Pages/Vite deployment; an API-only container is therefore consistent with the stated architecture, but this must be explicit in the quick start.
 - Individual Cargo packages inherit the MIT declaration but generally omit `repository`, `homepage`, `documentation`, `readme`, and sometimes `description` metadata. The web package is private, which is appropriate for an application bundle.
 - A tracked-file secret-pattern scan found only Compose/CI development passwords and explicit test fixtures. The single-commit Git history contains no historically tracked `.env`, private-key, credential, or secret-named file.
 - Docker Desktop and Buildx are healthy and advertise both `linux/amd64` and `linux/arm64`, so local image and multi-platform build validation are possible.
@@ -372,7 +371,6 @@
 
 ## README deployment documentation
 
-- The repository's published image contains the API and background workers only; the React Web console is a separate pnpm/Cloudflare Pages deployment configured with `VITE_API_BASE_URL`.
 - The implemented HTTP surface has four distinct entry points: JSON control-plane routes under `/api/v1/*`, native path-style object routes under `/{app_id}/...`, WebDAV under `/dav/{app_id}/...`, and a bounded S3 gateway under `/s3/{bucket}/{object_key}`.
 - The S3 gateway supports the PutObject, presigned/header-signed GetObject, and HeadObject operations needed by the documented sub2api integration; it is intentionally not a full S3-compatible administration/API implementation.
 - Docker Compose persists PostgreSQL metadata in `mediahub-postgres-data` and Local object bytes in `mediahub-data`; S3 mode stores bytes in the configured external backend while retaining PostgreSQL metadata locally.
@@ -391,6 +389,22 @@
 - Cleaning only the eight workspace packages after the real-source copy preserved dependency artifacts but forced the actual `mediahub-core`, app, adapters, and server packages to compile; the build log showed the placeholder artifacts removed before a 20-second real workspace rebuild.
 - The fixed image rejects missing configuration with a visible error and exit code 1, then starts with full configuration, logs database/listener initialization, remains at restart count 0, and returns healthy live/readiness responses.
 
+## Unified Web container
+
+- The current Docker context explicitly excludes both `web` and `openapi`, so a Web build stage cannot work until those exclusions are removed.
+- The Vite client currently defaults its API base URL to `http://localhost:3000`; a Web UI served by MediaHub must default to the browser's current origin while preserving `VITE_API_BASE_URL` overrides.
+- The Rust router owns broad native object routes such as `/{app_id}` and `/{app_id}/{bucket}`, so a global SPA fallback would break the object API. Static assets and each known SPA route must be mounted explicitly.
+- Current production output contains `index.html`, hashed files under `assets/`, and PDF.js resources under `pdfjs/`; these directories are sufficient for the existing Vite application.
+- The GitHub workflow currently ignores `web/**`; once the image contains Web assets, Web changes must trigger the image workflow and invalidate the Web build layer.
+- The existing resolver can preserve local Vite behavior by using port 3000 only in `import.meta.env.DEV`; production builds can safely use `window.location.origin` when no explicit API base is configured.
+- React owns `/`, five authentication routes, `/app/:appId/*`, and `/admin/*`. These can be registered explicitly alongside `assets/` and `pdfjs/` without a global fallback.
+- An optional validated `MEDIAHUB_WEB_ROOT` keeps ordinary Cargo development independent from a prior Web build, while the Docker runtime can require `/app/web` through its image environment.
+- `tower-http` is already shared by the server; enabling its `fs` feature provides the proven `ServeDir`/`ServeFile` services instead of custom path parsing.
+- The user selected the unified image as the only Web deployment path. The obsolete static-hosting configuration, package scripts, dependency, lock entries, and standalone Cloudflare documentation should be removed.
+- The server applies CORS as a route layer to API/native routes and applies request IDs, metrics, tracing, and HMAC authentication globally. Web routes should be mounted after the API CORS layer but before global middleware so same-origin static responses retain observability without changing cross-origin API behavior.
+- README and runbook currently describe standalone hosting as mandatory and recommend SHA/version image tags even though the release workflow publishes only `master` and `latest`. The instructions must use the unified image and same-origin URL.
+- Unified console/API hosting shares an origin with native object routes. Existing object responses mitigate active content with CSP sandboxing and nosniff headers, and force HTML/SVG to download; those security contracts already have tests. A separate media/CDN origin remains a stronger optional isolation boundary.
+
 ## Pre-release crates remediation final verification
 
 - Ordinary-upload reconciliation is now a durable fenced protocol rather than a `created_at` scan: active upload owners heartbeat, workers atomically claim expired leases, actual temporary keys are persisted, and every terminal mutation checks the current token.
@@ -402,24 +416,3 @@
 - Promotion cleanup remains inside the durable recovery protocol: final creation followed by temporary-delete failure returns an ambiguous result, retains the uploading row, and is retried before activation.
 - Webhook DNS and the complete delivery attempt are bounded below the lease lifetime; AsyncJob OpenAPI time formats, required nullable properties, and sensitive-field exclusions match the explicit server response DTOs.
 - Image intermediate allocation limits use actual bytes per pixel/sample in both Rust and libvips paths; the RGBA16 extreme-cover regression is covered.
-# Web Wrangler Deployment Refactor Findings
-
-- The Web application is a client-rendered Vite SPA that currently builds to `web/dist`; the reference project is SSR and therefore its Worker entry point cannot be copied directly.
-- `web/vite.config.ts` currently mixes production build, Vitest, static PDF.js assets, Web Worker format, and a Vite 8/Rolldown DOCX chunk compatibility rule.
-- The existing build contract explicitly verifies the DOCX lazy chunk and copied PDF.js CMaps/fonts, so the refactor must preserve both behaviors.
-- `web/package.json` still exposes Playwright E2E configuration/dependency and has no Wrangler scripts or dependency.
-- The worktree was clean before this task began.
-- The app uses `BrowserRouter`, so Cloudflare static assets require `not_found_handling: "single-page-application"` for deep-link refreshes.
-- The README still documents Cloudflare Pages dashboard deployment; it should be updated to the new repository-owned Wrangler commands.
-- The reference project needs a Worker entry because it is React Router SSR. MediaHub's Web app is client-only, so an assets-only Wrangler configuration is the appropriate equivalent.
-- The committed generated OpenAPI client is stale against `openapi/openapi.json`; the baseline `pnpm build` fails in `api:check` before reaching TypeScript or Vite.
-- The current latest Wrangler release from the official npm registry is `4.112.0`.
-- Wrangler 4.112.0 accepts the assets-only production and test configurations; both dry-runs read all 296 generated files with no bindings or configuration errors.
-- The separated Vitest configuration discovers the same 26 files and all 128 tests pass.
-- The refactored Vite build preserves the dedicated DOCX chunk, all viewer Web Workers/WASM assets, 169 PDF.js CMaps, and 16 PDF.js standard fonts.
-- pnpm 11 requires explicit install-script approval for Wrangler's `esbuild`/`workerd` dependencies and the existing `sharp` dependency; the narrow allowlist mirrors the reference project.
-- Regenerating the stale OpenAPI client changes 100 lines, primarily aligning the application-context header with `X-MediaHub-App-Id` and tightening AsyncJob schemas; this is required for `pnpm build`/deployment to be executable.
-- A live Wrangler server accepts the pinned `2026-07-20` compatibility date and serves the SPA entry for `/app/example/dashboard` with HTTP 200.
-- The complete `pnpm build` now passes OpenAPI verification/generation checks, TypeScript, Vite, and the viewer chunk/asset verifier.
-- Ordinary Webhook edits now explicitly send `rotate_secret: false`; a facade regression test proves the request body and application header.
-- Final coverage is 27 Vitest files and 129 passing tests; frozen installation, both Wrangler dry-runs, live deep-route serving, and `git diff --check` all pass.

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -64,7 +65,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 use url::{Host, Url};
 

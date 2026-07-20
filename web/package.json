@@ -10,9 +10,6 @@
     "build": "pnpm api:check && pnpm typecheck && vite build && pnpm verify:viewer-chunks",
     "preview": "vite preview",
     "typecheck": "tsc -b",
-    "cf:dev": "wrangler dev --env=\"\"",
-    "deploy": "pnpm build && wrangler deploy --env=\"\"",
-    "deploy:test": "pnpm build && wrangler deploy --env test",
     "test": "vitest run",
     "test:watch": "vitest",
     "api:generate": "node scripts/generate-openapi-client.mjs",
@@ -56,7 +53,6 @@
     "typescript": "^5.9.3",
     "vite": "^8.1.5",
     "vite-plugin-static-copy": "^4.1.1",
-    "vitest": "^4.1.10",
-    "wrangler": "^4.112.0"
+    "vitest": "^4.1.10"
   }
 }

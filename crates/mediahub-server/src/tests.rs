@@ -64,6 +64,77 @@ async fn auth_test_state(pool: sqlx::PgPool, registration_enabled: bool) -> Arc<
     })
 }
 
+#[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
+async fn web_routes_serve_the_spa_without_shadowing_native_routes(pool: sqlx::PgPool) {
+    let state = auth_test_state(pool, true).await;
+    let web_root = std::env::temp_dir().join(format!(
+        "mediahub-web-route-test-{}",
+        uuid::Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(web_root.join("assets")).expect("create Web assets");
+    std::fs::write(web_root.join("index.html"), "<main>mediahub-spa</main>")
+        .expect("write Web index");
+    std::fs::write(web_root.join("assets/app.js"), "window.mediahub = true")
+        .expect("write Web asset");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn({
+        let application = router((*state).clone(), Some(web_root.clone()));
+        async move {
+            axum::serve(listener, application)
+                .await
+                .expect("Web route test server");
+        }
+    });
+    let client = reqwest::Client::new();
+
+    for route in ["/", "/login", "/app/example/dashboard", "/admin/users"] {
+        let response = client
+            .get(format!("http://{address}{route}"))
+            .send()
+            .await
+            .expect("SPA request");
+        assert_eq!(response.status(), StatusCode::OK, "route {route}");
+        assert!(
+            response
+                .text()
+                .await
+                .expect("SPA response body")
+                .contains("mediahub-spa"),
+            "route {route} did not serve the SPA"
+        );
+    }
+
+    let asset = client
+        .get(format!("http://{address}/assets/app.js"))
+        .send()
+        .await
+        .expect("asset request");
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset.text().await.expect("asset body"),
+        "window.mediahub = true"
+    );
+
+    let native = client
+        .get(format!("http://{address}/native-application"))
+        .send()
+        .await
+        .expect("native route request");
+    assert_eq!(native.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !native
+            .text()
+            .await
+            .expect("native response body")
+            .contains("mediahub-spa")
+    );
+
+    server.abort();
+    std::fs::remove_dir_all(web_root).expect("remove Web root");
+}
+
 async fn authenticated_test_user(
     state: &AppState,
     email: &str,
@@ -380,7 +451,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
-        let application = router((*state).clone());
+        let application = router((*state).clone(), None);
         async move {
             axum::serve(listener, application)
                 .await
@@ -1542,7 +1613,7 @@ async fn canonical_object_paths_enforce_visibility_and_preserve_http_reads(pool:
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
-        let application = router((*state).clone());
+        let application = router((*state).clone(), None);
         async move {
             axum::serve(listener, application)
                 .await
@@ -1761,7 +1832,7 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
-        let application = router((*state).clone());
+        let application = router((*state).clone(), None);
         async move {
             axum::serve(listener, application)
                 .await
@@ -2257,7 +2328,7 @@ async fn local_upload_content_streams_beyond_the_general_request_limit(pool: sql
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
-        let application = router((*state).clone());
+        let application = router((*state).clone(), None);
         async move {
             axum::serve(listener, application)
                 .await

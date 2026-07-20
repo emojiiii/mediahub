@@ -29,7 +29,7 @@ The default URL is `http://127.0.0.1:3000`. Metadata is stored in PostgreSQL 17;
 object files are stored under `data/storage`.
 
 For a container deployment, copy `.env.example` to `.env`, fill every required
-secret/provider value, and pull the published API/worker image:
+secret/provider value, and pull the published Web/API/worker image:
 
 ```powershell
 Copy-Item .env.example .env
@@ -38,14 +38,14 @@ docker compose up -d --no-build
 docker compose ps
 ```
 
-The default image is `ghcr.io/emojiiii/mediahub:latest`. Set `MEDIAHUB_IMAGE`
-to a version tag or digest for reproducible deployments. The image contains the
-API and workers only; deploy the `web/` console separately and set
-`VITE_API_BASE_URL` to the public API origin.
+The default image is `ghcr.io/emojiiii/mediahub:latest`. The release workflow
+publishes only `latest` and `master`; pin `MEDIAHUB_IMAGE` to an image digest
+when deployment reproducibility is required. The image contains the Web console,
+API, and workers. Open the public MediaHub origin to use the console.
 
 The web console has no embedded demo or Mock API. It always calls the real API,
-using `VITE_API_BASE_URL` when set and `http://localhost:3000` otherwise. Start
-the local console in a second terminal with:
+using the browser's current origin in production. Vite development mode calls
+port 3000 on the current host. Start the local console in a second terminal with:
 
 ```powershell
 Set-Location web
@@ -56,8 +56,8 @@ pnpm dev
 ```powershell
 $env:MEDIAHUB_RESEND_API_KEY = 're_<server-side-api-key>'
 $env:MEDIAHUB_EMAIL_FROM = 'MediaHub <noreply@example.com>'
-$env:MEDIAHUB_WEB_URL = 'https://console.example.com'
-$env:MEDIAHUB_CORS_ALLOWED_ORIGINS = 'https://console.example.com'
+$env:MEDIAHUB_WEB_URL = 'https://mediahub.example.com'
+$env:MEDIAHUB_CORS_ALLOWED_ORIGINS = ''
 docker compose up --build
 ```
 
@@ -66,7 +66,8 @@ Storage objects in `mediahub-data`. Terminate TLS before exposing the service,
 because browser session cookies are `Secure`.
 The Compose profile sends transactional email directly through Resend. Verify
 the sender domain in Resend and replace the example API key, sender, and public
-Web origin before registration or password reset can deliver a link.
+Web origin before registration or password reset can deliver a link. The bundled
+same-origin console does not require a CORS allowlist.
 
 ## Implemented API
 
@@ -472,13 +473,13 @@ Management mutations create append-only audit events for the current
 Application. Audit summaries contain only non-sensitive resource facts and
 never contain SecretAccessKeys, sessions, signatures, prompts, or file bytes.
 
-For a separate frontend origin, set `MEDIAHUB_CORS_ALLOWED_ORIGINS` to a
-comma-separated exact allowlist, for example `http://localhost:5173`. The API
-allows credentialed CORS only for this list, including `X-CSRF-Token`. For
-cross-site frontend cookies also set `MEDIAHUB_COOKIE_SAME_SITE=none` while
-keeping secure cookies enabled. Local HTTP development instead uses
-`MEDIAHUB_ALLOW_INSECURE_COOKIES=true` and the default `SameSite=Lax`.
-The Compose service passes all three settings through to the API container.
+Keep `MEDIAHUB_CORS_ALLOWED_ORIGINS` empty for the bundled console. If an
+additional browser API client runs on another origin, set an exact
+comma-separated allowlist; credentialed CORS, including `X-CSRF-Token`, is
+allowed only for this list. A cross-site browser client also requires
+`MEDIAHUB_COOKIE_SAME_SITE=none` with secure cookies enabled. Local HTTP
+development uses `MEDIAHUB_ALLOW_INSECURE_COOKIES=true` and the default
+`SameSite=Lax`. Compose passes these settings through to the application.
 
 ## PostgreSQL Backup And Restore
 

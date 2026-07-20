@@ -79,22 +79,25 @@ pub(super) async fn run() -> anyhow::Result<()> {
         object_store.clone(),
         Arc::clone(&access_key_cipher),
     );
-    let app = router(AppState {
-        repository: repository.clone(),
-        object_store: object_store.clone(),
-        webdav,
-        access_key_cipher: Arc::clone(&access_key_cipher),
-        media_url_signer: Arc::new(MediaUrlSigner::new(config.media_url_signing_key)),
-        cookie_config: config.cookie_config,
-        cors_allowed_origins: config.cors_allowed_origins,
-        registration_enabled: config.registration_enabled,
-        expose_auth_tokens: config.expose_auth_tokens,
-        email_provider,
-        auth_rate_limiter: AuthRateLimiter::default(),
-        variant_slots: Arc::new(tokio::sync::Semaphore::new(4)),
-        http_metrics: HttpMetrics::default(),
-        metrics_bearer_token: config.metrics_bearer_token.map(Arc::from),
-    });
+    let app = router(
+        AppState {
+            repository: repository.clone(),
+            object_store: object_store.clone(),
+            webdav,
+            access_key_cipher: Arc::clone(&access_key_cipher),
+            media_url_signer: Arc::new(MediaUrlSigner::new(config.media_url_signing_key)),
+            cookie_config: config.cookie_config,
+            cors_allowed_origins: config.cors_allowed_origins,
+            registration_enabled: config.registration_enabled,
+            expose_auth_tokens: config.expose_auth_tokens,
+            email_provider,
+            auth_rate_limiter: AuthRateLimiter::default(),
+            variant_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            http_metrics: HttpMetrics::default(),
+            metrics_bearer_token: config.metrics_bearer_token.map(Arc::from),
+        },
+        config.web_root,
+    );
     let mut lifecycle_worker = tokio::spawn(super::workers::run_lifecycle_worker(
         repository.clone(),
         object_store,

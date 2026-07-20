@@ -1,4 +1,4 @@
-name: Backend
+name: Application
 
 on:
   push:
@@ -11,6 +11,8 @@ on:
       - Cargo.toml
       - Dockerfile
       - "crates/**"
+      - openapi/openapi.json
+      - "web/**"
   pull_request:
     paths:
       - .github/workflows/ci.yml
@@ -19,13 +21,15 @@ on:
       - Cargo.toml
       - Dockerfile
       - "crates/**"
+      - openapi/openapi.json
+      - "web/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: backend-${{ github.ref }}
+  group: application-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

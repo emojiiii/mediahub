@@ -190,7 +190,6 @@
 
 ## README usage and deployment guide
 
-- Rewrote the README opening guide with prebuilt-image deployment, source builds, Cloudflare Pages/pnpm Web deployment, configuration categories, and first-admin bootstrap steps.
 - Documented Local and external S3 storage profiles, Resend email settings, JSON control-plane routes, native path API, WebDAV, bounded S3 gateway, health endpoints, and production TLS/backup boundaries.
 - Corrected historical README/runbook wording that described supported S3 or Resend behavior as future/generic provider functionality.
 
@@ -205,6 +204,26 @@
 - Negative runtime check printed the required-key configuration error and exited 1 instead of silently exiting 0.
 - Full temporary PostgreSQL smoke passed with real startup logs, restart count 0, non-root runtime, and healthy live/readiness endpoints; task-owned containers/network were removed.
 - Final actionlint, Cargo check, diff check, image metadata inspection, and tag scan passed; only `master` and `latest` remain publishable from the default branch.
+
+## Unified Web and API image
+
+- Started from the committed container-entrypoint fix with a clean worktree.
+- Confirmed the Docker context excludes Web/OpenAPI, the Vite default points at localhost, and native object wildcards rule out a global SPA fallback.
+- Added production same-origin API resolution while preserving Vite development port 3000 and explicit API overrides; all six focused resolver tests pass.
+- Added optional validated Web-root configuration plus explicit SPA/static routes that compile without changing API-only local startup.
+- The focused Axum route test passes against temporary PostgreSQL: SPA deep links and assets return Web content, while a native Application path retains its backend 404 contract.
+- The complete host pnpm production build passes. The first Docker Web-stage attempt stopped before project execution because this host could not reach Docker Hub's authentication endpoint over IPv6.
+- User removed the standalone static-hosting option; the unified image is now the only supported Web deployment path.
+- Removed the obsolete static-hosting config, package scripts, runtime dependency, pnpm policy entry, and 532 lines of lockfile-only dependency data; frozen pnpm installation passes.
+- The Docker Web stage passes end to end with official Node 22 content obtained through the public ECR mirror: frozen pnpm install, OpenAPI check, TypeScript, Vite build, and viewer asset verification all complete successfully.
+- Workflow triggers now include Web/OpenAPI inputs without adding a separate Web job; Actionlint passes.
+- Compose and environment examples use the bundled `/app/web` root and same-origin defaults; Compose configuration validation passes.
+- README and runbook now document the unified Web/API/worker image, digest pinning, same-origin email links/CORS behavior, and pnpm source builds.
+- Final Web verification passed: frozen pnpm install, production build, 27 test files, and 131 tests.
+- Final Rust verification passed: format, 8 server library tests, 77 server binary tests, and workspace Clippy across all targets/features with warnings denied.
+- Built `mediahub:unified-web` as a 53.4 MB linux/amd64 image running as `mediahub` with `/app/web` configured.
+- Runtime smoke passed with restart count 0: root, login, deep Application SPA route, live/readiness, capabilities, and hashed JavaScript returned 200; the native Application route retained backend 404 behavior.
+- Removed task-owned containers, network, and the intermediate Web-builder image after validation; retained the complete local image.
 
 ## Application resource isolation
 
@@ -254,20 +273,3 @@
 - Final test counts: Image 11, Local 10, PostgreSQL unit 6 plus destructive contract 1, S3 unit 6 plus wrapper contract 1, App 21, Core 35, OpenAPI 10, Server lib 8, Server binary 75. The real S3 contract remains the single expected ignored test because `MEDIAHUB_TEST_S3_*` is not configured.
 - Removed the isolated `mediahub-codex-test` PostgreSQL container, network, and test volume after all destructive/server database tests passed.
 - Live creation of 空白测试应用 navigated to a dashboard with 0 objects, 0 Buckets, and 0 B usage.
-# Web Wrangler Deployment Refactor Progress
-
-- Started audit of the Web build and Cloudflare deployment contract.
-- Confirmed the reference Wrangler configuration uses Worker static assets, while this repository is a Vite SPA producing `dist`.
-- Confirmed the current Vite configuration has separable production and test responsibilities.
-- Confirmed SPA route fallback is a deployment requirement and the existing README deployment instructions need updating.
-- Baseline full build stopped at the pre-existing stale OpenAPI client check; continuing with isolated TypeScript/Vite/viewer-contract checks.
-- Added the Vite/Vitest split, Wrangler assets configuration/scripts, documentation, and obsolete-file removals; dependency installation now needs an explicit pnpm build-script policy.
-- Dependency installation passes; all 26 Vitest files/128 tests and both Wrangler dry-runs pass. Fixing one hoisted config literal type and the explicit top-level environment selector warning.
-- TypeScript now passes, Vite production output rebuilds successfully, the viewer chunk/asset verifier passes, and both final Wrangler dry-runs pass without environment-selection warnings.
-- Final repository checks pass; investigating a timed-out local Wrangler live-server smoke-test command before handoff.
-- Wrangler logs identified a UTC compatibility-date boundary issue; pinned the date to 2026-07-20 before retrying the live server.
-- Live Wrangler serves the deep SPA route successfully on port 8787. Regenerated the previously stale TypeScript API client so the complete deployment build can now be tested.
-- The regenerated contract exposed one required Webhook update field; implementing an explicit non-rotating update before the final full build.
-- Full production build, 27 test files/129 tests, frozen install, diff checks, and both final Wrangler dry-runs pass. Restarting the local dev server after Vite replaced its watched output directory.
-- Restarted Wrangler after the final build; the latest SPA is available at http://127.0.0.1:8787 and deep routes resolve correctly.
-- Completed the Web Wrangler deployment and Vite/Vitest configuration refactor.

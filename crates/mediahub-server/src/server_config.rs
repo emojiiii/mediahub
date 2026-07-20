@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, path::PathBuf};
 
 use axum::http::HeaderValue;
 use base64::{
@@ -33,6 +33,7 @@ pub(super) struct ServerConfig {
     pub(super) resend: Option<ResendConfig>,
     pub(super) bootstrap_admin_email: Option<String>,
     pub(super) metrics_bearer_token: Option<String>,
+    pub(super) web_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +81,20 @@ fn validate_database_url(database_url: &str) -> Result<(), String> {
             "MEDIAHUB_DATABASE_URL must use PostgreSQL, got unsupported scheme {scheme:?}"
         )),
     }
+}
+
+fn parse_web_root(value: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(value);
+    if !root.join("index.html").is_file() {
+        return Err(format!(
+            "MEDIAHUB_WEB_ROOT must contain a readable index.html: {}",
+            root.display()
+        ));
+    }
+    Ok(Some(root))
 }
 
 fn storage_backend(value: &str) -> Result<StorageBackend, String> {
@@ -247,6 +262,14 @@ impl ServerConfig {
                 }
             })
             .transpose()?;
+        let web_root_value = match env::var("MEDIAHUB_WEB_ROOT") {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("MEDIAHUB_WEB_ROOT must be valid UTF-8".to_owned());
+            }
+        };
+        let web_root = parse_web_root(web_root_value.as_deref())?;
         let resend = match env::var("MEDIAHUB_RESEND_API_KEY").ok() {
             Some(value) if !value.trim().is_empty() => {
                 let from = env::var("MEDIAHUB_EMAIL_FROM")
@@ -291,6 +314,7 @@ impl ServerConfig {
             resend,
             bootstrap_admin_email,
             metrics_bearer_token,
+            web_root,
         })
     }
 }
@@ -300,8 +324,8 @@ mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     use super::{
-        StorageBackend, decode_media_signing_key, parse_boolean_config, parse_web_url,
-        storage_backend, validate_database_url,
+        StorageBackend, decode_media_signing_key, parse_boolean_config, parse_web_root,
+        parse_web_url, storage_backend, validate_database_url,
     };
 
     #[test]
@@ -377,5 +401,22 @@ mod tests {
         ] {
             assert!(parse_web_url(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn web_root_requires_an_index_file_when_configured() {
+        let root = std::env::temp_dir().join(format!(
+            "mediahub-web-root-test-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create Web root");
+        assert!(parse_web_root(Some(root.to_string_lossy().as_ref())).is_err());
+        std::fs::write(root.join("index.html"), "<!doctype html>").expect("write index");
+        assert_eq!(
+            parse_web_root(Some(root.to_string_lossy().as_ref())),
+            Ok(Some(root.clone()))
+        );
+        assert_eq!(parse_web_root(Some("  ")), Ok(None));
+        std::fs::remove_dir_all(root).expect("remove Web root");
     }
 }

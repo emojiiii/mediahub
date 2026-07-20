@@ -2,14 +2,22 @@ import createClient, { type Middleware } from 'openapi-fetch'
 
 import type { paths } from './generated'
 
-type ApiPageLocation = { hostname: string }
+type ApiPageLocation = { hostname: string; origin: string }
 
 function isLoopbackHostname(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1'
 }
 
-export function resolveApiBaseUrl(configuredBaseUrl: string | undefined, pageLocation: ApiPageLocation | undefined = typeof window === 'undefined' ? undefined : window.location): string {
-  const url = new URL(configuredBaseUrl?.trim() || 'http://localhost:3000')
+export function resolveApiBaseUrl(
+  configuredBaseUrl: string | undefined,
+  pageLocation: ApiPageLocation | undefined = typeof window === 'undefined' ? undefined : window.location,
+  developmentMode = import.meta.env.DEV,
+): string {
+  const configured = configuredBaseUrl?.trim()
+  const defaultBaseUrl = developmentMode
+    ? `http://${pageLocation?.hostname ?? 'localhost'}:3000`
+    : pageLocation?.origin ?? 'http://localhost:3000'
+  const url = new URL(configured || defaultBaseUrl)
   if (pageLocation && isLoopbackHostname(url.hostname) && isLoopbackHostname(pageLocation.hostname)) url.hostname = pageLocation.hostname
   return url.toString().replace(/\/+$/, '')
 }

@@ -1,3 +1,12 @@
+FROM node:22-bookworm-slim AS web-builder
+WORKDIR /app/web
+RUN corepack enable
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY openapi /app/openapi
+COPY web ./
+RUN pnpm build
+
 FROM rust:1.97.0-bookworm AS builder
 ARG LIBVIPS_VERSION=8.18.4
 ARG LIBVIPS_SHA256=1e8d2228a4ffae7498e357dcddb3775440afa7b11726841cd511674dced84257
@@ -130,11 +139,13 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /opt/libvips/lib/ /usr/local/lib/
 COPY --from=builder /app/target/release/mediahub-server /usr/local/bin/mediahub-server
+COPY --from=web-builder --chown=mediahub:mediahub /app/web/dist /app/web
 RUN ldconfig
 USER mediahub
 ENV MEDIAHUB_BIND_ADDR=0.0.0.0:3000
 ENV MEDIAHUB_DATABASE_URL=postgres://mediahub:mediahub-local-only@postgres:5432/mediahub
 ENV MEDIAHUB_STORAGE_ROOT=/data/storage
+ENV MEDIAHUB_WEB_ROOT=/app/web
 VOLUME ["/data"]
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

@@ -1,9 +1,9 @@
 // Router construction, request middleware, and HMAC authentication.
 
-fn router(state: AppState) -> Router {
+fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
     let state = Arc::new(state);
     let cors = cors_layer(&state.cors_allowed_origins);
-    Router::new()
+    let mut app = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
         .route("/metrics", get(metrics))
@@ -136,7 +136,24 @@ fn router(state: AppState) -> Router {
         .route_layer(cors)
         .route("/dav", any(webdav::handle_webdav))
         .route("/dav/", any(webdav::handle_webdav))
-        .route("/dav/{*path}", any(webdav::handle_webdav))
+        .route("/dav/{*path}", any(webdav::handle_webdav));
+    if let Some(web_root) = web_root {
+        let index = ServeFile::new(web_root.join("index.html"));
+        app = app
+            .route_service("/", index.clone())
+            .route_service("/login", index.clone())
+            .route_service("/register", index.clone())
+            .route_service("/verify-email", index.clone())
+            .route_service("/forgot-password", index.clone())
+            .route_service("/reset-password", index.clone())
+            .route_service("/app", index.clone())
+            .route_service("/app/{*path}", index.clone())
+            .route_service("/admin", index.clone())
+            .route_service("/admin/{*path}", index)
+            .nest_service("/assets", ServeDir::new(web_root.join("assets")))
+            .nest_service("/pdfjs", ServeDir::new(web_root.join("pdfjs")));
+    }
+    app
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),

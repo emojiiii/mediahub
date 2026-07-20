@@ -10,6 +10,7 @@ services:
       MEDIAHUB_DATABASE_URL: ${MEDIAHUB_DATABASE_URL:-postgres://${MEDIAHUB_POSTGRES_USER:-mediahub}:${MEDIAHUB_POSTGRES_PASSWORD:?set_a_postgres_password}@postgres:5432/${MEDIAHUB_POSTGRES_DB:-mediahub}}
       MEDIAHUB_STORAGE_BACKEND: ${MEDIAHUB_STORAGE_BACKEND:-local}
       MEDIAHUB_STORAGE_ROOT: /data/storage
+      MEDIAHUB_WEB_ROOT: /app/web
       # S3-compatible storage is selected with MEDIAHUB_STORAGE_BACKEND=s3.
       # Bucket is then required; credentials must be supplied as a pair when
       # static credentials are used. HTTPS endpoints are enforced by default.
@@ -30,8 +31,7 @@ services:
       MEDIAHUB_MEDIA_SIGNING_KEY: ${MEDIAHUB_MEDIA_SIGNING_KEY:?set_an_independent_32_byte_base64_media_signing_key}
       # Set to false after bootstrapping accounts to reject public registration.
       MEDIAHUB_REGISTRATION_ENABLED: ${MEDIAHUB_REGISTRATION_ENABLED:-false}
-      # Browser consoles call the API directly. Use an exact comma-separated
-      # allowlist; keep it empty when the console is served from the API origin.
+      # The bundled console is same-origin and needs no CORS allowlist.
       MEDIAHUB_CORS_ALLOWED_ORIGINS: ${MEDIAHUB_CORS_ALLOWED_ORIGINS:-}
       MEDIAHUB_ALLOW_INSECURE_COOKIES: ${MEDIAHUB_ALLOW_INSECURE_COOKIES:-false}
       MEDIAHUB_COOKIE_SAME_SITE: ${MEDIAHUB_COOKIE_SAME_SITE:-lax}
