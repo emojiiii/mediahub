@@ -94,7 +94,18 @@ RUN for crate in \
 RUN cargo build --release --package mediahub-server --features docker-libvips
 
 COPY crates ./crates
-RUN cargo build --release --package mediahub-server --features docker-libvips
+RUN for crate in \
+        mediahub-adapter-image \
+        mediahub-adapter-local \
+        mediahub-adapter-postgres \
+        mediahub-adapter-s3 \
+        mediahub-app \
+        mediahub-core \
+        mediahub-openapi \
+        mediahub-server; do \
+        cargo clean --release --package "${crate}"; \
+    done \
+    && cargo build --release --package mediahub-server --features docker-libvips
 
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.title="MediaHub" \

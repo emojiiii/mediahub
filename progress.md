@@ -194,6 +194,18 @@
 - Documented Local and external S3 storage profiles, Resend email settings, JSON control-plane routes, native path API, WebDAV, bounded S3 gateway, health endpoints, and production TLS/backup boundaries.
 - Corrected historical README/runbook wording that described supported S3 or Resend behavior as future/generic provider functionality.
 
+## Container entrypoint and release tags
+
+- Confirmed the root is intentionally a virtual workspace and `mediahub-server` owns the conventional binary entry point.
+- Matched the production exit-0/no-log restart loop to the Docker dependency placeholder binary being retained after the real-source overlay.
+- Added deterministic cleanup of all workspace Release artifacts after copying real sources, preserving third-party dependency caches while preventing placeholder packaging.
+- Restricted default-branch image metadata to `master` and `latest`; removed version-tag workflow triggers and SHA/semver/PR image tags.
+- Actionlint passed after removing the obsolete tag trigger and metadata entries.
+- Built `mediahub:entrypoint-fix`; the source layer removed placeholder workspace artifacts and recompiled the real server binary.
+- Negative runtime check printed the required-key configuration error and exited 1 instead of silently exiting 0.
+- Full temporary PostgreSQL smoke passed with real startup logs, restart count 0, non-root runtime, and healthy live/readiness endpoints; task-owned containers/network were removed.
+- Final actionlint, Cargo check, diff check, image metadata inspection, and tag scan passed; only `master` and `latest` remain publishable from the default branch.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

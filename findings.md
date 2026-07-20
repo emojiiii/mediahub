@@ -381,6 +381,16 @@
 - The existing runbook contains the authoritative backup, PostgreSQL, S3, WebDAV, HMAC, and verification details; the README should be a concise operational front door linking to it rather than duplicating every contract.
 - README review found two historical phrases that described S3 and email as future/configurable provider features; the implementation now documents S3 as supported and Resend as the concrete email service.
 
+## Container placeholder-binary fix
+
+- The repository root is a virtual Cargo workspace with `crates/mediahub-server` in both `members` and `default-members`; it correctly has no root `src` directory.
+- `cargo build --package mediahub-server` selects the member package, whose conventional `crates/mediahub-server/src/main.rs` is the binary entry point without requiring an explicit root `[[bin]]` declaration.
+- The Docker dependency-cache stage writes and compiles an empty `mediahub-server/src/main.rs`, then overlays real sources whose preserved timestamps can be older than the cached artifact. Cargo may therefore retain the empty successful binary.
+- A packaged empty `fn main() {}` exactly explains the server evidence: immediate exit code 0, no application logs, no listening port, and an endless `unless-stopped` restart loop.
+- The image workflow currently emits branch, PR, semver, SHA, and latest metadata tags; the requested deployment contract is only `master` and `latest` from the default branch.
+- Cleaning only the eight workspace packages after the real-source copy preserved dependency artifacts but forced the actual `mediahub-core`, app, adapters, and server packages to compile; the build log showed the placeholder artifacts removed before a 20-second real workspace rebuild.
+- The fixed image rejects missing configuration with a visible error and exit code 1, then starts with full configuration, logs database/listener initialization, remains at restart count 0, and returns healthy live/readiness responses.
+
 ## Pre-release crates remediation final verification
 
 - Ordinary-upload reconciliation is now a durable fenced protocol rather than a `created_at` scan: active upload owners heartbeat, workers atomically claim expired leases, actual temporary keys are persisted, and every terminal mutation checks the current token.

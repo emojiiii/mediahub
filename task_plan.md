@@ -336,3 +336,28 @@ Remove obsolete local Nginx and Playwright configuration, add a production-ready
 | Generated Webhook response-schema lookup used obsolete schema names and returned no match | 1 | Test the stable facade behavior through its actual fetch request/response instead of coupling the regression to generated type names |
 | Initial facade regression test stubbed `fetch` after the module-level client had captured it | 1 | Stub `fetch` before dynamically importing the facade and reset the module cache after the test |
 | Live Wrangler returned 404 after Vite atomically replaced the watched `dist` directory | 1 | Restart the task-owned local Wrangler process after the final build and verify the newly mounted assets |
+
+# Current Task: Container Entrypoint And Release Tags
+
+## Goal
+
+Ensure the Docker dependency cache cannot package the placeholder server binary, prove the real workspace entry point runs, and publish only the default branch as `master` and `latest`.
+
+## Phases
+
+**Status:** complete
+
+- [completed] 1. Confirm the Cargo workspace/member entry-point contract and diagnose the exit-0 restart loop
+- [completed] 2. Fix Docker source invalidation and narrow image metadata tags
+- [completed] 3. Build the image and prove the real server process/logging/health behavior
+- [completed] 4. Validate workflow syntax and final diffs
+
+## Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| Local `actionlint` executable is not installed | 1 | Run the official actionlint container against the workflow instead of installing host tooling |
+| Removing version-tag values left an empty workflow `tags:` key | 1 | Delete the empty trigger key and rerun actionlint |
+| Dockerfile check timed out fetching Docker Hub auth over IPv6 | 1 | Reuse the locally cached base images with `--pull=false` for the actual image build |
+| BuildKit still resolved Docker Hub metadata despite `--pull=false` and hit the same IPv6 timeout | 2 | Switch to the classic local-image builder instead of repeating the BuildKit metadata path |
+| The previously used isolated PostgreSQL container no longer exists | 1 | Create a task-owned Docker network and temporary PostgreSQL 17 container, then remove both after the health smoke test |
