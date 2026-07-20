@@ -2240,11 +2240,11 @@ async fn capabilities_report_the_readme_contract() {
 }
 
 #[tokio::test]
-async fn email_provider_receives_bearer_authenticated_token_template() {
+async fn resend_receives_authenticated_rendered_email() {
     let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
     let captured_request = Arc::clone(&captured);
     let provider_app = Router::new().route(
-        "/",
+        "/emails",
         post(
             move |headers: HeaderMap, Json(mut payload): Json<serde_json::Value>| {
                 let captured_request = Arc::clone(&captured_request);
@@ -2256,8 +2256,15 @@ async fn email_provider_receives_bearer_authenticated_token_template() {
                             .unwrap_or_default()
                             .to_owned(),
                     );
+                    payload["idempotency_key"] = serde_json::Value::String(
+                        headers
+                            .get("idempotency-key")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
                     *captured_request.lock().expect("capture lock") = Some(payload);
-                    StatusCode::NO_CONTENT
+                    (StatusCode::OK, Json(serde_json::json!({"id": "email_123"})))
                 }
             },
         ),
@@ -2269,15 +2276,18 @@ async fn email_provider_receives_bearer_authenticated_token_template() {
             .await
             .expect("provider server");
     });
-    let provider = HttpEmailProvider::new(EmailProviderConfig {
-        url: Url::parse(&format!("http://{address}/")).expect("provider URL"),
-        bearer_token: "provider-secret".into(),
-        from: "mediahub@example.com".into(),
-    });
+    let provider = ResendEmailProvider::new_with_endpoint(
+        server_config::ResendConfig {
+            api_key: "re_provider_secret".into(),
+            from: "MediaHub <mediahub@example.com>".into(),
+            web_url: Url::parse("https://console.example.com").expect("Web URL"),
+        },
+        Url::parse(&format!("http://{address}/emails")).expect("provider URL"),
+    );
     let sent = provider
         .send_token(
             "owner@example.com",
-            "verify_email",
+            AuthEmailKind::VerifyEmail,
             "raw-token",
             OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(30),
         )
@@ -2288,11 +2298,79 @@ async fn email_provider_receives_bearer_authenticated_token_template() {
         .expect("capture lock")
         .clone()
         .expect("captured request");
-    assert_eq!(payload["to"], "owner@example.com");
-    assert_eq!(payload["template"], "verify_email");
-    assert_eq!(payload["token"], "raw-token");
-    assert_eq!(payload["authorization"], "Bearer provider-secret");
-    assert!(payload["expires_at"].is_string());
+    assert_eq!(payload["from"], "MediaHub <mediahub@example.com>");
+    assert_eq!(payload["to"][0], "owner@example.com");
+    assert_eq!(payload["subject"], "Verify your MediaHub email");
+    assert!(
+        payload["html"]
+            .as_str()
+            .expect("HTML body")
+            .contains("https://console.example.com/verify-email?token=raw-token")
+    );
+    assert!(
+        payload["text"]
+            .as_str()
+            .expect("text body")
+            .contains("raw-token")
+    );
+    assert_eq!(payload["authorization"], "Bearer re_provider_secret");
+    assert!(
+        payload["idempotency_key"]
+            .as_str()
+            .expect("idempotency key")
+            .starts_with("mediahub-verify_email-")
+    );
+    assert!(
+        !payload["idempotency_key"]
+            .as_str()
+            .expect("idempotency key")
+            .contains("raw-token")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn resend_rejection_is_reported_as_unavailable() {
+    let provider_app = Router::new().route(
+        "/emails",
+        post(|| async {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "name": "validation_error",
+                    "statusCode": 422,
+                    "message": "sender is invalid"
+                })),
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, provider_app)
+            .await
+            .expect("provider server");
+    });
+    let provider = ResendEmailProvider::new_with_endpoint(
+        server_config::ResendConfig {
+            api_key: "re_provider_secret".into(),
+            from: "MediaHub <mediahub@example.com>".into(),
+            web_url: Url::parse("https://console.example.com").expect("Web URL"),
+        },
+        Url::parse(&format!("http://{address}/emails")).expect("provider URL"),
+    );
+    let error = provider
+        .send_token(
+            "owner@example.com",
+            AuthEmailKind::ResetPassword,
+            "raw-token",
+            OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
+        )
+        .await
+        .expect_err("Resend rejection must fail");
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.code, "unavailable");
+    assert_eq!(error.message, "email delivery was rejected");
     server.abort();
 }
 

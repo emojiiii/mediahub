@@ -40,11 +40,11 @@ services:
       MEDIAHUB_BOOTSTRAP_ADMIN_EMAIL: ${MEDIAHUB_BOOTSTRAP_ADMIN_EMAIL:-}
       # Optional dedicated Prometheus scrape credential (32-512 printable bytes).
       MEDIAHUB_METRICS_BEARER_TOKEN: ${MEDIAHUB_METRICS_BEARER_TOKEN:-}
-      # Required in production. The provider accepts the documented JSON
-      # token-template request over HTTPS with this bearer credential.
-      MEDIAHUB_EMAIL_PROVIDER_URL: ${MEDIAHUB_EMAIL_PROVIDER_URL:?set_an_https_email_provider_url}
-      MEDIAHUB_EMAIL_PROVIDER_TOKEN: ${MEDIAHUB_EMAIL_PROVIDER_TOKEN:?set_an_email_provider_bearer_token}
+      # Required in production. Resend sends verification and password-reset
+      # messages from a verified domain to links on the public Web console.
+      MEDIAHUB_RESEND_API_KEY: ${MEDIAHUB_RESEND_API_KEY:?set_a_resend_api_key}
       MEDIAHUB_EMAIL_FROM: ${MEDIAHUB_EMAIL_FROM:?set_a_verified_sender_address}
+      MEDIAHUB_WEB_URL: ${MEDIAHUB_WEB_URL:?set_the_public_https_web_origin}
     volumes:
       - mediahub-data:/data
     depends_on:

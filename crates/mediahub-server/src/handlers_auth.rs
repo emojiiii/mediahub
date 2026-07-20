@@ -69,7 +69,7 @@ async fn register(
         provider
             .send_token(
                 &email,
-                "verify_email",
+                AuthEmailKind::VerifyEmail,
                 &verification_token,
                 verification_expires_at,
             )
@@ -149,7 +149,7 @@ async fn resend_verification(
             .map_err(ApiError::from_repository)?;
         if let Some(provider) = &state.email_provider
             && let Err(error) = provider
-                .send_token(&email, "verify_email", &token, expires_at)
+                .send_token(&email, AuthEmailKind::VerifyEmail, &token, expires_at)
                 .await
         {
             warn!(error = %error.message, "verification email delivery failed");
@@ -248,7 +248,12 @@ async fn forgot_password(
             .map_err(ApiError::from_repository)?;
         if let Some(provider) = &state.email_provider
             && let Err(error) = provider
-                .send_token(&email, "reset_password", &reset_token, reset_expires_at)
+                .send_token(
+                    &email,
+                    AuthEmailKind::ResetPassword,
+                    &reset_token,
+                    reset_expires_at,
+                )
                 .await
         {
             warn!(error = %error.message, "password reset email delivery failed");

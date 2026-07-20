@@ -279,3 +279,23 @@
 - Libvips 8.14.1 also predates the generated binding's `keep` saver property. All three output formats need the minimal suffix-option path, not only WebP.
 - The final `.jpg`, `.png`, and `.webp` suffix-option implementation passes all 11 libvips-enabled tests on both Debian libvips 8.14.1 and the deployment image's pinned libvips 8.18.4.
 - The release server builds successfully with the pinned library, and the rebuilt deployment image starts as the non-root `mediahub` user with both live and readiness checks returning HTTP 200.
+
+## Resend email integration
+
+- Resend sends mail through `POST https://api.resend.com/emails` with `Authorization: Bearer <API key>` and JSON fields `from`, `to`, `subject`, plus `html` and/or `text`.
+- A successful send returns a JSON `id`; API failures use non-2xx status codes and an error object containing `name`, `statusCode`, and `message`.
+- Resend accepts an `Idempotency-Key` header up to 256 characters. Keys expire after 24 hours, which can prevent duplicate verification/reset messages during ambiguous retries.
+- The default documented rate limit is 10 requests per second per team; `429` responses expose standard rate-limit headers.
+- Production senders require a verified Resend domain. The API key must remain server-side and should be scoped to sending where possible.
+- MediaHub currently owns its HTTP email client in `mediahub-server`, configured by a provider URL, bearer token, and sender address.
+- Registration, resend-verification, and forgot-password handlers all call one `send_token(email, template, token, expires_at)` method; this is the narrow integration boundary to preserve while changing the outbound Resend payload.
+- Existing server tests assert the old template-webhook body, so they must be migrated to verify Resend headers, endpoint, rendered subjects/bodies, and provider failure behavior.
+- Registration propagates an initial email-delivery failure, while resend-verification and forgot-password deliberately log failures and keep their enumeration-resistant accepted responses. The Resend migration must preserve this behavior.
+- Direct sending means MediaHub must now own the verification/reset subject and both HTML/text bodies; the old external provider previously owned template rendering.
+- The current provider configuration permits an HTTP endpoint only under an explicit development override. A direct Resend integration can use a fixed HTTPS production endpoint while retaining an injectable endpoint only for local tests.
+- The Web console already consumes `/verify-email?token=...` and `/reset-password?token=...`; direct email rendering therefore needs a configured public console origin so messages can contain actionable links.
+- No public console URL exists in the backend configuration today. It should be explicit rather than inferred from CORS, because CORS may contain multiple origins or be empty.
+- The existing server already depends on `reqwest`, `serde`, `serde_json`, `time`, `url`, and SHA-256 utilities, so the Resend integration does not require a new SDK or dependency.
+- Compose and `.env.example` currently expose the generic provider URL/token contract; these should become Resend-specific API key plus a public Web URL while retaining the verified sender setting.
+- The implementation uses the existing Web routes, a fixed Resend HTTPS endpoint, a 10-second request timeout, and a token-hash idempotency key. It validates the Resend response ID before treating a send as accepted.
+- Runtime configuration now requires `MEDIAHUB_RESEND_API_KEY`, a verified `MEDIAHUB_EMAIL_FROM`, and a clean HTTPS `MEDIAHUB_WEB_URL`; the development-only exposed-token mode can still run without Resend.

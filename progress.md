@@ -146,6 +146,18 @@
 - Local format check, diff check, focused adapter tests, `docker-libvips` server check, and workspace Clippy with all targets/features passed.
 - Rebuilt `mediahub:dependency-upgrade`; runtime smoke passed as non-root user with Docker health `healthy` and HTTP 200 live/readiness responses.
 
+## Resend email integration
+
+- Started direct Resend integration work from a clean worktree.
+- Planned API-contract verification, backend implementation, configuration/documentation migration, and focused regression coverage.
+- Replaced the generic token-template webhook client with a dedicated Resend client and typed verification/reset email templates.
+- Added public Web-origin validation, URL-encoded action links, a 10-second request timeout, hashed idempotency keys, and validated Resend success responses.
+- Focused Resend/template/config tests passed: 5 tests, 0 failures.
+- Migrated `.env.example`, Compose, README, and the runbook from the generic provider URL/token contract to Resend API key, verified sender, and public Web origin configuration.
+- Full `mediahub-server` verification passed against isolated PostgreSQL: 8 library tests and 72 binary tests.
+- Workspace Clippy with all targets/features, format check, diff check, and Compose configuration validation passed.
+- Built `mediahub:resend`; runtime smoke passed as non-root user with Docker health `healthy` and HTTP 200 live/readiness responses. No real Resend request was sent.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

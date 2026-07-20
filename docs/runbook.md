@@ -53,9 +53,9 @@ pnpm dev
 ```
 
 ```powershell
-$env:MEDIAHUB_EMAIL_PROVIDER_URL = 'https://mail.example.com/mediahub/tokens'
-$env:MEDIAHUB_EMAIL_PROVIDER_TOKEN = '<provider-bearer-token>'
-$env:MEDIAHUB_EMAIL_FROM = 'mediahub@example.com'
+$env:MEDIAHUB_RESEND_API_KEY = 're_<server-side-api-key>'
+$env:MEDIAHUB_EMAIL_FROM = 'MediaHub <noreply@example.com>'
+$env:MEDIAHUB_WEB_URL = 'https://console.example.com'
 $env:MEDIAHUB_CORS_ALLOWED_ORIGINS = 'https://console.example.com'
 docker compose up --build
 ```
@@ -63,9 +63,9 @@ docker compose up --build
 The Docker profile persists PostgreSQL in `mediahub-postgres-data` and Local
 Storage objects in `mediahub-data`. Terminate TLS before exposing the service,
 because browser session cookies are `Secure`.
-The Compose profile requires a real HTTPS email Provider; the example values
-above are placeholders and must be replaced before registration or password
-reset can deliver a token.
+The Compose profile sends transactional email directly through Resend. Verify
+the sender domain in Resend and replace the example API key, sender, and public
+Web origin before registration or password reset can deliver a link.
 
 ## Implemented API
 
@@ -137,13 +137,13 @@ Send `X-MediaHub-App-Id` with an owned public `app_id` to operate on another
 Application. Access Key HMAC credentials remain fixed to their own Application
 and cannot use this header to switch context.
 
-Production startup requires `MEDIAHUB_EMAIL_PROVIDER_URL` (HTTPS),
-`MEDIAHUB_EMAIL_PROVIDER_TOKEN`, and `MEDIAHUB_EMAIL_FROM`. The server sends a
-Bearer-authenticated JSON request containing `from`, `to`, `template`, `token`,
-and `expires_at`; templates are `verify_email` and `reset_password`. Raw tokens
-remain absent from the database. Plain HTTP is accepted only when
-`MEDIAHUB_ALLOW_INSECURE_EMAIL_PROVIDER=true` is explicitly set for isolated
-local testing. If no provider is configured, startup is allowed only with the
+Production startup requires `MEDIAHUB_RESEND_API_KEY`, `MEDIAHUB_EMAIL_FROM`,
+and `MEDIAHUB_WEB_URL`. The sender must belong to a domain verified in Resend.
+The Web URL must be a clean HTTPS origin such as `https://console.example.com`;
+MediaHub appends `/verify-email?token=...` or `/reset-password?token=...` and
+sends rendered HTML and text through `https://api.resend.com/emails`. Requests
+use a token-derived hashed idempotency key, while raw tokens remain absent from
+the database. If Resend is not configured, startup is allowed only with the
 development-only `MEDIAHUB_EXPOSE_AUTH_TOKENS=true` switch.
 
 Webhook endpoint secrets are returned only by endpoint creation or explicit

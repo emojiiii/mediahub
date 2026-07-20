@@ -30,7 +30,7 @@ pub(super) struct ServerConfig {
     pub(super) cors_allowed_origins: Vec<HeaderValue>,
     pub(super) registration_enabled: bool,
     pub(super) expose_auth_tokens: bool,
-    pub(super) email_provider: Option<EmailProviderConfig>,
+    pub(super) resend: Option<ResendConfig>,
     pub(super) bootstrap_admin_email: Option<String>,
     pub(super) metrics_bearer_token: Option<String>,
 }
@@ -42,10 +42,28 @@ pub(super) enum StorageBackend {
 }
 
 #[derive(Clone)]
-pub(super) struct EmailProviderConfig {
-    pub(super) url: Url,
-    pub(super) bearer_token: String,
+pub(super) struct ResendConfig {
+    pub(super) api_key: String,
     pub(super) from: String,
+    pub(super) web_url: Url,
+}
+
+fn parse_web_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value.trim()).map_err(|_| "MEDIAHUB_WEB_URL is invalid".to_owned())?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "MEDIAHUB_WEB_URL must be an HTTPS origin without credentials, path, query, or fragment"
+                .to_owned(),
+        );
+    }
+    Ok(url)
 }
 
 fn validate_database_url(database_url: &str) -> Result<(), String> {
@@ -229,34 +247,25 @@ impl ServerConfig {
                 }
             })
             .transpose()?;
-        let email_provider = match env::var("MEDIAHUB_EMAIL_PROVIDER_URL").ok() {
+        let resend = match env::var("MEDIAHUB_RESEND_API_KEY").ok() {
             Some(value) if !value.trim().is_empty() => {
-                let url = Url::parse(value.trim())
-                    .map_err(|_| "MEDIAHUB_EMAIL_PROVIDER_URL is invalid".to_owned())?;
-                let allow_insecure_provider = env::var("MEDIAHUB_ALLOW_INSECURE_EMAIL_PROVIDER")
-                    .ok()
-                    .as_deref()
-                    == Some("true");
-                if url.scheme() != "https" && !(allow_insecure_provider && url.scheme() == "http") {
-                    return Err(
-                        "MEDIAHUB_EMAIL_PROVIDER_URL must use HTTPS unless the explicit local-development override is enabled"
-                            .to_owned(),
-                    );
+                let from = env::var("MEDIAHUB_EMAIL_FROM")
+                    .map_err(|_| "MEDIAHUB_EMAIL_FROM is required with Resend".to_owned())?;
+                if from.trim().is_empty() {
+                    return Err("MEDIAHUB_EMAIL_FROM must not be empty".to_owned());
                 }
-                Some(EmailProviderConfig {
-                    url,
-                    bearer_token: env::var("MEDIAHUB_EMAIL_PROVIDER_TOKEN").map_err(|_| {
-                        "MEDIAHUB_EMAIL_PROVIDER_TOKEN is required with the provider URL".to_owned()
-                    })?,
-                    from: env::var("MEDIAHUB_EMAIL_FROM").map_err(|_| {
-                        "MEDIAHUB_EMAIL_FROM is required with the provider URL".to_owned()
-                    })?,
+                let web_url = env::var("MEDIAHUB_WEB_URL")
+                    .map_err(|_| "MEDIAHUB_WEB_URL is required with Resend".to_owned())?;
+                Some(ResendConfig {
+                    api_key: value.trim().to_owned(),
+                    from: from.trim().to_owned(),
+                    web_url: parse_web_url(&web_url)?,
                 })
             }
             _ if expose_auth_tokens => None,
             _ => {
                 return Err(
-                    "MEDIAHUB_EMAIL_PROVIDER_URL is required unless MEDIAHUB_EXPOSE_AUTH_TOKENS=true for isolated development"
+                    "MEDIAHUB_RESEND_API_KEY is required unless MEDIAHUB_EXPOSE_AUTH_TOKENS=true for isolated development"
                         .to_owned(),
                 );
             }
@@ -279,7 +288,7 @@ impl ServerConfig {
             cors_allowed_origins,
             registration_enabled,
             expose_auth_tokens,
-            email_provider,
+            resend,
             bootstrap_admin_email,
             metrics_bearer_token,
         })
@@ -291,8 +300,8 @@ mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     use super::{
-        StorageBackend, decode_media_signing_key, parse_boolean_config, storage_backend,
-        validate_database_url,
+        StorageBackend, decode_media_signing_key, parse_boolean_config, parse_web_url,
+        storage_backend, validate_database_url,
     };
 
     #[test]
@@ -354,5 +363,19 @@ mod tests {
         assert_eq!(decode_media_signing_key(&encoded_key), Ok(vec![9; 32]));
         assert!(decode_media_signing_key("not a base64 key").is_err());
         assert!(decode_media_signing_key(&URL_SAFE_NO_PAD.encode([9; 31])).is_err());
+    }
+
+    #[test]
+    fn web_url_requires_a_clean_https_origin() {
+        assert!(parse_web_url("https://console.example.com").is_ok());
+        for invalid in [
+            "http://console.example.com",
+            "https://user:secret@console.example.com",
+            "https://console.example.com/auth",
+            "https://console.example.com?source=email",
+            "https://console.example.com#auth",
+        ] {
+            assert!(parse_web_url(invalid).is_err(), "accepted {invalid}");
+        }
     }
 }

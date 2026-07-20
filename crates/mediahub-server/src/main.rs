@@ -73,6 +73,7 @@ use mediahub_server::{
     security::{CanonicalRequest, HmacError, MAX_SIGNATURE_AGE, verify_hmac},
 };
 
+mod email;
 mod runtime_storage;
 mod s3_gateway;
 mod s3_http;
@@ -82,8 +83,9 @@ mod s3_xml;
 mod server_config;
 mod webdav;
 
+use email::{AuthEmailKind, ResendEmailProvider};
 use runtime_storage::RuntimeObjectStore;
-use server_config::{CookieConfig, EmailProviderConfig, ServerConfig, StorageBackend};
+use server_config::{CookieConfig, ServerConfig, StorageBackend};
 
 const SESSION_COOKIE: &str = "mediahub_session";
 const CSRF_COOKIE: &str = "mediahub_csrf";
@@ -265,7 +267,7 @@ struct AppState {
     cors_allowed_origins: Vec<HeaderValue>,
     registration_enabled: bool,
     expose_auth_tokens: bool,
-    email_provider: Option<Arc<HttpEmailProvider>>,
+    email_provider: Option<Arc<ResendEmailProvider>>,
     auth_rate_limiter: AuthRateLimiter,
     variant_slots: Arc<tokio::sync::Semaphore>,
     http_metrics: HttpMetrics,
@@ -304,56 +306,6 @@ fn validate_upload_expected_size(expected_size: u64) -> Result<(), ApiError> {
         ));
     }
     Ok(())
-}
-
-struct HttpEmailProvider {
-    client: reqwest::Client,
-    config: EmailProviderConfig,
-}
-
-#[derive(Serialize)]
-struct EmailProviderRequest<'a> {
-    from: &'a str,
-    to: &'a str,
-    template: &'a str,
-    token: &'a str,
-    expires_at: OffsetDateTime,
-}
-
-impl HttpEmailProvider {
-    fn new(config: EmailProviderConfig) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            config,
-        }
-    }
-
-    async fn send_token(
-        &self,
-        to: &str,
-        template: &str,
-        token: &str,
-        expires_at: OffsetDateTime,
-    ) -> Result<(), ApiError> {
-        let response = self
-            .client
-            .post(self.config.url.clone())
-            .bearer_auth(&self.config.bearer_token)
-            .json(&EmailProviderRequest {
-                from: &self.config.from,
-                to,
-                template,
-                token,
-                expires_at,
-            })
-            .send()
-            .await
-            .map_err(|_| ApiError::unavailable("email provider is unavailable"))?;
-        if !response.status().is_success() {
-            return Err(ApiError::unavailable("email provider rejected the message"));
-        }
-        Ok(())
-    }
 }
 
 // Keep each responsibility in its own source file while retaining the original

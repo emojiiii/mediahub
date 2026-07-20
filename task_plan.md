@@ -188,3 +188,27 @@ Make the libvips image tests and production encoder work with both the GitHub ru
 | Debian package mirror returned HTTP 502 for `libsz2` | 1 | Add APT acquisition retries and `--fix-missing` before running the 8.14.1 test suite |
 | Libvips 8.14.1 also rejects the generated JPEG option `keep` | 1 | Route JPEG, PNG, and WebP through minimal suffix options so no 8.18-only default fields cross the FFI boundary |
 | Final repository scan included a nonexistent optional `compose.yaml` path | 1 | Use the repository's actual `docker-compose.yml`; no build or runtime check was affected |
+
+## Current Task: Resend Email Integration
+
+### Goal
+
+Replace the custom email-provider webhook contract with a direct, production-ready Resend email integration for verification and password-reset messages.
+
+### Phases
+
+**Status:** complete
+
+- [completed] 1. Confirm the current Resend API contract and inventory MediaHub email call sites/configuration
+- [completed] 2. Design and implement Resend request mapping and secure configuration
+- [completed] 3. Add focused tests for templates, authentication, success, and provider errors
+- [completed] 4. Update Compose/example environment and deployment documentation
+- [completed] 5. Run formatting, focused tests, workspace checks, and final review
+
+### Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| A parallel source scan included nonexistent `crates/mediahub-server/tests` | 1 | Read the existing `src/tests.rs` and `server_config.rs` paths directly; no implementation state was changed |
+| The broad `email` test filter also selected an existing SQLx auth-lifecycle test without `DATABASE_URL` | 1 | Use exact `email::tests` and `tests::resend_` filters for unit/provider coverage, then run database-backed tests with the configured PostgreSQL service |
+| Docker Desktop stopped before final PostgreSQL/image validation | 1 | Complete non-Docker checks first, then restore the local Docker engine if available and rerun the isolated database/image checks |
