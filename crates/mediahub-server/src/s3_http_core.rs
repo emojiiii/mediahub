@@ -157,6 +157,43 @@ pub(super) async fn s3_list_objects(
     Ok(s3_xml_response(StatusCode::OK, body, &request_id.0.0))
 }
 
+pub(super) async fn s3_head_bucket(
+    State(state): State<Arc<AppState>>,
+    Path(bucket_name): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    request_id: Extension<RequestId>,
+) -> Result<Response, S3ApiError> {
+    let auth =
+        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    let has_bucket_access = auth.hmac_identity.as_ref().is_some_and(|identity| {
+        identity.permissions.iter().any(|permission| {
+            matches!(
+                permission.as_str(),
+                "media:upload" | "media:read" | "media:list"
+            )
+        })
+    });
+    if !has_bucket_access {
+        return Err(S3ApiError::from_api(
+            ApiError::forbidden("access key lacks an S3 media permission"),
+            uri.path(),
+            &request_id.0.0,
+        ));
+    }
+    state
+        .repository
+        .find_bucket_by_name(auth.application.id, &bucket_name)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 HeadBucket lookup failed");
+            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
+        })?
+        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
+    Ok(s3_empty_response(StatusCode::OK, &request_id.0.0))
+}
+
 fn s3_list_token_codec(state: &AppState) -> ContinuationTokenCodec {
     let mut digest = Sha256::new();
     digest.update(b"mediahub:s3:list-token:v1");

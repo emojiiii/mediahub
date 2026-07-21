@@ -113,6 +113,7 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
         .route(
             "/s3/{bucket}",
             get(s3_http::s3_list_objects)
+                .head(s3_http::s3_head_bucket)
                 .post(s3_http::s3_bucket_post)
                 .layer(DefaultBodyLimit::max(MAX_S3_CONTROL_REQUEST_BYTES)),
         )

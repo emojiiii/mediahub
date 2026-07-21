@@ -447,6 +447,27 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         })
         .await
         .expect("persist access key");
+    let backup_access_key_id = "mh_ak_sub2api_backup_test";
+    let backup_access_key_secret = "sub2api-backup-test-secret";
+    state
+        .repository
+        .create_access_key(&NewAccessKey {
+            id: uuid::Uuid::now_v7().to_string(),
+            application_id: application.id,
+            access_key_id: backup_access_key_id.into(),
+            secret_ciphertext: state
+                .access_key_cipher
+                .encrypt(backup_access_key_secret.as_bytes())
+                .expect("encrypt backup access key"),
+            secret_key_version: state.access_key_cipher.version(),
+            secret_last_four: "cret".into(),
+            name: "sub2api backup S3".into(),
+            permissions: vec!["media:upload".into()],
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .expect("persist backup access key");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -459,6 +480,29 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         }
     });
     let client = reqwest::Client::new();
+    let bucket_url = format!("http://{address}/s3/{}", bucket.name());
+    let mut head_bucket = http::Request::builder()
+        .method(Method::HEAD)
+        .uri(&bucket_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("sub2api HeadBucket request");
+    sign_s3_test_request(
+        &mut head_bucket,
+        backup_access_key_id,
+        backup_access_key_secret,
+        None,
+    );
+    let head_bucket = send_s3_test_request(&client, head_bucket).await;
+    assert_eq!(head_bucket.status(), StatusCode::OK);
+    assert!(head_bucket.headers().contains_key("x-amz-request-id"));
+    assert!(
+        head_bucket
+            .bytes()
+            .await
+            .expect("HeadBucket response")
+            .is_empty()
+    );
     let object_key = "images/imgtask_test-0.png";
     let url = format!("http://{address}/s3/{}/{}", bucket.name(), object_key);
     let content = b"generated-image-png".to_vec();
@@ -795,7 +839,6 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
             .is_empty()
     );
 
-    let bucket_url = format!("http://{address}/s3/{}", bucket.name());
     let mut first_list = http::Request::builder()
         .method(Method::GET)
         .uri(format!(

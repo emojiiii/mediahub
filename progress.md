@@ -237,6 +237,8 @@
 - Added Local/S3 chunk-boundary, digest, short-body cleanup, streaming SigV4, and 64 MiB+ sub2api-shaped HTTP regressions.
 - Final available verification passed: formatting, diff check, workspace all-target/all-feature check, Clippy with warnings denied, complete test compilation, 17 Local/S3 adapter tests plus the wrapper contract, 4 SigV4 tests, 8 server library tests, and 83 core/app/image/PostgreSQL/OpenAPI unit tests. The real-S3 contract remains intentionally ignored without isolated provider credentials.
 - After Docker Desktop became available, started an isolated PostgreSQL 17 container and ran the full S3 gateway SQLx test. A signed ordinary PutObject containing 64 MiB + 1 byte succeeded and persisted the expected Media size/MIME; the same test also passed Multipart, read/head, ACL, list, and delete behavior. The temporary PostgreSQL container was removed afterward.
+- Reproduced the subsequent sub2api connection-test failure from its public source: the button calls HeadBucket, while MediaHub's implicit HEAD fallback incorrectly entered ListObjects and required `media:list`.
+- Added a dedicated HeadBucket route and regression using an Access Key whose only permission is `media:upload`. The real Axum/PostgreSQL test passed HeadBucket plus the complete S3 gateway flow, and the isolated PostgreSQL container was removed.
 
 ## Application resource isolation
 
