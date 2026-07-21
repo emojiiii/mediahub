@@ -62,6 +62,25 @@ pub struct ComposedObject {
     pub sha256: String,
 }
 
+/// Facts calculated while streaming one request body into temporary storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamedObject {
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum StreamingUploadError {
+    #[error("uploaded content size {actual} does not match expected size {expected}")]
+    SizeMismatch { expected: u64, actual: u64 },
+
+    #[error("upload stream failed: {0}")]
+    Stream(String),
+
+    #[error(transparent)]
+    Storage(#[from] ObjectStoreError),
+}
+
 /// Logical object storage. Implementations may use temporary files or native
 /// multipart uploads internally, but the application sees only opaque keys.
 #[allow(clippy::missing_errors_doc)]

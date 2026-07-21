@@ -458,10 +458,16 @@ path-style S3 Bucket. Configure clients with the public MediaHub origin plus
 configuration and proxy requirements are in
 [`sub2api-async-image-storage.md`](sub2api-async-image-storage.md).
 
-The gateway aggregates one signed PUT up to 64 MiB and then delegates to the
-same immutable upload application service as the native API. The result is a
-Media record with quota, Bucket policy, lifecycle, audit, outbox, and storage
-rollback behavior. Reads use the standard MediaHub Range/ETag/throttling path.
+The gateway authenticates a signed PUT before streaming it into a durable
+UploadSession. Local storage writes directly to a staging file; an external
+S3/R2 backend uses bounded, backpressured internal multipart writes. PutObject
+and UploadPart therefore do not aggregate complete payloads in MediaHub memory.
+The result is a Media record with quota, Bucket policy, lifecycle, audit,
+outbox, and storage rollback behavior. The effective object limit is the
+smallest of the 2 GiB technical limit, Bucket policy, and Application quota.
+Reads use the standard MediaHub Range/ETag/throttling path. A reverse proxy,
+including Cloudflare's ordinary proxied hostname, can impose a lower request
+body limit and must be configured or bypassed separately from the R2 API.
 AWS XML errors are intentionally outside the JSON control-plane OpenAPI; use
 `GET /api/v1/capabilities` and require `s3_gateway=true` for discovery.
 

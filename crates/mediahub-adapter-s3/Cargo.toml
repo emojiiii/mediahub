@@ -9,6 +9,7 @@ description = "S3-compatible object storage adapter for MediaHub"
 async-trait.workspace = true
 aws-credential-types = "=1.3.0"
 aws-sigv4 = { version = "=1.5.1", default-features = false, features = ["http1", "sign-http"] }
+bytes.workspace = true
 futures-util = "0.3.33"
 hex.workspace = true
 http.workspace = true

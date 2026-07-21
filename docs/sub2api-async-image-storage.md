@@ -64,7 +64,7 @@ image_storage:
 - `force_path_style` 必须为 `true`。Bucket 必须出现在 `/s3/{bucket}/{key}` 路径中。
 - 私有 Bucket 的 `public_base_url` 必须留空，让 `sub2api` 返回 AWS query-presigned GET URL。
 - `region` 推荐固定为 `us-east-1`；MediaHub 会验证请求 Credential Scope 前后一致，但不把 Region 映射到物理机房。
-- S3 网关单请求上限为 64 MiB。建议 `max_download_bytes` 不超过 `67108864`；默认 32 MiB 可直接使用。
+- `PutObject` 会流式写入 MediaHub 的 Local 存储，或通过带背压的 5 MiB 内部分片流向底层 S3/R2，不会在 MediaHub 内存中聚合完整对象。对象大小受 Bucket `max_object_size`、Application 配额和 MediaHub 2 GiB 技术上限约束。
 - MediaHub Object Key 不可覆盖。`sub2api` 使用任务 ID 生成 Key，正常情况下不会冲突；重放或重复 Key 会返回 S3 `OperationAborted`。
 
 修改挂载的 `config.yaml` 后重启：
@@ -101,7 +101,7 @@ docker compose up -d --force-recreate sub2api
 ## Multipart 限制
 
 - 每个 Application 最多同时保留 1000 个 `pending` 或 `completing` 状态的 Multipart Upload；超出后必须先完成、中止或等待旧 Upload 过期。
-- 每个 `UploadPart` 请求体最多 64 MiB，Part Number 范围为 1 到 10000。除最后一个 Part 外，每个 Part 至少 5 MiB。
+- `UploadPart` 同样采用流式存储，Part Number 范围为 1 到 10000。除最后一个 Part 外，每个 Part 至少 5 MiB；单个 Part 和累计对象大小都不得超过 Bucket 与 MediaHub 的对象上限。
 - `UploadPart` 写入 Part 元数据时即预占 Application 配额；覆盖同一 Part Number 时按新旧 Part 大小的差值增加或释放预留量。累计上传量同时受目标 Bucket 的 `max_object_size` 和 MediaHub 2 GiB 单对象技术上限约束。
 - `CompleteMultipartUpload` 将该 Upload 的预留配额转为正式 Media 已用配额；`AbortMultipartUpload` 和过期回收会释放预留配额。Multipart Upload 默认 24 小时过期，完成或中止后会清理临时 Part，生命周期 Worker 也会回收过期 Upload。
 - 完成后的总对象大小必须同时满足目标 Bucket 的 `max_object_size`、Application 配额和 MediaHub 2 GiB 单对象技术上限；三者取更小值。
@@ -113,7 +113,7 @@ docker compose up -d --force-recreate sub2api
 - 生产环境必须使用 HTTPS。
 - 保留原始 `Host`、请求路径、查询字符串、`Authorization` 和 `X-Amz-*` Header。
 - 不得对 `/s3` 后的路径做二次 URL decode、路径归一化或重写。
-- 允许至少 64 MiB 请求体，并关闭会改写已签名 Header/Query 的规则。
+- 代理的请求体上限必须不小于实际业务对象上限，并关闭会改写已签名 Header/Query 的规则。Cloudflare R2 API 与普通橙云代理不是同一条上传链路；若 MediaHub 上传域名经过 Cloudflare 代理，仍会受到当前套餐的代理上传上限，应使用 DNS-only/源站直连上传域名或确认套餐上限足够。
 - 预签名 URL 的 Host 必须与客户端签名时使用的外部 Host 相同。
 
 ## 验证

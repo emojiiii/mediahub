@@ -356,3 +356,27 @@ The unified image is the only supported Web deployment path; remove the obsolete
 | Combined validation aborted after a legitimate no-match `rg` returned exit code 1 | 1 | Treat both obsolete-reference searches as match-tolerant and rerun Actionlint/Compose independently so their outputs are retained |
 | First runtime smoke container rejected an invalid fixed Base64 media-signing test key, and its random-port shorthand was not queryable | 1 | Recreate the task-owned container with two generated 32-byte Base64 keys and explicit `127.0.0.1:0:3000` publishing |
 | Final evidence command lost quotes inside Docker Go-template and container `stat` arguments | 1 | Runtime HTTP/log checks and cleanup already passed; rerun image metadata inspection with simple independent templates |
+
+# Current Task: Streaming S3 Backup Uploads
+
+## Goal
+
+Make the fixed sub2api backup client interoperable with MediaHub's S3 gateway by accepting its actual `PutObject` request shape, streaming request bodies through authentication and storage without whole-object memory buffering, and returning protocol-correct S3 errors.
+
+## Phases
+
+**Status:** complete
+
+- [completed] 1. Verify sub2api backup behavior through DeepWiki and trace MediaHub's upload/storage contracts
+- [completed] 2. Design a bounded streaming pipeline for PutObject and UploadPart across Local and external S3 backends
+- [completed] 3. Implement streaming authentication, persistence, cleanup, and S3 XML rejection behavior
+- [completed] 4. Add large-body, bounded-memory, multipart, checksum, and failure-cleanup regression tests
+- [completed] 5. Run full Rust verification and the database-backed backup-sized upload regression
+
+## Current Task Errors
+
+| Error | Attempt | Resolution |
+| --- | --- | --- |
+| Windows `rg` calls used a Unix-style wildcard path and aborted one branch of two source reads | 2 | Stop passing wildcard paths entirely; read explicit files or search the concrete source directory with `-g '*.rs'` |
+| Focused server test compilation missed a qualified `Sha256` name in a new assertion | 1 | Qualify the test-only digest type and rerun the three SigV4 tests successfully |
+| No local PostgreSQL service, `DATABASE_URL`, or running Docker daemon was initially available for the 64 MiB+ SQLx HTTP test | 1 | After Docker Desktop became available, start an isolated PostgreSQL 17 container, run the exact regression successfully, then remove the container |

@@ -226,6 +226,23 @@ fn reject_s3_versioning(uri: &Uri, request_id: &str) -> Result<(), S3ApiError> {
     }
 }
 
+fn s3_content_length(
+    headers: &HeaderMap,
+    resource: &str,
+    request_id: &str,
+) -> Result<u64, S3ApiError> {
+    let value = headers
+        .get(http::header::CONTENT_LENGTH)
+        .ok_or_else(|| S3ApiError::missing_content_length(resource, request_id))?;
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            S3ApiError::invalid_argument("Content-Length is invalid.", resource, request_id)
+        })
+}
+
 fn s3_xml_response(status: StatusCode, body: String, request_id: &str) -> Response {
     let mut response = (status, body).into_response();
     response
@@ -373,6 +390,7 @@ impl S3ApiError {
             | SigV4Error::SessionCredentialsUnsupported
             | SigV4Error::DuplicateQueryParameter
             | SigV4Error::InvalidPayloadHash
+            | SigV4Error::StreamingPayloadHashRequired
             | SigV4Error::InvalidRequest => StatusCode::BAD_REQUEST,
             SigV4Error::MissingAuthentication
             | SigV4Error::SignatureMismatch
@@ -453,6 +471,36 @@ impl S3ApiError {
             StatusCode::BAD_REQUEST,
             "EntityTooSmall",
             "Your proposed upload is smaller than the minimum allowed object size.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn entity_too_large(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "EntityTooLarge",
+            "Your proposed upload exceeds the maximum allowed object size.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn missing_content_length(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::LENGTH_REQUIRED,
+            "MissingContentLength",
+            "You must provide the Content-Length HTTP header.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn incomplete_body(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            "You did not provide the number of bytes specified by the Content-Length HTTP header.",
             resource,
             request_id,
         )

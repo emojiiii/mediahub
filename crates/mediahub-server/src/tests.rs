@@ -401,7 +401,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         .update_application_quota(
             user_id,
             application.id,
-            16 * 1024 * 1024,
+            128 * 1024 * 1024,
             "req_s3_gateway_test_quota",
             OffsetDateTime::now_utc(),
         )
@@ -485,6 +485,37 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         .expect("MediaHub media record");
     assert_eq!(media.mime(), "image/png");
     assert_eq!(media.size(), content.len() as u64);
+
+    // This crosses the former Axum Bytes-extractor limit and exercises the
+    // same ordinary PutObject shape used by sub2api backups.
+    let large_key = "backups/sub2api-backup.sql.gz";
+    let large_url = format!("http://{address}/s3/{}/{}", bucket.name(), large_key);
+    let large_size = 64 * 1024 * 1024 + 1;
+    let mut large_put = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&large_url)
+        .header("host", address.to_string())
+        .header(CONTENT_TYPE, "application/gzip")
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .body(vec![b'z'; large_size])
+        .expect("large backup PUT request");
+    sign_s3_test_request(&mut large_put, access_key_id, access_key_secret, None);
+    let large_put = send_s3_test_request(&client, large_put).await;
+    let large_status = large_put.status();
+    let large_body = large_put.text().await.expect("large backup PUT response");
+    assert_eq!(
+        large_status,
+        StatusCode::OK,
+        "large backup PUT response: {large_body}"
+    );
+    let large_media = state
+        .repository
+        .find_by_object_key(application.id, bucket.id(), large_key)
+        .await
+        .expect("large backup media lookup")
+        .expect("large backup MediaHub media record");
+    assert_eq!(large_media.size(), large_size as u64);
+    assert_eq!(large_media.mime(), "application/gzip");
 
     let mut get = http::Request::builder()
         .method(Method::GET)

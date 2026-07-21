@@ -1,11 +1,13 @@
 use std::{ops::Range, path::Path};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::Stream;
 use mediahub_adapter_local::LocalObjectStore;
 use mediahub_adapter_s3::S3ObjectStore;
 use mediahub_app::{
     ComposedObject, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, PreparedUpload,
-    StoredUpload, UploadSessionStorage,
+    StoredUpload, StreamedObject, StreamingUploadError, UploadSessionStorage,
 };
 use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId};
 
@@ -50,6 +52,31 @@ impl RuntimeObjectStore {
                 "local storage root is unavailable".to_owned(),
             )),
             Self::S3(store) => store.exists("health/readiness").await.map(|_| ()),
+        }
+    }
+
+    pub(crate) async fn put_temporary_stream<S, E>(
+        &self,
+        temporary_key: &str,
+        stream: S,
+        expected_size: u64,
+        content_type: &str,
+    ) -> Result<StreamedObject, StreamingUploadError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send,
+        E: std::fmt::Display,
+    {
+        match self {
+            Self::Local(store) => {
+                store
+                    .put_temporary_stream(temporary_key, stream, expected_size, content_type)
+                    .await
+            }
+            Self::S3(store) => {
+                store
+                    .put_temporary_stream(temporary_key, stream, expected_size, content_type)
+                    .await
+            }
         }
     }
 }

@@ -17,11 +17,11 @@ use aws_sigv4::{
     },
     sign::v4,
 };
-use futures_util::TryStreamExt;
+use futures_util::{Stream, StreamExt, TryStreamExt, pin_mut};
 use http::{Method, Request};
 use mediahub_app::{
     ComposedObject, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, PreparedUpload,
-    StoredUpload, UploadSessionStorage, UploadTarget,
+    StoredUpload, StreamedObject, StreamingUploadError, UploadSessionStorage, UploadTarget,
 };
 use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId, UploadSessionState};
 use object_store::{
@@ -257,6 +257,102 @@ impl S3ObjectStore {
         prefix: Option<&str>,
     ) -> Result<Self, ObjectStoreError> {
         Self::from_parts(backend, prefix, None)
+    }
+
+    /// Streams one temporary object through bounded, backpressured multipart
+    /// writes. This is independent from the caller-facing S3 multipart API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body stream fails, its length differs from
+    /// `expected_size`, or the configured object store rejects the upload.
+    pub async fn put_temporary_stream<S, E>(
+        &self,
+        temporary_key: &str,
+        stream: S,
+        expected_size: u64,
+        content_type: &str,
+    ) -> Result<StreamedObject, StreamingUploadError>
+    where
+        S: Stream<Item = Result<bytes::Bytes, E>> + Send,
+        E: std::fmt::Display,
+    {
+        let destination = self.path_for(temporary_key)?;
+        let mut attributes = Attributes::new();
+        attributes.insert(Attribute::ContentType, content_type.to_owned().into());
+        if expected_size == 0 {
+            let sha256 = hex::encode(Sha256::digest([]));
+            attributes.insert(
+                Attribute::Metadata(SHA256_METADATA_KEY.into()),
+                sha256.clone().into(),
+            );
+            self.put_create(&destination, Vec::new(), attributes)
+                .await?;
+            return Ok(StreamedObject { size: 0, sha256 });
+        }
+        let upload = self
+            .backend
+            .put_multipart_opts(
+                &destination,
+                PutMultipartOptions {
+                    attributes,
+                    ..PutMultipartOptions::default()
+                },
+            )
+            .await
+            .map_err(map_backend_error)?;
+        let mut writer = WriteMultipart::new(upload);
+        let mut digest = Sha256::new();
+        let mut received = 0_u64;
+        pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = writer.abort().await;
+                    return Err(StreamingUploadError::Stream(error.to_string()));
+                }
+            };
+            received = match received.checked_add(chunk.len() as u64) {
+                Some(value) if value <= expected_size => value,
+                Some(value) => {
+                    let _ = writer.abort().await;
+                    return Err(StreamingUploadError::SizeMismatch {
+                        expected: expected_size,
+                        actual: value,
+                    });
+                }
+                None => {
+                    let _ = writer.abort().await;
+                    return Err(StreamingUploadError::SizeMismatch {
+                        expected: expected_size,
+                        actual: u64::MAX,
+                    });
+                }
+            };
+            digest.update(&chunk);
+            writer.put(chunk);
+            if let Err(error) = writer.wait_for_capacity(4).await {
+                let _ = writer.abort().await;
+                return Err(StreamingUploadError::Storage(map_backend_error(error)));
+            }
+        }
+        if received != expected_size {
+            let _ = writer.abort().await;
+            return Err(StreamingUploadError::SizeMismatch {
+                expected: expected_size,
+                actual: received,
+            });
+        }
+        writer
+            .finish()
+            .await
+            .map_err(map_backend_error)
+            .map_err(StreamingUploadError::Storage)?;
+        Ok(StreamedObject {
+            size: received,
+            sha256: hex::encode(digest.finalize()),
+        })
     }
 
     fn from_parts(

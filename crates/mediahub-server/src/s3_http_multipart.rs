@@ -84,7 +84,9 @@ async fn s3_upload_part(
     operation: S3ObjectOperation<'_>,
     upload_id: &str,
     part_number: u16,
-    content: Bytes,
+    signature: ParsedSigV4,
+    headers: &HeaderMap,
+    content: Body,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -125,24 +127,37 @@ async fn s3_upload_part(
         .max_object_size()
         .unwrap_or(MAX_UPLOAD_OBJECT_BYTES)
         .min(MAX_UPLOAD_OBJECT_BYTES);
-    let sha256 = hex::encode(Sha256::digest(&content));
-    let etag = format!("\"{sha256}\"");
+    let expected_size = s3_content_length(headers, uri.path(), request_id)?;
+    if expected_size > maximum_upload_size {
+        return Err(S3ApiError::entity_too_large(uri.path(), request_id));
+    }
     let storage_key = new_multipart_part_storage_key(upload_id, part_number);
-    state
+    let streamed = state
         .object_store
-        .put_temporary(&storage_key, &content, "application/octet-stream")
+        .put_temporary_stream(
+            &storage_key,
+            content.into_data_stream(),
+            expected_size,
+            "application/octet-stream",
+        )
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 multipart part storage failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
+            s3_streaming_upload_error(error, expected_size, uri.path(), request_id)
         })?;
+    if let Err(error) = signature.verify_payload_sha256(&streamed.sha256) {
+        let _ = state.object_store.delete(&storage_key).await;
+        return Err(S3ApiError::from_sigv4(error, uri.path(), request_id));
+    }
+    let sha256 = streamed.sha256;
+    let etag = format!("\"{sha256}\"");
     let result = state
         .repository
         .put_multipart_part(
             upload_id,
             NewS3MultipartPart {
                 part_number,
-                size: content.len() as u64,
+                size: streamed.size,
                 sha256,
                 etag: etag.clone(),
                 storage_key: storage_key.clone(),

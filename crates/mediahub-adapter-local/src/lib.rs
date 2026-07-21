@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, pin_mut};
 use mediahub_app::{
     ComposedObject, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, PreparedUpload,
-    StoredUpload, UploadSessionStorage, UploadTarget,
+    StoredUpload, StreamedObject, StreamingUploadError, UploadSessionStorage, UploadTarget,
 };
 use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId, UploadSessionState};
 use sha2::{Digest, Sha256};
@@ -29,17 +29,7 @@ const UPLOAD_TARGET_PREFIX: &str = "/api/v1/uploads";
 const METADATA_DIRECTORY: &str = ".mediahub-metadata";
 const STAGING_DIRECTORY: &str = ".mediahub-staging";
 
-#[derive(Debug, thiserror::Error)]
-pub enum LocalUploadError {
-    #[error("uploaded content size {actual} does not match expected size {expected}")]
-    SizeMismatch { expected: u64, actual: u64 },
-
-    #[error("upload stream failed: {0}")]
-    Stream(String),
-
-    #[error(transparent)]
-    Storage(#[from] ObjectStoreError),
-}
+pub use mediahub_app::StreamingUploadError as LocalUploadError;
 
 /// Stores all media beneath one configured directory.
 ///
@@ -138,7 +128,7 @@ impl LocalObjectStore {
         stream: S,
         expected_size: u64,
         content_type: &str,
-    ) -> Result<(), LocalUploadError>
+    ) -> Result<StreamedObject, StreamingUploadError>
     where
         S: Stream<Item = Result<Bytes, E>> + Send,
         E: std::fmt::Display,
@@ -159,17 +149,18 @@ impl LocalObjectStore {
             .write(true)
             .open(&stage_object)
             .await
-            .map_err(|error| LocalUploadError::Storage(map_create_error(&error)))?;
+            .map_err(|error| StreamingUploadError::Storage(map_create_error(&error)))?;
 
         pin_mut!(stream);
         let mut received = 0_u64;
+        let mut digest = Sha256::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     drop(file);
                     let _ = tokio::fs::remove_file(&stage_object).await;
-                    return Err(LocalUploadError::Stream(error.to_string()));
+                    return Err(StreamingUploadError::Stream(error.to_string()));
                 }
             };
             received = match received.checked_add(chunk.len() as u64) {
@@ -177,7 +168,7 @@ impl LocalObjectStore {
                 None => {
                     drop(file);
                     let _ = tokio::fs::remove_file(&stage_object).await;
-                    return Err(LocalUploadError::SizeMismatch {
+                    return Err(StreamingUploadError::SizeMismatch {
                         expected: expected_size,
                         actual: u64::MAX,
                     });
@@ -186,7 +177,7 @@ impl LocalObjectStore {
             if received > expected_size {
                 drop(file);
                 let _ = tokio::fs::remove_file(&stage_object).await;
-                return Err(LocalUploadError::SizeMismatch {
+                return Err(StreamingUploadError::SizeMismatch {
                     expected: expected_size,
                     actual: received,
                 });
@@ -194,13 +185,14 @@ impl LocalObjectStore {
             if let Err(error) = file.write_all(&chunk).await {
                 drop(file);
                 let _ = tokio::fs::remove_file(&stage_object).await;
-                return Err(LocalUploadError::Storage(io_error(&error)));
+                return Err(StreamingUploadError::Storage(io_error(&error)));
             }
+            digest.update(&chunk);
         }
         if received != expected_size {
             drop(file);
             let _ = tokio::fs::remove_file(&stage_object).await;
-            return Err(LocalUploadError::SizeMismatch {
+            return Err(StreamingUploadError::SizeMismatch {
                 expected: expected_size,
                 actual: received,
             });
@@ -208,7 +200,7 @@ impl LocalObjectStore {
         if let Err(error) = file.sync_all().await {
             drop(file);
             let _ = tokio::fs::remove_file(&stage_object).await;
-            return Err(LocalUploadError::Storage(io_error(&error)));
+            return Err(StreamingUploadError::Storage(io_error(&error)));
         }
         drop(file);
 
@@ -218,16 +210,16 @@ impl LocalObjectStore {
                 .write(true)
                 .open(&stage_metadata)
                 .await
-                .map_err(|error| LocalUploadError::Storage(map_create_error(&error)))?;
+                .map_err(|error| StreamingUploadError::Storage(map_create_error(&error)))?;
             metadata
                 .write_all(content_type.as_bytes())
                 .await
-                .map_err(|error| LocalUploadError::Storage(io_error(&error)))?;
+                .map_err(|error| StreamingUploadError::Storage(io_error(&error)))?;
             metadata
                 .sync_all()
                 .await
-                .map_err(|error| LocalUploadError::Storage(io_error(&error)))?;
-            Ok::<(), LocalUploadError>(())
+                .map_err(|error| StreamingUploadError::Storage(io_error(&error)))?;
+            Ok::<(), StreamingUploadError>(())
         }
         .await;
         if let Err(error) = metadata_result {
@@ -242,11 +234,15 @@ impl LocalObjectStore {
         })
         .await
         .map_err(|error| {
-            LocalUploadError::Storage(ObjectStoreError::Unavailable(format!(
+            StreamingUploadError::Storage(ObjectStoreError::Unavailable(format!(
                 "local upload installation task failed: {error}"
             )))
         })?;
-        result.map_err(LocalUploadError::Storage)
+        result.map_err(StreamingUploadError::Storage)?;
+        Ok(StreamedObject {
+            size: received,
+            sha256: hex::encode(digest.finalize()),
+        })
     }
 
     fn path_for(&self, key: &str) -> Result<PathBuf, ObjectStoreError> {

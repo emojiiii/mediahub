@@ -53,9 +53,10 @@ pub use memory::{
 pub use ports::{
     BucketRepository, Clock, ComposedObject, LeasedMediaUpload, LeasedWebhookDelivery,
     MediaRepository, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, OutboxEvent,
-    OutboxRepository, RepositoryError, UploadSessionCancellation, UploadSessionCompletion,
-    UploadSessionExpiration, UploadSessionRepository, UploadSessionStorage, WebhookDelivery,
-    WebhookDeliveryEndpoint, WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
+    OutboxRepository, RepositoryError, StreamedObject, StreamingUploadError,
+    UploadSessionCancellation, UploadSessionCompletion, UploadSessionExpiration,
+    UploadSessionRepository, UploadSessionStorage, WebhookDelivery, WebhookDeliveryEndpoint,
+    WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
 };
 pub use s3_multipart::{
     CompletedS3MultipartPart, MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION,

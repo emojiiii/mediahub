@@ -108,13 +108,13 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
                 .put(s3_http::s3_put_object)
                 .post(s3_http::s3_post_object)
                 .delete(s3_http::s3_delete_object)
-                .layer(DefaultBodyLimit::max(MAX_S3_GATEWAY_REQUEST_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_S3_CONTROL_REQUEST_BYTES)),
         )
         .route(
             "/s3/{bucket}",
             get(s3_http::s3_list_objects)
                 .post(s3_http::s3_bucket_post)
-                .layer(DefaultBodyLimit::max(MAX_S3_GATEWAY_REQUEST_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_S3_CONTROL_REQUEST_BYTES)),
         )
         .route("/{app_id}", get(list_path_buckets))
         .route(

@@ -225,6 +225,19 @@
 - Runtime smoke passed with restart count 0: root, login, deep Application SPA route, live/readiness, capabilities, and hashed JavaScript returned 200; the native Application route retained backend 404 behavior.
 - Removed task-owned containers, network, and the intermediate Web-builder image after validation; retained the complete local image.
 
+## Streaming S3 backup uploads
+
+- Confirmed the reported 413 matches MediaHub's hard-coded 64 MiB S3 route limit; Axum rejects before the S3 handler and the client then misparses the non-XML body.
+- Confirmed both PutObject and UploadPart currently extract the complete request as `Bytes`, so increasing the limit alone would create unsafe per-request memory growth.
+- Confirmed MediaHub implements Multipart, but the client is fixed and its backup behavior must be verified before choosing the server contract.
+- Verified through DeepWiki plus the public sub2api source that backup upload performs `io.ReadAll`, wraps the bytes in `bytes.Reader`, installs the unsigned-payload SigV4 middleware, and calls ordinary `s3.Client.PutObject`; no client-managed Multipart uploader is involved.
+- Replaced MediaHub's whole-body PutObject and UploadPart extractors with authenticated, Content-Length-bounded streams. Local writes directly to staging disk; external S3/R2 uses backpressured 5 MiB internal Multipart writes.
+- Routed ordinary PutObject through durable UploadSession creation/completion so quota and cleanup ownership exist before the first body chunk, while preserving immutable Media, audit, and outbox behavior.
+- Added protocol-correct XML errors for missing/invalid lengths, incomplete bodies, oversized requests, stream failures, and checksum mismatches; removed stale 64 MiB claims from README and operational docs and documented Cloudflare proxy limits separately from R2.
+- Added Local/S3 chunk-boundary, digest, short-body cleanup, streaming SigV4, and 64 MiB+ sub2api-shaped HTTP regressions.
+- Final available verification passed: formatting, diff check, workspace all-target/all-feature check, Clippy with warnings denied, complete test compilation, 17 Local/S3 adapter tests plus the wrapper contract, 4 SigV4 tests, 8 server library tests, and 83 core/app/image/PostgreSQL/OpenAPI unit tests. The real-S3 contract remains intentionally ignored without isolated provider credentials.
+- After Docker Desktop became available, started an isolated PostgreSQL 17 container and ran the full S3 gateway SQLx test. A signed ordinary PutObject containing 64 MiB + 1 byte succeeded and persisted the expected Media size/MIME; the same test also passed Multipart, read/head, ACL, list, and delete behavior. The temporary PostgreSQL container was removed afterward.
+
 ## Application resource isolation
 
 - Confirmed backend requests and React Query keys are already Application-scoped.

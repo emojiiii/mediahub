@@ -185,7 +185,7 @@ MEDIAHUB_S3_ALLOW_HTTP=false
 /s3/{bucket}/{object_key}
 ```
 
-当前支持对象的 `PutObject`、`GetObject`、`HeadObject`、删除和受限列表，单次 PUT 上限为 64 MiB。客户端使用 Application Access Key，要求至少具备 `media:upload` 和 `media:read`，并使用 `force_path_style=true`。是否启用网关可以通过 `GET /api/v1/capabilities` 的 `s3_gateway` 字段发现。它不能替代完整的 AWS S3 管理 API、Multipart Upload 或 Bucket 管理服务。
+当前支持对象的 `PutObject`、`GetObject`、`HeadObject`、删除、受限列表和 Multipart Upload。`PutObject` 与 `UploadPart` 都会流式写入 Local 磁盘，或通过带背压的内部分片流向底层 S3/R2，不会在 MediaHub 内存中聚合完整对象；对象大小受 Bucket `max_object_size`、Application 配额和 2 GiB 技术上限共同约束。客户端使用 Application Access Key，要求至少具备 `media:upload` 和 `media:read`，并使用 `force_path_style=true`。是否启用网关可以通过 `GET /api/v1/capabilities` 的 `s3_gateway` 字段发现。它仍不是完整的 AWS S3 Bucket 管理服务。
 
 ### 健康检查和运行边界
 

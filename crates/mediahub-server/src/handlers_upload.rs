@@ -357,7 +357,7 @@ async fn put_upload_content(
         )
         .await
     {
-        Ok(()) => {
+        Ok(_) => {
             let current = state
                 .repository
                 .find_upload_session(session.id())

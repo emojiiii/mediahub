@@ -241,7 +241,7 @@
         let root = test_root();
         let store = LocalObjectStore::new(&root).expect("store initializes");
         let key = "objects/streamed";
-        store
+        let streamed = store
             .put_temporary_stream(
                 key,
                 futures_util::stream::iter([
@@ -253,6 +253,8 @@
             )
             .await
             .expect("streamed upload succeeds");
+        assert_eq!(streamed.size, 7);
+        assert_eq!(streamed.sha256, hex::encode(Sha256::digest(b"abcdefg")));
         assert_eq!(store.read(key), Ok(b"abcdefg".to_vec()));
         assert_eq!(
             store.content_type_for(key),

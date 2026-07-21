@@ -90,6 +90,37 @@ impl ParsedSigV4 {
                 SignableBody::Precomputed(expected.clone())
             }
         };
+        self.verify_signature(secret, signable_body)
+    }
+
+    /// Verifies an upload request without buffering its payload. A streaming
+    /// request must either opt into `UNSIGNED-PAYLOAD` or provide the payload
+    /// digest in `x-amz-content-sha256` so the canonical request is known
+    /// before the body is accepted.
+    pub(crate) fn verify_streaming_signature(&self, secret: &str) -> Result<(), SigV4Error> {
+        let signable_body = match &self.payload_mode {
+            PayloadMode::Unsigned => SignableBody::UnsignedPayload,
+            PayloadMode::Precomputed(expected) => SignableBody::Precomputed(expected.clone()),
+            PayloadMode::Calculate => return Err(SigV4Error::StreamingPayloadHashRequired),
+        };
+        self.verify_signature(secret, signable_body)
+    }
+
+    pub(crate) fn verify_payload_sha256(&self, actual: &str) -> Result<(), SigV4Error> {
+        match &self.payload_mode {
+            PayloadMode::Precomputed(expected) if !constant_time_eq(actual, expected) => {
+                Err(SigV4Error::PayloadHashMismatch)
+            }
+            PayloadMode::Calculate => Err(SigV4Error::StreamingPayloadHashRequired),
+            PayloadMode::Unsigned | PayloadMode::Precomputed(_) => Ok(()),
+        }
+    }
+
+    fn verify_signature(
+        &self,
+        secret: &str,
+        signable_body: SignableBody<'_>,
+    ) -> Result<(), SigV4Error> {
         let identity = Credentials::new(
             self.access_key_id.clone(),
             secret.to_owned(),
@@ -457,6 +488,8 @@ pub(crate) enum SigV4Error {
     InvalidPayloadHash,
     #[error("the payload does not match x-amz-content-sha256")]
     PayloadHashMismatch,
+    #[error("streaming uploads require x-amz-content-sha256 or UNSIGNED-PAYLOAD")]
+    StreamingPayloadHashRequired,
     #[error("the signed request is invalid")]
     InvalidRequest,
 }
@@ -465,7 +498,9 @@ impl SigV4Error {
     pub(crate) const fn s3_code(self) -> &'static str {
         match self {
             Self::MissingAuthentication => "AccessDenied",
-            Self::UnsupportedAlgorithm | Self::SessionCredentialsUnsupported => "InvalidRequest",
+            Self::UnsupportedAlgorithm
+            | Self::SessionCredentialsUnsupported
+            | Self::StreamingPayloadHashRequired => "InvalidRequest",
             Self::InvalidCredentialScope => "AuthorizationHeaderMalformed",
             Self::InvalidDate | Self::Expired => "RequestTimeTooSkewed",
             Self::InvalidExpiry => "AuthorizationQueryParametersError",
@@ -573,6 +608,45 @@ mod tests {
     }
 
     #[test]
+    fn streaming_upload_requires_an_explicit_payload_mode() {
+        let body = b"generated-image".to_vec();
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri("/s3/images/images/task-0.png")
+            .header("host", "media.example.com")
+            .body(body.clone())
+            .expect("request");
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().expect("header")));
+        let signable = SignableRequest::new(
+            "PUT",
+            request.uri().to_string(),
+            headers,
+            SignableBody::Bytes(&body),
+        )
+        .expect("signable");
+        sign(signable, &params(settings(SignatureLocation::Headers)))
+            .expect("signature")
+            .into_parts()
+            .0
+            .apply_to_request_http1x(&mut request);
+        let parsed = ParsedSigV4::parse(
+            request.method(),
+            request.uri(),
+            request.headers(),
+            signing_time(),
+        )
+        .expect("parse");
+        assert_eq!(parsed.verify(SECRET, &body), Ok(()));
+        assert_eq!(
+            parsed.verify_streaming_signature(SECRET),
+            Err(SigV4Error::StreamingPayloadHashRequired)
+        );
+    }
+
+    #[test]
     fn verifies_presigned_get_and_rejects_expiry() {
         let mut request = Request::builder()
             .method(Method::GET)
@@ -653,6 +727,15 @@ mod tests {
         .expect("parse");
         assert_eq!(
             parsed.verify(SECRET, b"tampered"),
+            Err(SigV4Error::PayloadHashMismatch)
+        );
+        assert_eq!(parsed.verify_streaming_signature(SECRET), Ok(()));
+        assert_eq!(
+            parsed.verify_payload_sha256(&hex::encode(sha2::Sha256::digest(&body))),
+            Ok(())
+        );
+        assert_eq!(
+            parsed.verify_payload_sha256(&hex::encode(sha2::Sha256::digest(b"tampered"))),
             Err(SigV4Error::PayloadHashMismatch)
         );
     }

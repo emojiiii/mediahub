@@ -10,8 +10,9 @@
     };
 
     use async_trait::async_trait;
+    use bytes::Bytes;
     use futures_util::{StreamExt as _, stream::BoxStream};
-    use mediahub_app::{ObjectStoreError, UploadSessionStorage};
+    use mediahub_app::{ObjectStoreError, StreamingUploadError, UploadSessionStorage};
     use mediahub_core::{
         ApplicationId, BucketId, ClientMetadata, MediaId, NewUploadSession, OffsetDateTime,
         UploadSession, UploadSessionId,
@@ -53,6 +54,62 @@
         fail_delete_calls: AtomicUsize,
         full_get_calls: AtomicUsize,
         range_get_calls: AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_crosses_internal_part_boundaries_and_aborts_short_bodies() {
+        let backend = Arc::new(InMemory::new());
+        let store = S3ObjectStore::from_backend(backend.clone(), Some("tenant"))
+            .expect("test object store");
+        let first = Bytes::from(vec![b'a'; 3 * 1024 * 1024]);
+        let second = Bytes::from(vec![b'b'; 3 * 1024 * 1024 + 17]);
+        let expected_size = (first.len() + second.len()) as u64;
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+
+        let streamed = store
+            .put_temporary_stream(
+                "temporary/streamed",
+                futures_util::stream::iter([
+                    Ok::<Bytes, &str>(first),
+                    Ok::<Bytes, &str>(second),
+                ]),
+                expected_size,
+                "application/octet-stream",
+            )
+            .await
+            .expect("streamed S3 upload");
+        assert_eq!(streamed.size, expected_size);
+        assert_eq!(streamed.sha256, hex::encode(Sha256::digest(&expected)));
+        let stored = backend
+            .get(&Path::from("tenant/temporary/streamed"))
+            .await
+            .expect("stored streamed object")
+            .bytes()
+            .await
+            .expect("streamed object bytes");
+        assert_eq!(stored.as_ref(), expected);
+
+        assert!(matches!(
+            store
+                .put_temporary_stream(
+                    "temporary/short",
+                    futures_util::stream::iter([Ok::<Bytes, &str>(Bytes::from_static(b"short"))]),
+                    6,
+                    "application/octet-stream",
+                )
+                .await,
+            Err(StreamingUploadError::SizeMismatch {
+                expected: 6,
+                actual: 5
+            })
+        ));
+        assert!(
+            backend
+                .head(&Path::from("tenant/temporary/short"))
+                .await
+                .is_err()
+        );
     }
 
     impl CommitProbeStore {

@@ -1671,7 +1671,6 @@ dependencies = [
  "mediahub-app",
  "mediahub-core",
  "sha2 0.11.0",
- "thiserror",
  "tokio",
  "uuid",
 ]
@@ -1697,6 +1696,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sigv4",
+ "bytes",
  "futures-util",
  "hex",
  "http 1.4.2",
