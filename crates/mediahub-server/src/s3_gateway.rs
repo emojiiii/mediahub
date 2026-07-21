@@ -46,6 +46,7 @@ pub(crate) struct ParsedSigV4 {
     method: String,
     signing_uri: String,
     signed_headers: Vec<(String, String)>,
+    cloudflare_accept_encoding_rewrite: bool,
     payload_mode: PayloadMode,
     supplied_signature: String,
 }
@@ -121,6 +122,31 @@ impl ParsedSigV4 {
         secret: &str,
         signable_body: SignableBody<'_>,
     ) -> Result<(), SigV4Error> {
+        let result =
+            self.verify_signature_with_headers(secret, signable_body.clone(), &self.signed_headers);
+        if result == Err(SigV4Error::SignatureMismatch) && self.cloudflare_accept_encoding_rewrite {
+            let original_headers = self
+                .signed_headers
+                .iter()
+                .map(|(name, value)| {
+                    if name == "accept-encoding" {
+                        (name.clone(), "identity".to_owned())
+                    } else {
+                        (name.clone(), value.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            return self.verify_signature_with_headers(secret, signable_body, &original_headers);
+        }
+        result
+    }
+
+    fn verify_signature_with_headers(
+        &self,
+        secret: &str,
+        signable_body: SignableBody<'_>,
+        signed_headers: &[(String, String)],
+    ) -> Result<(), SigV4Error> {
         let identity = Credentials::new(
             self.access_key_id.clone(),
             secret.to_owned(),
@@ -150,7 +176,7 @@ impl ParsedSigV4 {
         let signable = SignableRequest::new(
             &self.method,
             self.signing_uri.as_str(),
-            self.signed_headers
+            signed_headers
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
             signable_body,
@@ -189,6 +215,10 @@ impl ParsedSigV4 {
         let signing_time = parse_signing_time(date)?;
         scope.validate_date(signing_time)?;
         let signed_headers = collect_signed_headers(headers, uri, declared_headers)?;
+        let cloudflare_accept_encoding_rewrite = headers.contains_key("cf-ray")
+            && signed_headers
+                .iter()
+                .any(|(name, value)| name == "accept-encoding" && value != "identity");
         let payload_mode = payload_mode(headers, false)?;
         Ok(Self {
             access_key_id: scope.access_key_id,
@@ -199,6 +229,7 @@ impl ParsedSigV4 {
             method: method.as_str().to_owned(),
             signing_uri: uri.to_string(),
             signed_headers,
+            cloudflare_accept_encoding_rewrite,
             payload_mode,
             supplied_signature: (*supplied_signature).to_owned(),
         })
@@ -234,6 +265,7 @@ impl ParsedSigV4 {
             method: method.as_str().to_owned(),
             signing_uri: unsigned_query_uri(uri)?,
             signed_headers,
+            cloudflare_accept_encoding_rewrite: false,
             payload_mode: PayloadMode::Unsigned,
             supplied_signature: supplied_signature.to_owned(),
         })
@@ -643,6 +675,67 @@ mod tests {
         assert_eq!(
             parsed.verify_streaming_signature(SECRET),
             Err(SigV4Error::StreamingPayloadHashRequired)
+        );
+    }
+
+    #[test]
+    fn cloudflare_accept_encoding_rewrite_is_narrowly_recovered() {
+        let mut request = Request::builder()
+            .method(Method::HEAD)
+            .uri("/s3/sub2api")
+            .header("host", "media.example.com")
+            .header("accept-encoding", "identity")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(Vec::<u8>::new())
+            .expect("request");
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().expect("header")));
+        let signable = SignableRequest::new(
+            "HEAD",
+            request.uri().to_string(),
+            headers,
+            SignableBody::UnsignedPayload,
+        )
+        .expect("signable");
+        sign(signable, &params(settings(SignatureLocation::Headers)))
+            .expect("signature")
+            .into_parts()
+            .0
+            .apply_to_request_http1x(&mut request);
+        request.headers_mut().insert(
+            "accept-encoding",
+            http::HeaderValue::from_static("br, gzip"),
+        );
+
+        let without_cloudflare = ParsedSigV4::parse(
+            request.method(),
+            request.uri(),
+            request.headers(),
+            signing_time(),
+        )
+        .expect("parse rewritten request");
+        assert_eq!(
+            without_cloudflare.verify(SECRET, &[]),
+            Err(SigV4Error::SignatureMismatch)
+        );
+
+        request.headers_mut().insert(
+            http::HeaderName::from_static("cf-ray"),
+            http::HeaderValue::from_static("sub2api-probe-test"),
+        );
+        let through_cloudflare = ParsedSigV4::parse(
+            request.method(),
+            request.uri(),
+            request.headers(),
+            signing_time(),
+        )
+        .expect("parse Cloudflare request");
+        assert_eq!(through_cloudflare.verify(SECRET, &[]), Ok(()));
+        assert_eq!(
+            through_cloudflare.verify("wrong-secret", &[]),
+            Err(SigV4Error::SignatureMismatch)
         );
     }
 

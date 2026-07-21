@@ -485,6 +485,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         .method(Method::HEAD)
         .uri(&bucket_url)
         .header("host", address.to_string())
+        .header("accept-encoding", "identity")
         .body(Vec::new())
         .expect("sub2api HeadBucket request");
     sign_s3_test_request(
@@ -492,6 +493,13 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         backup_access_key_id,
         backup_access_key_secret,
         None,
+    );
+    head_bucket
+        .headers_mut()
+        .insert("accept-encoding", HeaderValue::from_static("br, gzip"));
+    head_bucket.headers_mut().insert(
+        HeaderName::from_static("cf-ray"),
+        HeaderValue::from_static("sub2api-probe-test"),
     );
     let head_bucket = send_s3_test_request(&client, head_bucket).await;
     assert_eq!(head_bucket.status(), StatusCode::OK);

@@ -112,7 +112,7 @@ docker compose up -d --force-recreate sub2api
 ## 反向代理要求
 
 - 生产环境必须使用 HTTPS。
-- 保留原始 `Host`、请求路径、查询字符串、`Authorization` 和 `X-Amz-*` Header。
+- 保留原始 `Host`、请求路径、查询字符串、`Authorization` 和 `X-Amz-*` Header。Cloudflare 橙云会改写 AWS Go SDK 已签名的 `Accept-Encoding: identity`；MediaHub 仅在存在 `CF-Ray` 且其他签名校验条件完整时兼容该项改写。
 - 不得对 `/s3` 后的路径做二次 URL decode、路径归一化或重写。
 - 代理的请求体上限必须不小于实际业务对象上限，并关闭会改写已签名 Header/Query 的规则。Cloudflare R2 API 与普通橙云代理不是同一条上传链路；若 MediaHub 上传域名经过 Cloudflare 代理，仍会受到当前套餐的代理上传上限，应使用 DNS-only/源站直连上传域名或确认套餐上限足够。
 - 预签名 URL 的 Host 必须与客户端签名时使用的外部 Host 相同。
