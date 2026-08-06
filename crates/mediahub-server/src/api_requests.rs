@@ -188,6 +188,12 @@ struct CompleteUploadSessionHttpRequest {
     sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateShortLinkRequest {
+    target_url: String,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct UploadContentQuery {

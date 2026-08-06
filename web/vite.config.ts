@@ -8,7 +8,10 @@ const viewerChunkGroups = [
     name: 'docx-preview',
     test: /node_modules[\\/]docx-preview[\\/]/,
     priority: 10,
-    includeDependenciesRecursively: false,
+    // Keep docx-preview's bundled helpers in the same lazy chunk. Leaving
+    // dependencies outside the group creates a circular import with the
+    // ObjectFileViewer chunk (the docx chunk calls an uninitialized export).
+    includeDependenciesRecursively: true,
   },
 ]
 

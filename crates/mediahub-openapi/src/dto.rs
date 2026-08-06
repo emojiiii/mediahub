@@ -489,6 +489,22 @@ pub struct CreateUploadSessionResponse {
 
 #[derive(Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CreateShortLink {
+    pub target_url: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShortLink {
+    pub code: String,
+    pub url: String,
+    pub target_url: String,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWebhook {
     pub url: String,
     pub events: Vec<String>,

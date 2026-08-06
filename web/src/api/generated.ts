@@ -1582,6 +1582,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/short-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create a short link for a public object */
+        post: {
+            parameters: {
+                query?: never;
+                header?: {
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
+                };
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CreateShortLink"];
+                };
+            };
+            responses: {
+                /** @description Resource created */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ShortLink"];
+                    };
+                };
+                400: components["responses"]["InvalidRequest"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/uploads": {
         parameters: {
             query?: never;
@@ -2143,6 +2191,44 @@ export interface paths {
                 };
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/s/{code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Redirect a public short link */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    code: components["parameters"]["ShortCode"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Response */
+                307: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                404: components["responses"]["NotFound"];
                 503: components["responses"]["Unavailable"];
             };
         };
@@ -2879,6 +2965,9 @@ export interface components {
             name: string;
             visibility?: null | components["schemas"]["Visibility"];
         };
+        CreateShortLink: {
+            target_url: string;
+        };
         CreateUploadSession: {
             bucket: string;
             content_type: string;
@@ -3021,6 +3110,13 @@ export interface components {
             last_seen_at: string;
             last_seen_ip?: string | null;
             user_agent_summary?: string | null;
+        };
+        ShortLink: {
+            code: string;
+            created_at: string;
+            expires_at?: string | null;
+            target_url: string;
+            url: string;
         };
         SignedMediaUrl: {
             expires_at: string;
@@ -3254,6 +3350,7 @@ export interface components {
         PublicBucketName: string;
         Range: string;
         SessionId: string;
+        ShortCode: string;
         UploadSessionId: string;
         UserId: string;
         VariantBackground: string;

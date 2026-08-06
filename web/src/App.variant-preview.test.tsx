@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { DEFAULT_VARIANT_PARAMS, ObjectPreviewModal, isRasterImageMimeType, isValidVariantParams } from './App'
@@ -83,6 +83,45 @@ describe('图片实时 Variant 预览', () => {
       'flex-1',
       'overflow-hidden',
     )
+  })
+
+  it('公开对象使用无 token 链接预览，并可复制原链和短链', async () => {
+    const publicUrl = 'https://media.example.test/app_test/images/previews/sample.png'
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const getSignedUrl = vi.spyOn(api, 'getSignedUrl')
+    vi.spyOn(api, 'getPublicUrl').mockResolvedValue({ url: publicUrl, expiresAt: '' })
+    const createShortLink = vi.spyOn(api, 'createShortLink').mockResolvedValue({
+      code: 'sample',
+      url: 'https://media.example.test/s/sample',
+      targetUrl: publicUrl,
+    })
+
+    renderPreview({ ...IMAGE, visibility: '公开' })
+
+    expect(await screen.findByTestId('raster-preview-image')).toHaveAttribute('src', publicUrl)
+    expect(getSignedUrl).not.toHaveBeenCalled()
+    expect(screen.getByRole('link', { name: '在新窗口打开' })).toHaveAttribute('href', publicUrl)
+
+    fireEvent.click(screen.getByRole('button', { name: '复制公开链接' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(publicUrl))
+
+    fireEvent.click(screen.getByRole('button', { name: '复制短链' }))
+    await waitFor(() => expect(createShortLink).toHaveBeenCalledWith(publicUrl))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('https://media.example.test/s/sample'))
+  })
+
+  it('私有对象不提供公开链接复制入口', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockResolvedValue({
+      url: 'https://media.example.test/private.png?token=secret',
+      expiresAt: '2026-07-18T09:00:00.000Z',
+    })
+
+    renderPreview()
+
+    await screen.findByTestId('raster-preview-image')
+    expect(screen.queryByRole('button', { name: '复制公开链接' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '复制短链' })).not.toBeInTheDocument()
   })
 
   it('防抖请求 Variant，并在新图加载前保留当前图片与打开链接', async () => {

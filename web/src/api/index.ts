@@ -193,6 +193,11 @@ export type VariantParams = {
   crop: 'center' | 'top' | 'bottom' | 'left' | 'right'
   background: string
 }
+export type ShortLink = {
+  code: string
+  url: string
+  targetUrl: string
+}
 export type BatchAction =
   | { type: 'update_ttl_seconds'; ttl_seconds: number | null }
   | { type: 'update_visibility'; visibility: Visibility }
@@ -264,7 +269,9 @@ type Api = {
   updateObject(mediaId: string, revision: number, input: MediaUpdateInput): Promise<void>
   deleteObject(mediaId: string): Promise<void>
   getSignedUrl(mediaId: string): Promise<{ url: string; expiresAt: string }>
+  getPublicUrl(mediaId: string): Promise<{ url: string; expiresAt: string }>
   getVariantUrl(mediaId: string, params: VariantParams): Promise<{ url: string; expiresAt: string }>
+  createShortLink(targetUrl: string): Promise<ShortLink>
   executeBatch(mediaIds: string[], action: BatchAction): Promise<BatchOperationResult>
   getJob(jobId: string): Promise<AsyncJobView>
   cancelJob(jobId: string): Promise<void>
@@ -408,7 +415,17 @@ async function backendObjectById(mediaId: string): Promise<{ appId: string; buck
   if (!bucket) throw new ApiRequestError(404, 'not_found', 'Object Bucket not found')
   return { appId, bucket, media: item, buckets }
 }
+async function signedObjectUrl({ appId, bucket, media }: Awaited<ReturnType<typeof backendObjectById>>): Promise<{ url: string; expiresAt: string }> {
+  const value = await backendData(backendClient.POST('/{app_id}/{bucket}/{object_key}', {
+    params: { path: { app_id: appId, bucket: bucket.name, object_key: media.object_key } },
+  }))
+  return { url: absoluteResourceUrl(value.url), expiresAt: value.expires_at }
+}
 function absoluteResourceUrl(path: string): string { return new URL(path, `${apiBaseUrl}/`).toString() }
+function publicResourceUrl(appId: string, bucket: string, objectKey: string): string {
+  const path = [appId, bucket, ...objectKey.split('/')].map((segment) => encodeURIComponent(segment)).join('/')
+  return absoluteResourceUrl(`/${path}`)
+}
 function variantUrl(baseUrl: string, params: VariantParams): string {
   const url = new URL(baseUrl)
   url.searchParams.set('w', String(params.width))
@@ -495,8 +512,25 @@ const backendApi: Api = {
   async getObject(mediaId) { const { buckets, media } = await backendObjectById(mediaId); return objectFromMedia(media, new Map(buckets.map((bucket) => [bucket.id, bucket]))) },
   async updateObject(mediaId, revision, input) { const { appId, bucket, media } = await backendObjectById(mediaId); await backendData(backendClient.PATCH('/{app_id}/{bucket}/{object_key}', { params: { path: { app_id: appId, bucket: bucket.name, object_key: media.object_key }, header: { 'If-Match': `"${revision}"` } }, body: { display_name: input.displayName, visibility: input.visibility, ttl_seconds: input.ttlSeconds, metadata: metadataForBackend(input.metadata) } })) },
   async deleteObject(mediaId) { const { appId, bucket, media } = await backendObjectById(mediaId); await backendOk(backendClient.DELETE('/{app_id}/{bucket}/{object_key}', { params: { path: { app_id: appId, bucket: bucket.name, object_key: media.object_key } } })) },
-  async getSignedUrl(mediaId) { const { appId, bucket, media } = await backendObjectById(mediaId); const value = await backendData(backendClient.POST('/{app_id}/{bucket}/{object_key}', { params: { path: { app_id: appId, bucket: bucket.name, object_key: media.object_key } } })); return { url: absoluteResourceUrl(value.url), expiresAt: value.expires_at } },
-  async getVariantUrl(mediaId, params) { const signed = await backendApi.getSignedUrl(mediaId); return { ...signed, url: variantUrl(signed.url, params) } },
+  async getSignedUrl(mediaId) { return signedObjectUrl(await backendObjectById(mediaId)) },
+  async getPublicUrl(mediaId) {
+    const { appId, bucket, media } = await backendObjectById(mediaId)
+    const visibility = media.visibility ?? bucket.visibility
+    if (visibility !== 'public') throw new ApiRequestError(403, 'private_object', '私有对象没有公开访问链接')
+    return { url: publicResourceUrl(appId, bucket.name, media.object_key), expiresAt: '' }
+  },
+  async getVariantUrl(mediaId, params) {
+    const object = await backendObjectById(mediaId)
+    const visibility = object.media.visibility ?? object.bucket.visibility
+    const base = visibility === 'public'
+      ? { url: publicResourceUrl(object.appId, object.bucket.name, object.media.object_key), expiresAt: '' }
+      : await signedObjectUrl(object)
+    return { ...base, url: variantUrl(base.url, params) }
+  },
+  async createShortLink(targetUrl) {
+    const value = await backendData(backendClient.POST('/api/v1/short-links', { body: { target_url: targetUrl } }))
+    return { code: value.code, url: absoluteResourceUrl(value.url), targetUrl: value.target_url }
+  },
   async executeBatch(mediaIds, action) {
     const payload = await backendData(backendClient.POST('/api/v1/media/batch', { params: { header: { 'Idempotency-Key': crypto.randomUUID() } }, body: { action, media_ids: mediaIds } }))
     if ('job' in payload) return { mode: 'job', job: jobFromBackend(payload) }

@@ -34,6 +34,8 @@ import {
   Eye,
   KeyRound,
   LayoutDashboard,
+  Link,
+  Link2,
   LoaderCircle,
   LogOut,
   Mail,
@@ -1000,6 +1002,43 @@ export function ObjectPagination({ currentPage, fetching, hasNext, hasPrevious, 
   return <footer data-testid="object-pagination" className="flex shrink-0 flex-col gap-3 border-t border-separator bg-default-soft px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-muted">本页 {itemCount} 项</p><div className="flex flex-wrap items-center gap-3"><label className="flex items-center gap-2 text-xs text-muted"><span>每页</span><SelectControl aria-label="每页数量" className="w-20" value={String(pageSize)} options={[{ value: '25', label: '25' }, { value: '50', label: '50' }, { value: '100', label: '100' }]} onChange={(next) => onPageSizeChange(Number(next))} /></label><div className="flex h-9 items-center overflow-hidden rounded-md border border-separator bg-surface"><Button variant="ghost" isIconOnly size="sm" className="rounded-none" aria-label="上一页" isDisabled={!hasPrevious || fetching} onClick={onPrevious}><ChevronLeft className="h-4 w-4" /></Button><span className="min-w-20 border-x border-separator px-3 text-center text-xs font-medium tabular-nums">第 {currentPage} 页</span><Button variant="ghost" isIconOnly size="sm" className="rounded-none" aria-label="下一页" isDisabled={!hasNext || fetching} onClick={onNext}>{fetching ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <ChevronRight className="h-4 w-4" />}</Button></div></div></footer>
 }
 
+export function ObjectRowActions({ item, deleting, onPreview, onEdit, onDelete }: { item: ObjectItem; deleting: boolean; onPreview: () => void; onEdit: () => void; onDelete: () => void }) {
+  const publicObject = item.visibility === '公开'
+  const [copied, setCopied] = useState<'normal' | 'short' | null>(null)
+  const [copyError, setCopyError] = useState<string | null>(null)
+  const copyUrl = async (kind: 'normal' | 'short', url: string) => {
+    try {
+      await navigator.clipboard.writeText(url)
+      setCopied(kind)
+      setCopyError(null)
+      window.setTimeout(() => setCopied((current) => current === kind ? null : current), 1500)
+    } catch (error) {
+      setCopyError(errorMessage(error))
+    }
+  }
+  const normalLink = useMutation({
+    mutationFn: () => publicObject ? api.getPublicUrl(item.id) : api.getSignedUrl(item.id),
+    onSuccess: (value) => { void copyUrl('normal', value.url) },
+    onError: (error) => setCopyError(errorMessage(error)),
+  })
+  const shortLink = useMutation({
+    mutationFn: async () => {
+      const publicLink = await api.getPublicUrl(item.id)
+      return api.createShortLink(publicLink.url)
+    },
+    onSuccess: (value) => { void copyUrl('short', value.url) },
+    onError: (error) => setCopyError(errorMessage(error)),
+  })
+  return <div className="flex items-center justify-end gap-1" role="group" aria-label={`${item.name} 操作`}>
+    <Button isIconOnly size="sm" variant="ghost" aria-label={`预览 ${item.name}`} onClick={onPreview}><Eye className="size-4" /></Button>
+    <span title={publicObject ? '复制公开链接' : '复制短期访问链接'} className="inline-flex"><Button isIconOnly size="sm" variant="ghost" aria-label={`复制 ${item.name} 普通链接`} isDisabled={normalLink.isPending} onClick={() => normalLink.mutate()}>{normalLink.isPending ? <LoaderCircle className="size-4 animate-spin" /> : copied === 'normal' ? <Check className="size-4" /> : <Link className="size-4" />}</Button></span>
+    <span title={publicObject ? '复制短链' : '私有对象不能创建短链'} className="inline-flex"><Button isIconOnly size="sm" variant="ghost" aria-label={`复制 ${item.name} 短链`} isDisabled={!publicObject || shortLink.isPending} onClick={() => shortLink.mutate()}>{shortLink.isPending ? <LoaderCircle className="size-4 animate-spin" /> : copied === 'short' ? <Check className="size-4" /> : <Link2 className="size-4" />}</Button></span>
+    <Button isIconOnly size="sm" variant="ghost" aria-label={`编辑 ${item.name}`} onClick={onEdit}><Pencil className="size-4" /></Button>
+    <Button isIconOnly size="sm" variant="ghost" className="text-danger" aria-label={`删除 ${item.name}`} isDisabled={deleting} onClick={onDelete}>{deleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}</Button>
+    {copyError && <span className="sr-only" role="alert">{copyError}</span>}
+  </div>
+}
+
 function ObjectTable({ items, prefixes, currentPrefix, directoryMode, bucket, appId, selectedIds, deletingId, navigationState, onOpenFolder, onSelectionChange, onPreview, onEdit, onDelete }: { items: ObjectItem[]; prefixes: string[]; currentPrefix: string; directoryMode: boolean; bucket: string; appId: string; selectedIds: string[]; deletingId?: string; navigationState: ObjectListNavigationState; onOpenFolder: (prefix: string) => void; onSelectionChange: (ids: string[]) => void; onPreview: (item: ObjectItem) => void; onEdit: (item: ObjectItem) => void; onDelete: (item: ObjectItem) => void }) {
   const selected = new Set(selectedIds)
   const allSelected = items.length > 0 && items.every((item) => selected.has(item.id))
@@ -1007,15 +1046,11 @@ function ObjectTable({ items, prefixes, currentPrefix, directoryMode, bucket, ap
   const toggle = (id: string) => onSelectionChange(selected.has(id) ? selectedIds.filter((value) => value !== id) : [...selectedIds, id])
   const checkbox = (label: string, checked: boolean, onChange: () => void) => <Checkbox aria-label={label} isSelected={checked} onChange={onChange}><Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control></Checkbox.Content></Checkbox>
   const folderName = (prefix: string) => prefix.slice(currentPrefix.length).replace(/\/$/, '') || prefix.replace(/\/$/, '')
-  const actions = (item: ObjectItem) => <div className="flex items-center justify-end gap-1">
-    <Button isIconOnly size="sm" variant="ghost" aria-label={`预览 ${item.name}`} onClick={() => onPreview(item)}><Eye className="size-4" /></Button>
-    <Button isIconOnly size="sm" variant="ghost" aria-label={`编辑 ${item.name}`} onClick={() => onEdit(item)}><Pencil className="size-4" /></Button>
-    <Button isIconOnly size="sm" variant="ghost" className="text-danger" aria-label={`删除 ${item.name}`} isDisabled={deletingId === item.id} onClick={() => onDelete(item)}>{deletingId === item.id ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}</Button>
-  </div>
+  const actions = (item: ObjectItem) => <ObjectRowActions item={item} deleting={deletingId === item.id} onPreview={() => onPreview(item)} onEdit={() => onEdit(item)} onDelete={() => onDelete(item)} />
   return <>
     <div data-testid="object-table-scroll" className="hidden h-full overflow-auto overscroll-contain md:block">
       <table className="w-full min-w-[1080px]">
-        <thead data-testid="object-table-head" className="sticky top-0 z-10"><tr className="table-head"><th className="w-12 px-4 py-3">{checkbox('选择当前结果', allSelected, toggleAll)}</th><th className="px-5 py-3">对象</th><th className="px-5 py-3">Bucket</th><th className="px-5 py-3">类型</th><th className="px-5 py-3">大小</th><th className="px-5 py-3">创建时间</th><th className="px-5 py-3">状态</th><th className="px-5 py-3">可见性</th><th aria-label="操作" className="w-32 px-3 py-3" /></tr></thead>
+        <thead data-testid="object-table-head" className="sticky top-0 z-10"><tr className="table-head"><th className="w-12 px-4 py-3">{checkbox('选择当前结果', allSelected, toggleAll)}</th><th className="px-5 py-3">对象</th><th className="px-5 py-3">Bucket</th><th className="px-5 py-3">类型</th><th className="px-5 py-3">大小</th><th className="px-5 py-3">创建时间</th><th className="px-5 py-3">状态</th><th className="px-5 py-3">可见性</th><th aria-label="操作" className="w-48 px-3 py-3" /></tr></thead>
         <tbody>{directoryMode && prefixes.map((prefix) => <tr key={`folder:${prefix}`} data-testid="object-folder-row" className="border-b border-separator text-sm transition-colors last:border-0 hover:bg-default-soft" onDoubleClick={() => onOpenFolder(prefix)}>
           <td className="px-4 py-3" />
           <td className="px-5 py-3"><button type="button" aria-label={`打开文件夹 ${folderName(prefix)}`} className="flex min-w-0 items-center gap-3 text-left" onClick={() => onOpenFolder(prefix)}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-[#fff7d6] text-[#a16207]"><FolderOpen className="h-4 w-4" /></span><span className="min-w-0"><span className="block truncate font-medium text-foreground hover:text-accent">{folderName(prefix)}</span><span className="mt-0.5 block max-w-[260px] truncate text-xs text-muted">{prefix}</span></span></button></td>
@@ -1122,12 +1157,15 @@ function ImageVariantToolbar({ mode, params, pending, valid, failed, onModeChang
 
 export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: ObjectItem; variant?: VariantParams; onClose: () => void; onEdit?: () => void }) {
   const rasterImage = isRasterImageMimeType(item.type)
+  const publicObject = item.visibility === '公开'
   const [imageMode, setImageMode] = useState<ImagePreviewMode>(variant ? 'variant' : 'original')
   const [variantParams, setVariantParams] = useState<VariantParams>(() => ({ ...(variant ?? DEFAULT_VARIANT_PARAMS) }))
   const [debouncedVariant, setDebouncedVariant] = useState<VariantParams | null>(null)
   const [loadedVariant, setLoadedVariant] = useState<LoadedVariant | null>(null)
   const [variantImageError, setVariantImageError] = useState<string | null>(null)
   const [variantImageAttempt, setVariantImageAttempt] = useState(0)
+  const [copiedLink, setCopiedLink] = useState<'public' | 'short' | null>(null)
+  const [copyError, setCopyError] = useState<string | null>(null)
   const variantValid = isValidVariantParams(variantParams)
   const variantParamsKey = JSON.stringify(variantParams)
   const debouncedVariantKey = debouncedVariant ? JSON.stringify(debouncedVariant) : ''
@@ -1142,8 +1180,8 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
   }, [imageMode, rasterImage, variantParamsKey, variantValid])
 
   const originalPreview = useQuery({
-    queryKey: ['objects', item.id, 'signed-preview', 'original'],
-    queryFn: () => api.getSignedUrl(item.id),
+    queryKey: ['objects', item.id, publicObject ? 'public-preview' : 'signed-preview', 'original'],
+    queryFn: () => publicObject ? api.getPublicUrl(item.id) : api.getSignedUrl(item.id),
     staleTime: 4 * 60_000,
     retry: false,
   })
@@ -1177,6 +1215,22 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
     setVariantImageAttempt((attempt) => attempt + 1)
     void variantPreview.refetch()
   }
+  const copyLink = async (kind: 'public' | 'short', url: string) => {
+    try {
+      await navigator.clipboard.writeText(url)
+      setCopiedLink(kind)
+      setCopyError(null)
+      window.setTimeout(() => setCopiedLink((current) => current === kind ? null : current), 1500)
+    } catch {
+      setCopyError('复制失败，请检查浏览器剪贴板权限')
+    }
+  }
+  const shortLink = useMutation({
+    mutationFn: (targetUrl: string) => api.createShortLink(targetUrl),
+    onSuccess: (value) => { void copyLink('short', value.url) },
+    onError: (error) => setCopyError(errorMessage(error)),
+  })
+  const publicUrl = publicObject ? originalPreview.data?.url : undefined
 
   const loading = <div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载对象预览" color="accent" /><span>正在加载预览</span></div>
   const originalError = <div className="max-w-md px-6 text-center"><AlertCircle className="mx-auto size-8 text-danger" /><p className="mt-3 text-sm font-medium text-white">预览加载失败</p><p className="mt-1 text-xs leading-5 text-white/50">{errorMessage(originalPreview.error)}</p><Button variant="secondary" className="mt-4" onClick={() => originalPreview.refetch()}><RefreshCw className="size-4" />重试</Button></div>
@@ -1206,7 +1260,14 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
       <aside className="flex min-h-0 min-w-0 flex-col border-t border-separator bg-surface lg:border-l lg:border-t-0">
         <div className="border-b border-separator p-5"><div className="flex items-start gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-md bg-[#eff6ff] text-[#2563eb]"><FileImage className="size-5" /></span><div className="min-w-0"><h2 className="break-words text-sm font-semibold text-foreground">{item.name}</h2><code className="mt-1 block break-all text-[10px] leading-4 text-muted">{item.key}</code></div></div><div className="mt-4 flex flex-wrap gap-2"><Badge tone={item.status === 'active' ? 'positive' : 'warning'}>{item.status}</Badge><Badge tone={item.visibility === '公开' ? 'positive' : 'neutral'}>{item.visibility}</Badge></div></div>
         <dl data-testid="object-preview-details" className="min-h-0 flex-1 space-y-3 overflow-y-auto p-5 text-sm"><Detail label="Bucket" value={item.bucket} /><Detail label="内容类型" value={currentVariant ? `image/${currentVariant.params.format}` : item.type} /><Detail label="大小" value={formatBytes(item.size)} />{rasterImage && <Detail label="预览模式" value={imageMode === 'variant' ? 'Variant' : '原图'} />}{rasterImage && imageMode === 'variant' && <Detail label="Variant 参数" value={`${variantParams.width} × ${variantParams.height} · ${variantParams.fit} · ${variantParams.format} · Q${variantParams.quality} · Blur ${variantParams.blur}`} />}<Detail label="创建时间" value={formatDateTime(item.createdAt)} /><Detail label="Revision" value={String(item.revision)} /><Detail label="SHA-256" value={item.sha256} mono /></dl>
-        <div data-testid="object-preview-actions" className="grid shrink-0 grid-cols-2 gap-2 border-t border-separator p-4">{onEdit && <Button variant="secondary" className={cn('w-full', !currentUrl && 'col-span-2')} onClick={onEdit}><Pencil className="size-4" />编辑对象</Button>}{currentUrl && <a className={buttonVariants({ variant: 'primary', className: cn('inline-flex w-full items-center justify-center gap-2', !onEdit && 'col-span-2') })} href={currentUrl} target="_blank" rel="noreferrer">在新窗口打开<ArrowRight className="size-4" /></a>}{currentExpiresAt && <p className="col-span-2 pt-1 text-center text-[10px] text-muted">链接有效至 {formatDateTime(currentExpiresAt)}</p>}</div>
+        <div data-testid="object-preview-actions" className="grid shrink-0 grid-cols-2 gap-2 border-t border-separator p-4">
+          {onEdit && <Button variant="secondary" className={cn('w-full', !currentUrl && 'col-span-2')} onClick={onEdit}><Pencil className="size-4" />编辑对象</Button>}
+          {currentUrl && <a className={buttonVariants({ variant: 'primary', className: cn('inline-flex w-full items-center justify-center gap-2', !onEdit && 'col-span-2') })} href={currentUrl} target="_blank" rel="noreferrer">在新窗口打开<ArrowRight className="size-4" /></a>}
+          {publicUrl && <Button variant="secondary" className="w-full" aria-label="复制公开链接" onClick={() => void copyLink('public', publicUrl)}>{copiedLink === 'public' ? <Check className="size-4" /> : <Copy className="size-4" />}复制公开链接</Button>}
+          {publicUrl && <Button variant="secondary" className="w-full" aria-label="复制短链" isDisabled={shortLink.isPending} onClick={() => shortLink.mutate(publicUrl)}>{copiedLink === 'short' ? <Check className="size-4" /> : <Copy className="size-4" />}复制短链</Button>}
+          {copyError && <p className="col-span-2 text-xs text-danger" role="alert">{copyError}</p>}
+          {currentExpiresAt && <p className="col-span-2 pt-1 text-center text-[10px] text-muted">链接有效至 {formatDateTime(currentExpiresAt)}</p>}
+        </div>
       </aside>
     </div>
   </Modal>

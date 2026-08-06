@@ -9,9 +9,12 @@ mod idempotency;
 mod media;
 mod outbox;
 mod s3_multipart;
+mod short_links;
 mod upload_session;
 mod variant;
 mod webhook;
+
+pub use short_links::ShortLinkRecord;
 
 use std::time::Duration;
 

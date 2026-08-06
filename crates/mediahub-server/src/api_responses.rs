@@ -462,6 +462,15 @@ struct SignedMediaUrlResponse {
 }
 
 #[derive(Serialize)]
+struct ShortLinkResponse {
+    code: String,
+    url: String,
+    target_url: String,
+    expires_at: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
 struct CreateUploadSessionResponse {
     upload_id: String,
     media_id: String,

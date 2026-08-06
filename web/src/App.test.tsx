@@ -1,5 +1,6 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useState } from 'react'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -13,12 +14,13 @@ import {
   directoryBreadcrumbs,
   normalizeDirectoryPrefix,
   normalizeUploadPath,
+  ObjectRowActions,
   objectListRefetchInterval,
   removeObjectIdsFromPages,
   uploadObjectKeyValidationError,
   uploadPathValidationError,
 } from './App'
-import type { ObjectItem } from './api'
+import { api, type ObjectItem } from './api'
 
 afterEach(() => {
   cleanup()
@@ -90,6 +92,36 @@ describe('console helpers and standalone controls', () => {
       [OBJECT.id],
     )
     expect(filtered?.pages[0]?.items).toEqual([])
+  })
+
+  it('为公开对象复制无 token 原链和短链，并保留私有对象签名链接', async () => {
+    const user = userEvent.setup()
+    const clipboard = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: clipboard } })
+    const publicUrl = 'https://media.example.test/app_test/images/sample.png'
+    vi.spyOn(api, 'getPublicUrl').mockResolvedValue({ url: publicUrl, expiresAt: '' })
+    vi.spyOn(api, 'createShortLink').mockResolvedValue({ code: 'sample', url: 'https://media.example.test/s/sample', targetUrl: '/app_test/images/sample.png' })
+    const queryClient = new QueryClient()
+    render(<QueryClientProvider client={queryClient}><ObjectRowActions item={{ ...OBJECT, visibility: '公开' }} deleting={false} onPreview={vi.fn()} onEdit={vi.fn()} onDelete={vi.fn()} /></QueryClientProvider>)
+
+    await user.click(screen.getByRole('button', { name: '复制 sample.png 普通链接' }))
+    await waitFor(() => expect(clipboard).toHaveBeenCalledWith(publicUrl))
+    await user.click(screen.getByRole('button', { name: '复制 sample.png 短链' }))
+    await waitFor(() => expect(clipboard).toHaveBeenCalledWith('https://media.example.test/s/sample'))
+  })
+
+  it('私有对象普通链接使用签名 URL，短链按钮保持禁用', async () => {
+    const user = userEvent.setup()
+    const clipboard = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: clipboard } })
+    const signedUrl = 'https://media.example.test/app_test/images/sample.png?token=secret'
+    vi.spyOn(api, 'getSignedUrl').mockResolvedValue({ url: signedUrl, expiresAt: '2026-07-19T01:00:00.000Z' })
+    const queryClient = new QueryClient()
+    render(<QueryClientProvider client={queryClient}><ObjectRowActions item={OBJECT} deleting={false} onPreview={vi.fn()} onEdit={vi.fn()} onDelete={vi.fn()} /></QueryClientProvider>)
+
+    await user.click(screen.getByRole('button', { name: '复制 sample.png 普通链接' }))
+    await waitFor(() => expect(clipboard).toHaveBeenCalledWith(signedUrl))
+    expect(screen.getByRole('button', { name: '复制 sample.png 短链' })).toBeDisabled()
   })
 
   it('submits the selected access-key permissions', async () => {

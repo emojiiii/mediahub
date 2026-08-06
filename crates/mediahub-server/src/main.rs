@@ -322,6 +322,7 @@ include!("media_http.rs");
 include!("handlers_webhooks.rs");
 include!("handlers_path.rs");
 include!("handlers_media.rs");
+include!("short_links.rs");
 include!("handlers_admin_auth.rs");
 include!("http.rs");
 

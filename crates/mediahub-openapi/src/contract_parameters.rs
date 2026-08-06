@@ -65,6 +65,7 @@ const PARAMETERS: &[ParameterContract] = &[
     parameter!("ObjectKey", "object_key", Path, true, String),
     parameter!("AccessKeyId", "access_key_id", Path, true, String),
     parameter!("SessionId", "session_id", Path, true, String),
+    parameter!("ShortCode", "code", Path, true, String),
     parameter!("WebhookId", "webhook_id", Path, true, String),
     parameter!("UploadSessionId", "upload_session_id", Path, true, Uuid),
     parameter!("UserId", "user_id", Path, true, Uuid),
@@ -153,6 +154,11 @@ pub fn parameters() -> Value {
                 if parameter.component == "ContentLength" {
                     schema["minimum"] = json!(1);
                     schema["maximum"] = json!(2_147_483_648_u64);
+                }
+                if parameter.component == "ShortCode" {
+                    schema["minLength"] = json!(8);
+                    schema["maxLength"] = json!(32);
+                    schema["pattern"] = json!("^[A-Za-z0-9_-]+$");
                 }
                 (
                     parameter.component.into(),

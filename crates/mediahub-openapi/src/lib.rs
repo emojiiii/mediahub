@@ -43,6 +43,7 @@ use utoipa::OpenApi;
         dto::CreateAccessKeyResponse,
         dto::CreateApplication,
         dto::CreateBucket,
+        dto::CreateShortLink,
         dto::CreateUploadSession,
         dto::CreateUploadSessionResponse,
         dto::CreateWebhook,
@@ -61,6 +62,7 @@ use utoipa::OpenApi;
         dto::ResendVerificationResponse,
         dto::ResetPassword,
         dto::Session,
+        dto::ShortLink,
         dto::SignedMediaUrl,
         dto::UpdateAccessKey,
         dto::UpdateApplication,
@@ -112,10 +114,10 @@ mod tests {
         let paths = document["paths"]
             .as_object()
             .ok_or_else(|| anyhow!("paths must be an object"))?;
-        ensure!(paths.len() == 44, "expected 44 paths, got {}", paths.len());
+        ensure!(paths.len() == 46, "expected 46 paths, got {}", paths.len());
         ensure!(
-            contract::OPERATION_COUNT == 67,
-            "expected 67 operations, got {}",
+            contract::OPERATION_COUNT == 69,
+            "expected 69 operations, got {}",
             contract::OPERATION_COUNT
         );
         ensure!(
@@ -189,7 +191,7 @@ mod tests {
                 }
             }
         }
-        ensure!(operations == 67, "expected 67 operations, got {operations}");
+        ensure!(operations == 69, "expected 69 operations, got {operations}");
         Ok(())
     }
 

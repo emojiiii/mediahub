@@ -45,19 +45,21 @@ const sqliteWasmAsset = findAsset(/^sql-wasm-.*\.wasm$/, 'sql.js WASM')
 const spreadsheetPluginAsset = findAsset(/^SpreadsheetPreviewPlugin-.*\.js$/, 'spreadsheet preview plugin')
 const spreadsheetWorkerAsset = findAsset(/^spreadsheet\.worker-.*\.js$/, 'spreadsheet Worker')
 const pdfWorkerAsset = findAsset(/^pdf\.worker-.*\.mjs$/, 'PDF.js Worker')
+const docxPreviewAsset = findAsset(/^docx-preview-.*\.js$/, 'DOCX renderer')
 const heavyFormatAssets = [
   findAsset(/^xlsx-.*\.js$/, 'SheetJS parser'),
   findAsset(/^pdf-.*\.js$/, 'PDF.js parser'),
   findAsset(/^three\.module-.*\.js$/, 'Three.js runtime'),
   findAsset(/^aiden0z-pptx-renderer\.es-.*\.js$/, 'PPTX renderer'),
   findAsset(/^heic2any-.*\.js$/, 'HEIC converter'),
-  findAsset(/^docx-preview-.*\.js$/, 'DOCX renderer'),
+  docxPreviewAsset,
   findAsset(/^prism-typescript-.*\.js$/, 'TypeScript grammar'),
 ]
 
-const [main, objectViewer, archivePlugin, archiveWorker, sevenZip, sqlitePlugin, sqliteWorker, spreadsheetPlugin, spreadsheetWorker] = await Promise.all([
+const [main, objectViewer, docxPreview, archivePlugin, archiveWorker, sevenZip, sqlitePlugin, sqliteWorker, spreadsheetPlugin, spreadsheetWorker] = await Promise.all([
   readFile(path.join(assetsRoot, mainAsset), 'utf8'),
   readFile(path.join(assetsRoot, objectViewerAsset), 'utf8'),
+  readFile(path.join(assetsRoot, docxPreviewAsset), 'utf8'),
   readFile(path.join(assetsRoot, archivePluginAsset), 'utf8'),
   readFile(path.join(assetsRoot, archiveWorkerAsset), 'utf8'),
   readFile(path.join(assetsRoot, sevenZipAsset), 'utf8'),
@@ -94,6 +96,10 @@ for (const asset of deepViewerAssets) {
 
 requireReference(objectViewer, archivePluginAsset, objectViewerAsset)
 requireReference(objectViewer, pdfWorkerAsset, objectViewerAsset)
+// docx-preview must not import an ObjectFileViewer export. Rolldown can split
+// their shared CommonJS helper across both chunks, which creates a circular
+// initialization and fails at runtime as "t is not a function".
+forbidStaticImport(docxPreview, objectViewerAsset, docxPreviewAsset)
 for (const asset of heavyFormatAssets) requireReference(objectViewer, asset, objectViewerAsset)
 forbidReference(objectViewer, archiveWorkerAsset, objectViewerAsset)
 forbidReference(objectViewer, archiveWasmAsset, objectViewerAsset)

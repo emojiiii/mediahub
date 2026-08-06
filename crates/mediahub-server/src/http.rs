@@ -84,6 +84,7 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
         )
         .route("/api/v1/media", get(list_media).post(upload_media))
         .route("/api/v1/media/batch", post(batch_media))
+        .route("/api/v1/short-links", post(create_short_link))
         .route(
             "/api/v1/jobs/{job_id}",
             get(get_async_job).delete(cancel_async_job),
@@ -117,6 +118,7 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
                 .post(s3_http::s3_bucket_post)
                 .layer(DefaultBodyLimit::max(MAX_S3_CONTROL_REQUEST_BYTES)),
         )
+        .route("/s/{code}", get(redirect_short_link))
         .route("/{app_id}", get(list_path_buckets))
         .route(
             "/{app_id}/{bucket}",

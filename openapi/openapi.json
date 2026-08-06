@@ -244,6 +244,17 @@
           "type": "string"
         }
       },
+      "ShortCode": {
+        "in": "path",
+        "name": "code",
+        "required": true,
+        "schema": {
+          "maxLength": 32,
+          "minLength": 8,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        }
+      },
       "UploadSessionId": {
         "in": "path",
         "name": "upload_session_id",
@@ -1588,6 +1599,18 @@
         ],
         "type": "object"
       },
+      "CreateShortLink": {
+        "additionalProperties": false,
+        "properties": {
+          "target_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_url"
+        ],
+        "type": "object"
+      },
       "CreateUploadSession": {
         "additionalProperties": false,
         "properties": {
@@ -2176,6 +2199,36 @@
           "last_seen_at",
           "created_at",
           "is_current"
+        ],
+        "type": "object"
+      },
+      "ShortLink": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_url": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "url",
+          "target_url",
+          "created_at"
         ],
         "type": "object"
       },
@@ -4327,6 +4380,65 @@
         "summary": "Run or schedule a media batch operation"
       }
     },
+    "/api/v1/short-links": {
+      "post": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ApplicationContext"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateShortLink"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShortLink"
+                }
+              }
+            },
+            "description": "Resource created"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "CsrfToken": [],
+            "SessionCookie": []
+          },
+          {
+            "HmacAccessKey": []
+          }
+        ],
+        "summary": "Create a short link for a public object"
+      }
+    },
     "/api/v1/uploads": {
       "post": {
         "parameters": [
@@ -4940,6 +5052,28 @@
           }
         ],
         "summary": "Read Prometheus deployment metrics"
+      }
+    },
+    "/s/{code}": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ShortCode"
+          }
+        ],
+        "responses": {
+          "307": {
+            "description": "Response"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [],
+        "summary": "Redirect a public short link"
       }
     },
     "/{app_id}": {

@@ -1779,6 +1779,7 @@ dependencies = [
  "mime_guess",
  "object_store",
  "password-hash",
+ "percent-encoding",
  "quick-xml",
  "rand",
  "reqwest",
