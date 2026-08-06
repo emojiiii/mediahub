@@ -20,6 +20,7 @@ use utoipa::OpenApi;
         dto::AdminJob,
         dto::AdminSettings,
         dto::AdminStorage,
+        dto::AdminSystemVersion,
         dto::AdminUpdateUserStatus,
         dto::AdminUpdateSettings,
         dto::AdminUser,
@@ -64,6 +65,9 @@ use utoipa::OpenApi;
         dto::Session,
         dto::ShortLink,
         dto::SignedMediaUrl,
+        dto::SystemLatestBuild,
+        dto::SystemUpdateOperation,
+        dto::SystemUpdatePhase,
         dto::UpdateAccessKey,
         dto::UpdateApplication,
         dto::UpdateBucket,
@@ -114,10 +118,10 @@ mod tests {
         let paths = document["paths"]
             .as_object()
             .ok_or_else(|| anyhow!("paths must be an object"))?;
-        ensure!(paths.len() == 46, "expected 46 paths, got {}", paths.len());
+        ensure!(paths.len() == 48, "expected 48 paths, got {}", paths.len());
         ensure!(
-            contract::OPERATION_COUNT == 69,
-            "expected 69 operations, got {}",
+            contract::OPERATION_COUNT == 71,
+            "expected 71 operations, got {}",
             contract::OPERATION_COUNT
         );
         ensure!(
@@ -132,6 +136,11 @@ mod tests {
             paths["/api/v1/admin/settings"]["get"].is_object()
                 && paths["/api/v1/admin/settings"]["patch"].is_object(),
             "Admin settings operations are missing"
+        );
+        ensure!(
+            paths["/api/v1/admin/system/version"]["get"].is_object()
+                && paths["/api/v1/admin/system/update"]["post"].is_object(),
+            "Admin system update operations are missing"
         );
         ensure!(
             paths["/api/v1/admin/applications/{application_id}/quota"]["patch"].is_object(),
@@ -191,7 +200,7 @@ mod tests {
                 }
             }
         }
-        ensure!(operations == 69, "expected 69 operations, got {operations}");
+        ensure!(operations == 71, "expected 71 operations, got {operations}");
         Ok(())
     }
 
@@ -235,10 +244,12 @@ mod tests {
                     "AdminJob",
                     "AdminSettings",
                     "AdminStorage",
+                    "AdminSystemVersion",
                     "AdminUpdateApplicationQuota",
                     "AdminUpdateSettings",
                     "AdminUpdateUserStatus",
                     "AdminUser",
+                    "SystemUpdateOperation",
                 ],
             ),
             (

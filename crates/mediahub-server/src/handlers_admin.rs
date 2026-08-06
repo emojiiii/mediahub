@@ -143,6 +143,79 @@ async fn admin_settings(
     Ok(Json(AdminSettingsResponse::from(settings)))
 }
 
+async fn admin_system_version(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AdminSystemVersionQuery>,
+) -> Result<Json<SystemVersionInfo>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(state.system_update.status(query.force).await))
+}
+
+async fn admin_system_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request_id: Extension<RequestId>,
+) -> Result<(StatusCode, Json<UpdateOperation>), ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    verify_csrf(&state, &headers).await?;
+    let operation = state
+        .system_update
+        .trigger_update()
+        .await
+        .map_err(|error| match error {
+            UpdateTriggerError::Disabled => {
+                ApiError::bad_request("automatic updates are not configured")
+            }
+            UpdateTriggerError::InProgress => {
+                ApiError::conflict("a system update is already in progress")
+            }
+        })?;
+    record_admin_update_audit(&state, admin.id, &request_id.0.0, &operation).await;
+    Ok((StatusCode::ACCEPTED, Json(operation)))
+}
+
+async fn record_admin_update_audit(
+    state: &AppState,
+    admin_id: UserId,
+    request_id: &str,
+    operation: &UpdateOperation,
+) {
+    match state
+        .repository
+        .default_application_for_user(admin_id)
+        .await
+    {
+        Ok(Some(application)) => {
+            record_session_audit(
+                state,
+                admin_id,
+                request_id,
+                SessionAudit {
+                    application_id: application.id,
+                    action: "system.update.requested",
+                    target_type: "system_update",
+                    target_id: operation
+                        .operation_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    summary: serde_json::json!({
+                        "from_version": operation.from_version,
+                        "target_version": operation.target_version,
+                    }),
+                },
+            )
+            .await;
+        }
+        Ok(None) => {
+            warn!(%admin_id, "system update audit skipped because the Admin has no Application");
+        }
+        Err(error) => {
+            warn!(%admin_id, %error, "system update audit Application lookup failed");
+        }
+    }
+}
+
 async fn admin_update_settings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

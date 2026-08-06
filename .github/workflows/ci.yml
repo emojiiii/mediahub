@@ -91,6 +91,10 @@ jobs:
           tags: |
             type=raw,value=master,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
+      - name: Generate build metadata
+        id: build
+        shell: bash
+        run: echo "version=prod-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
       - name: Build and publish image
         uses: docker/build-push-action@v7.3.0
         with:
@@ -99,6 +103,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MEDIAHUB_BUILD_VERSION=${{ steps.build.outputs.version }}
+            MEDIAHUB_BUILD_REVISION=${{ github.sha }}
+            MEDIAHUB_UPDATE_CHANNEL=prod
           cache-from: |
             type=gha,scope=mediahub-container-${{ github.ref_name }}
             type=gha,scope=mediahub-container-master

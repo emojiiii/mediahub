@@ -229,6 +229,54 @@ pub struct AdminUpdateSettings {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemUpdatePhase {
+    Idle,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SystemUpdateOperation {
+    #[schema(inline)]
+    pub phase: SystemUpdatePhase,
+    pub operation_id: Option<String>,
+    pub from_version: Option<String>,
+    pub target_version: Option<String>,
+    #[schema(format = DateTime)]
+    pub started_at: Option<String>,
+    #[schema(format = DateTime)]
+    pub completed_at: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SystemLatestBuild {
+    pub version: String,
+    pub revision: String,
+    pub source_url: String,
+    #[schema(format = DateTime)]
+    pub published_at: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSystemVersion {
+    pub current_version: String,
+    pub current_revision: Option<String>,
+    pub channel: String,
+    pub current_source_url: String,
+    pub latest_build: Option<SystemLatestBuild>,
+    pub has_update: Option<bool>,
+    pub update_enabled: bool,
+    pub warning: Option<String>,
+    pub operation: SystemUpdateOperation,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdminUpdateUserStatus {
     pub status: String,

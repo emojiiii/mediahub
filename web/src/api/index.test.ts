@@ -86,4 +86,54 @@ describe('MediaHub API facade', () => {
     await expect(shortLinkRequest?.clone().json()).resolves.toEqual({ target_url: publicLink.url })
     api.setApplication(undefined)
   })
+
+  it('checks and triggers system image updates through the admin API', async () => {
+    const operation = {
+      phase: 'running',
+      operation_id: 'update_123',
+      from_version: 'prod-aaaaaaaaaaaa',
+      target_version: 'prod-bbbbbbbbbbbb',
+      started_at: '2026-08-07T00:00:00Z',
+      completed_at: null,
+      message: '已提交镜像检查',
+    }
+    const fetchMock = vi.fn(async (request: Request) => {
+      const url = new URL(request.url)
+      if (request.method === 'GET' && url.pathname === '/api/v1/admin/system/version') {
+        return new Response(JSON.stringify({
+          current_version: 'prod-aaaaaaaaaaaa',
+          current_revision: 'aaaaaaaaaaaaaaaa',
+          channel: 'prod',
+          current_source_url: 'https://github.com/emojiiii/mediaHub/commit/aaaaaaaaaaaaaaaa',
+          latest_build: {
+            version: 'prod-bbbbbbbbbbbb',
+            revision: 'bbbbbbbbbbbbbbbb',
+            source_url: 'https://github.com/emojiiii/mediaHub/actions/runs/1',
+            published_at: '2026-08-07T00:00:00Z',
+          },
+          has_update: true,
+          update_enabled: true,
+          warning: null,
+          operation: { ...operation, phase: 'idle', operation_id: null, started_at: null, message: null },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (request.method === 'POST' && url.pathname === '/api/v1/admin/system/update') {
+        return new Response(JSON.stringify(operation), { status: 202, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(null, { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { api } = await import('./index')
+
+    const version = await api.getAdminSystemVersion(true)
+    expect(version.currentVersion).toBe('prod-aaaaaaaaaaaa')
+    expect(version.latestBuild?.version).toBe('prod-bbbbbbbbbbbb')
+    expect(version.operation.phase).toBe('idle')
+    const versionRequest = fetchMock.mock.calls[0][0]
+    expect(new URL(versionRequest.url).searchParams.get('force')).toBe('true')
+
+    const update = await api.triggerAdminSystemUpdate()
+    expect(update).toEqual(expect.objectContaining({ phase: 'running', operationId: 'update_123', targetVersion: 'prod-bbbbbbbbbbbb' }))
+    expect(fetchMock.mock.calls[1][0].method).toBe('POST')
+  })
 })

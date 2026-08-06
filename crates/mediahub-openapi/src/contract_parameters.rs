@@ -22,6 +22,7 @@ enum ParameterSchema {
     String,
     Uuid,
     Integer,
+    Boolean,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +73,7 @@ const PARAMETERS: &[ParameterContract] = &[
     parameter!("ApplicationId", "application_id", Path, true, Uuid),
     parameter!("EventId", "event_id", Path, true, String),
     parameter!("AdminLimit", "limit", Query, false, Integer),
+    parameter!("ForceVersionRefresh", "force", Query, false, Boolean),
     parameter!(
         "ApplicationContext",
         "X-MediaHub-App-Id",
@@ -110,6 +112,7 @@ pub fn parameters() -> Value {
                     ParameterSchema::String => json!({ "type": "string" }),
                     ParameterSchema::Uuid => json!({ "type": "string", "format": "uuid" }),
                     ParameterSchema::Integer => json!({ "type": "integer" }),
+                    ParameterSchema::Boolean => json!({ "type": "boolean" }),
                 };
                 if parameter.component == "Limit" {
                     schema["minimum"] = json!(1);

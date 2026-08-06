@@ -127,6 +127,14 @@
           "type": "string"
         }
       },
+      "ForceVersionRefresh": {
+        "in": "query",
+        "name": "force",
+        "required": false,
+        "schema": {
+          "type": "boolean"
+        }
+      },
       "IdempotencyKey": {
         "in": "header",
         "name": "Idempotency-Key",
@@ -783,6 +791,62 @@
           "variants",
           "disk_total_bytes",
           "disk_available_bytes"
+        ],
+        "type": "object"
+      },
+      "AdminSystemVersion": {
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "current_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_source_url": {
+            "type": "string"
+          },
+          "current_version": {
+            "type": "string"
+          },
+          "has_update": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "latest_build": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SystemLatestBuild"
+              }
+            ]
+          },
+          "operation": {
+            "$ref": "#/components/schemas/SystemUpdateOperation"
+          },
+          "update_enabled": {
+            "type": "boolean"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "current_version",
+          "channel",
+          "current_source_url",
+          "update_enabled",
+          "operation"
         ],
         "type": "object"
       },
@@ -2248,6 +2312,96 @@
         ],
         "type": "object"
       },
+      "SystemLatestBuild": {
+        "additionalProperties": false,
+        "properties": {
+          "published_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "revision",
+          "source_url",
+          "published_at"
+        ],
+        "type": "object"
+      },
+      "SystemUpdateOperation": {
+        "additionalProperties": false,
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "idle",
+              "running",
+              "completed",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "phase"
+        ],
+        "type": "object"
+      },
+      "SystemUpdatePhase": {
+        "enum": [
+          "idle",
+          "running",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
       "UpdateAccessKey": {
         "additionalProperties": false,
         "properties": {
@@ -3122,6 +3276,77 @@
           }
         ],
         "summary": "Read global storage totals"
+      }
+    },
+    "/api/v1/admin/system/update": {
+      "post": {
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemUpdateOperation"
+                }
+              }
+            },
+            "description": "Request accepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "security": [
+          {
+            "CsrfToken": [],
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Request a controlled container image update"
+      }
+    },
+    "/api/v1/admin/system/version": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ForceVersionRefresh"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSystemVersion"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Read the current build and update status"
       }
     },
     "/api/v1/admin/users": {

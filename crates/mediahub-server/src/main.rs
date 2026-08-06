@@ -87,11 +87,13 @@ mod s3_list;
 mod s3_multipart_storage;
 mod s3_xml;
 mod server_config;
+mod system_update;
 mod webdav;
 
 use email::{AuthEmailKind, ResendEmailProvider};
 use runtime_storage::RuntimeObjectStore;
 use server_config::{CookieConfig, ServerConfig, StorageBackend};
+use system_update::{SystemUpdateService, SystemVersionInfo, UpdateOperation, UpdateTriggerError};
 
 const SESSION_COOKIE: &str = "mediahub_session";
 const CSRF_COOKIE: &str = "mediahub_csrf";
@@ -278,6 +280,7 @@ struct AppState {
     variant_slots: Arc<tokio::sync::Semaphore>,
     http_metrics: HttpMetrics,
     metrics_bearer_token: Option<Arc<str>>,
+    system_update: SystemUpdateService,
 }
 
 #[derive(Clone, Default)]

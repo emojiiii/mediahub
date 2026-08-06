@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   AccessKeyEditor,
+  AdminSystemVersionPanel,
   DEFAULT_OBJECT_FILTERS,
   ObjectPagination,
   OneTimeSecretPanel,
@@ -20,7 +21,7 @@ import {
   uploadObjectKeyValidationError,
   uploadPathValidationError,
 } from './App'
-import { api, type ObjectItem } from './api'
+import { api, type AdminSystemVersion, type ObjectItem } from './api'
 
 afterEach(() => {
   cleanup()
@@ -42,7 +43,55 @@ const OBJECT: ObjectItem = {
   visibility: '私有',
 }
 
+const SYSTEM_VERSION: AdminSystemVersion = {
+  currentVersion: 'prod-aaaaaaaaaaaa',
+  currentRevision: 'aaaaaaaaaaaaaaaa',
+  channel: 'prod',
+  currentSourceUrl: 'https://github.com/emojiiii/mediaHub/commit/aaaaaaaaaaaaaaaa',
+  latestBuild: {
+    version: 'prod-bbbbbbbbbbbb',
+    revision: 'bbbbbbbbbbbbbbbb',
+    sourceUrl: 'https://github.com/emojiiii/mediaHub/actions/runs/1',
+    publishedAt: '2026-08-07T00:00:00.000Z',
+  },
+  hasUpdate: true,
+  updateEnabled: true,
+  warning: null,
+  operation: {
+    phase: 'idle',
+    operationId: null,
+    fromVersion: null,
+    targetVersion: null,
+    startedAt: null,
+    completedAt: null,
+    message: null,
+  },
+}
+
 describe('console helpers and standalone controls', () => {
+  it('在管理员版本面板中确认更新并允许重新检查版本', async () => {
+    const user = userEvent.setup()
+    const onRefresh = vi.fn()
+    const onUpdate = vi.fn()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<AdminSystemVersionPanel version={SYSTEM_VERSION} loading={false} refreshing={false} error={null} updateError={null} updating={false} onRefresh={onRefresh} onUpdate={onUpdate} />)
+
+    expect(screen.getByText('prod-aaaaaaaaaaaa')).toBeInTheDocument()
+    expect(screen.getByText('prod-bbbbbbbbbbbb')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '重新检查系统版本' }))
+    expect(onRefresh).toHaveBeenCalledOnce()
+    await user.click(screen.getByRole('button', { name: '更新到 prod-bbbbbbbbbbbb' }))
+    expect(onUpdate).toHaveBeenCalledOnce()
+  })
+
+  it('系统更新运行时保持轮询状态并禁用重复触发', () => {
+    render(<AdminSystemVersionPanel version={{ ...SYSTEM_VERSION, operation: { ...SYSTEM_VERSION.operation, phase: 'running', message: '已提交镜像检查' } }} loading={false} refreshing={false} error={null} updateError={null} updating={false} onRefresh={vi.fn()} onUpdate={vi.fn()} />)
+
+    expect(screen.getByText('更新中')).toBeInTheDocument()
+    expect(screen.getByText('已提交镜像检查')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '正在更新' })).toBeDisabled()
+  })
+
   it('builds an encoded Bucket object path prefix', () => {
     expect(bucketObjectPath('app demo', 'media assets')).toBe('/app%20demo/media%20assets/')
   })

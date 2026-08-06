@@ -145,6 +145,32 @@ export type AdminJob = { id: string; applicationId: string; action: string; stat
 export type AdminStorage = { quotaBytes: number; usedBytes: number; reservedBytes: number; mediaObjects: number; variantBytes: number; variants: number; diskTotalBytes: number; diskAvailableBytes: number }
 export type AdminSystemSettings = { downloadBytesPerSecond: number | null; updatedAt: string }
 export type AdminAudit = { id: string; applicationId: string; actorType: 'user' | 'access_key' | 'system'; actorId: string; action: string; targetType: string; targetId: string; requestId: string; summary: Record<string, unknown>; createdAt: string }
+export type AdminSystemUpdateOperation = {
+  phase: 'idle' | 'running' | 'completed' | 'failed'
+  operationId: string | null
+  fromVersion: string | null
+  targetVersion: string | null
+  startedAt: string | null
+  completedAt: string | null
+  message: string | null
+}
+export type AdminSystemBuild = {
+  version: string
+  revision: string
+  sourceUrl: string
+  publishedAt: string
+}
+export type AdminSystemVersion = {
+  currentVersion: string
+  currentRevision: string | null
+  channel: string
+  currentSourceUrl: string
+  latestBuild: AdminSystemBuild | null
+  hasUpdate: boolean | null
+  updateEnabled: boolean
+  warning: string | null
+  operation: AdminSystemUpdateOperation
+}
 
 export type BucketInput = {
   name: string
@@ -263,6 +289,8 @@ type Api = {
   getAdminStorage(): Promise<AdminStorage>
   getAdminSystemSettings(): Promise<AdminSystemSettings>
   updateAdminSystemSettings(downloadBytesPerSecond: number | null): Promise<AdminSystemSettings>
+  getAdminSystemVersion(force?: boolean): Promise<AdminSystemVersion>
+  triggerAdminSystemUpdate(): Promise<AdminSystemUpdateOperation>
   getAdminAudit(): Promise<AdminAudit[]>
   getObjects(filters?: MediaFilters): Promise<MediaPage>
   getObject(mediaId: string): Promise<ObjectItem>
@@ -329,6 +357,9 @@ type BackendAdminStorage = components['schemas']['AdminStorage']
 type BackendAdminSystemSettings = components['schemas']['AdminSettings']
 type BackendAdminAudit = components['schemas']['AdminAudit']
 
+type BackendSystemUpdateOperation = components['schemas']['SystemUpdateOperation']
+type BackendSystemVersion = components['schemas']['AdminSystemVersion']
+
 let selectedApplicationId: string | undefined
 function csrfToken(): string | undefined {
   const prefix = 'mediahub_csrf='
@@ -387,6 +418,37 @@ function adminJobFromBackend(job: BackendAdminJob): AdminJob { return { id: job.
 function adminStorageFromBackend(storage: BackendAdminStorage): AdminStorage { return { quotaBytes: bytes(storage.quota_bytes), usedBytes: bytes(storage.used_bytes), reservedBytes: bytes(storage.reserved_bytes), mediaObjects: storage.media_objects, variantBytes: bytes(storage.variant_bytes), variants: storage.variants, diskTotalBytes: bytes(storage.disk_total_bytes), diskAvailableBytes: bytes(storage.disk_available_bytes) } }
 function adminSystemSettingsFromBackend(settings: BackendAdminSystemSettings): AdminSystemSettings { return { downloadBytesPerSecond: settings.download_bytes_per_second === null ? null : bytes(settings.download_bytes_per_second), updatedAt: settings.updated_at } }
 function adminAuditFromBackend(audit: BackendAdminAudit): AdminAudit { return { id: audit.id, applicationId: audit.application_id, actorType: audit.actor_type, actorId: audit.actor_id, action: audit.action, targetType: audit.target_type, targetId: audit.target_id, requestId: audit.request_id, summary: audit.summary, createdAt: audit.created_at } }
+function systemUpdateOperationFromBackend(operation: BackendSystemUpdateOperation | undefined): AdminSystemUpdateOperation {
+  const phase = operation?.phase
+  return {
+    phase: phase === 'running' || phase === 'completed' || phase === 'failed' ? phase : 'idle',
+    operationId: operation?.operation_id ?? null,
+    fromVersion: operation?.from_version ?? null,
+    targetVersion: operation?.target_version ?? null,
+    startedAt: operation?.started_at ?? null,
+    completedAt: operation?.completed_at ?? null,
+    message: operation?.message ?? null,
+  }
+}
+function adminSystemVersionFromBackend(value: BackendSystemVersion): AdminSystemVersion {
+  const latest = value.latest_build
+  return {
+    currentVersion: value.current_version ?? 'unknown',
+    currentRevision: value.current_revision ?? null,
+    channel: value.channel ?? 'unknown',
+    currentSourceUrl: value.current_source_url ?? '',
+    latestBuild: latest ? {
+      version: latest.version ?? 'unknown',
+      revision: latest.revision ?? '',
+      sourceUrl: latest.source_url ?? '',
+      publishedAt: latest.published_at ?? '',
+    } : null,
+    hasUpdate: typeof value.has_update === 'boolean' ? value.has_update : null,
+    updateEnabled: value.update_enabled === true,
+    warning: value.warning ?? null,
+    operation: systemUpdateOperationFromBackend(value.operation),
+  }
+}
 async function requiredMe(): Promise<BackendMe> { return backendData(backendClient.GET('/api/v1/auth/me')) }
 async function backendAllMedia(): Promise<BackendMedia[]> {
   const items: BackendMedia[] = []
@@ -507,6 +569,12 @@ const backendApi: Api = {
   async getAdminStorage() { return adminStorageFromBackend(await backendData(backendClient.GET('/api/v1/admin/storage'))) },
   async getAdminSystemSettings() { return adminSystemSettingsFromBackend(await backendData(backendClient.GET('/api/v1/admin/settings'))) },
   async updateAdminSystemSettings(downloadBytesPerSecond) { return adminSystemSettingsFromBackend(await backendData(backendClient.PATCH('/api/v1/admin/settings', { body: { download_bytes_per_second: downloadBytesPerSecond } }))) },
+  async getAdminSystemVersion(force = false) {
+    return adminSystemVersionFromBackend(await backendData(backendClient.GET('/api/v1/admin/system/version', { params: { query: { force } } })))
+  },
+  async triggerAdminSystemUpdate() {
+    return systemUpdateOperationFromBackend(await backendData(backendClient.POST('/api/v1/admin/system/update')))
+  },
   async getAdminAudit() { return (await backendData(backendClient.GET('/api/v1/admin/audit', { params: { query: { limit: 100 } } }))).map(adminAuditFromBackend) },
   async getObjects(filters = {}) { const [buckets, page] = await Promise.all([backendData(backendClient.GET('/api/v1/buckets')), backendData(backendClient.GET('/api/v1/media', { params: { query: { bucket: filters.bucket, status: filters.status, mime: filters.mime, created_from: filters.createdFrom, created_before: filters.createdBefore, prefix: filters.prefix, delimiter: filters.delimiter, limit: filters.limit, cursor: filters.cursor } } }))]); const map = new Map(buckets.map((bucket) => [bucket.id, bucket])); return { items: page.items.map((item) => objectFromMedia(item, map)), commonPrefixes: page.common_prefixes, nextCursor: page.next_cursor } },
   async getObject(mediaId) { const { buckets, media } = await backendObjectById(mediaId); return objectFromMedia(media, new Map(buckets.map((bucket) => [bucket.id, bucket]))) },

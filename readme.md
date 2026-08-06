@@ -57,6 +57,39 @@ docker compose up -d --no-build
 docker compose logs --tail=100 mediahub
 ```
 
+### 自动更新部署（Watchtower）
+
+Compose 默认同时启动一个仅加入内部网络的 `mediahub-updater`。它使用
+Watchtower HTTP API 检查镜像并替换服务容器；Docker Socket 只挂载到 updater，
+业务容器不会获得 Docker 控制权限。updater 使用 `mediahub-prod` scope，且只处理
+带有 `com.centurylinklabs.watchtower.enable=true` 和相同 scope 的 `mediahub` 服务，
+不会更新主机上的其他容器。
+
+在 `.env` 中设置一个至少 32 个字符的随机 token（不要提交到 Git）：
+
+```bash
+MEDIAHUB_UPDATER_TOKEN=替换为随机长 token
+```
+
+发布镜像使用可变 tag（默认 `ghcr.io/emojiiii/mediahub:latest`）时，管理员更新入口
+会通过内部 `http://mediahub-updater:8080/v1/update` 触发检查。若将
+`MEDIAHUB_IMAGE` 固定为 `@sha256:...` 摘要，Watchtower 会保持该不可变版本，不会自动
+切换；需要更新时请先修改摘要，再执行常规 `docker compose pull mediahub &&
+docker compose up -d --no-build`。
+
+私有 GHCR 镜像需要在宿主机完成 `docker login ghcr.io`，并将 Docker 配置文件路径填入
+`DOCKER_CONFIG_PATH`（默认 `/root/.docker/config.json`）。该文件以只读方式挂载到 updater，
+不会写入应用数据卷。私有仓库还可设置只读的 `MEDIAHUB_GITHUB_TOKEN`，供版本页面查询最新
+成功的 GitHub Actions 构建；它不会传递给 Watchtower。
+
+更新后可检查服务状态和日志：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 mediahub-updater mediahub
+curl --fail http://127.0.0.1:3000/health/ready
+```
+
 ### 从源码构建服务器
 
 只有在服务器无法访问 GHCR，或需要测试未发布代码时才使用源码构建：
@@ -93,6 +126,9 @@ pnpm dev
 | 配置 | 作用 |
 | --- | --- |
 | `MEDIAHUB_IMAGE` | Web/API/Worker 镜像地址，生产环境建议固定摘要 |
+| `MEDIAHUB_UPDATER_TOKEN` | 内部 Watchtower HTTP API Bearer Token；自动更新部署时必填，至少 32 个字符 |
+| `MEDIAHUB_GITHUB_TOKEN` | 可选的只读 GitHub Token；私有仓库的版本检查需要，不会传递给 Watchtower |
+| `DOCKER_CONFIG_PATH` | 可选的宿主机 Docker registry 配置路径；私有 GHCR 镜像需要，默认 `/root/.docker/config.json` |
 | `MEDIAHUB_POSTGRES_DB`、`MEDIAHUB_POSTGRES_USER`、`MEDIAHUB_POSTGRES_PASSWORD` | Compose PostgreSQL 配置；共享环境必须替换默认密码 |
 | `MEDIAHUB_DATABASE_URL` | 可选，覆盖 Compose 自动生成的连接串，用于外部 PostgreSQL |
 | `MEDIAHUB_STORAGE_BACKEND` | `local` 或 `s3`，默认是 `local` |

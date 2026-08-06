@@ -102,6 +102,12 @@ RUN for crate in \
     && printf 'fn main() {}\n' > crates/mediahub-server/src/main.rs
 RUN cargo build --release --package mediahub-server --features docker-libvips
 
+ARG MEDIAHUB_BUILD_VERSION=0.1.0-dev
+ARG MEDIAHUB_BUILD_REVISION=unknown
+ARG MEDIAHUB_UPDATE_CHANNEL=dev
+ENV MEDIAHUB_BUILD_VERSION=${MEDIAHUB_BUILD_VERSION} \
+    MEDIAHUB_BUILD_REVISION=${MEDIAHUB_BUILD_REVISION} \
+    MEDIAHUB_UPDATE_CHANNEL=${MEDIAHUB_UPDATE_CHANNEL}
 COPY crates ./crates
 RUN for crate in \
         mediahub-adapter-image \

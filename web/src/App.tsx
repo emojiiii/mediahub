@@ -62,6 +62,7 @@ import {
   type AccessKey,
   type AdminApplication,
   type AdminSystemSettings,
+  type AdminSystemVersion,
   type Application,
   type AsyncJobView,
   type AuthSession,
@@ -1796,11 +1797,28 @@ function AdminPage() {
   const jobs = useQuery({ queryKey: ['admin', 'jobs'], queryFn: api.getAdminJobs })
   const storage = useQuery({ queryKey: ['admin', 'storage'], queryFn: api.getAdminStorage })
   const systemSettings = useQuery({ queryKey: ['admin', 'settings'], queryFn: api.getAdminSystemSettings })
+  const systemVersion = useQuery({
+    queryKey: ['admin', 'system-version'],
+    queryFn: () => api.getAdminSystemVersion(),
+    enabled: tab === 'settings',
+    refetchInterval: (query) => query.state.data?.operation.phase === 'running' ? 2000 : false,
+  })
   const audit = useQuery({ queryKey: ['admin', 'audit'], queryFn: api.getAdminAudit })
   const queryClient = useQueryClient()
   const statusMutation = useMutation({ mutationFn: ({ userId, status }: { userId: string; status: 'active' | 'suspended' }) => api.updateAdminUserStatus(userId, status), onSuccess: async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ['admin', 'users'] }), queryClient.invalidateQueries({ queryKey: ['admin', 'audit'] })]) } })
   const quotaMutation = useMutation({ mutationFn: ({ applicationId, quotaBytes }: { applicationId: string; quotaBytes: number }) => api.updateAdminApplicationQuota(applicationId, quotaBytes), onSuccess: async () => { setQuotaEditor(null); await Promise.all([queryClient.invalidateQueries({ queryKey: ['admin', 'applications'] }), queryClient.invalidateQueries({ queryKey: ['admin', 'storage'] }), queryClient.invalidateQueries({ queryKey: ['admin', 'audit'] })]) } })
   const settingsMutation = useMutation({ mutationFn: api.updateAdminSystemSettings, onSuccess: (settings) => queryClient.setQueryData(['admin', 'settings'], settings) })
+  const refreshVersionMutation = useMutation({
+    mutationFn: () => api.getAdminSystemVersion(true),
+    onSuccess: (version) => queryClient.setQueryData(['admin', 'system-version'], version),
+  })
+  const updateVersionMutation = useMutation({
+    mutationFn: api.triggerAdminSystemUpdate,
+    onSuccess: async (operation) => {
+      queryClient.setQueryData<AdminSystemVersion>(['admin', 'system-version'], (current) => current ? { ...current, operation } : current)
+      await queryClient.invalidateQueries({ queryKey: ['admin', 'audit'] })
+    },
+  })
   const pendingJobs = jobs.data?.filter((job) => job.state === 'pending' || job.state === 'running').length
   const failedJobs = jobs.data?.filter((job) => job.state === 'failed').length
   const error = users.error ?? applications.error ?? jobs.error ?? storage.error ?? systemSettings.error ?? audit.error ?? statusMutation.error ?? quotaMutation.error
@@ -1852,6 +1870,7 @@ function AdminPage() {
         {tab === 'settings' && <div role="tabpanel">
           <div className="border-b border-separator px-5 py-4"><h2 className="text-sm font-semibold">传输设置</h2><p className="mt-1 text-xs text-muted">限制每个对象响应的下载速度；多个下载仍可并行。</p></div>
           {systemSettings.isLoading ? loading : systemSettings.data ? <AdminSystemSettingsPanel value={systemSettings.data} pending={settingsMutation.isPending} error={settingsMutation.error} onSave={(bytesPerSecond) => settingsMutation.mutate(bytesPerSecond)} /> : empty('系统设置暂不可用。')}
+          <AdminSystemVersionPanel version={systemVersion.data} loading={systemVersion.isLoading} refreshing={systemVersion.isFetching || refreshVersionMutation.isPending} error={systemVersion.error ?? refreshVersionMutation.error} updateError={updateVersionMutation.error} updating={updateVersionMutation.isPending} onRefresh={() => refreshVersionMutation.mutate()} onUpdate={() => updateVersionMutation.mutate()} />
         </div>}
 
         {tab === 'audit' && <div role="tabpanel">
@@ -1885,6 +1904,59 @@ function AdminSystemSettingsPanel({ value, pending, error, onSave }: { value: Ad
     <MutationError error={error} />
     <div className="flex items-center justify-between gap-4 border-t border-separator pt-4"><p className="text-xs text-muted">上次更新：{formatDateTime(value.updatedAt)}</p><Button type="submit" variant="primary" isDisabled={pending || !valid || unchanged}>{pending && <LoaderCircle className="size-4 animate-spin" />}保存系统设置</Button></div>
   </form>
+}
+
+export function AdminSystemVersionPanel({ version, loading, refreshing, error, updateError, updating, onRefresh, onUpdate }: {
+  version: AdminSystemVersion | undefined
+  loading: boolean
+  refreshing: boolean
+  error: unknown
+  updateError: unknown
+  updating: boolean
+  onRefresh: () => void
+  onUpdate: () => void
+}) {
+  const operation = version?.operation
+  const running = operation?.phase === 'running'
+  const phaseLabel = operation?.phase === 'running' ? '更新中' : operation?.phase === 'completed' ? '已完成' : operation?.phase === 'failed' ? '失败' : '空闲'
+  const phaseTone = operation?.phase === 'failed' ? 'danger' : operation?.phase === 'completed' ? 'positive' : 'neutral'
+  const canUpdate = Boolean(version?.updateEnabled) && !running && version?.hasUpdate !== false
+  const updateLabel = running || updating
+    ? '正在更新'
+    : version?.hasUpdate === false
+      ? '当前已是最新版本'
+      : version?.latestBuild?.version
+        ? `更新到 ${version.latestBuild.version}`
+        : '检查并更新镜像'
+  const sourceUrl = version?.latestBuild?.sourceUrl || version?.currentSourceUrl
+
+  return <section aria-label="系统版本" className="border-t border-separator">
+    <div className="flex items-center justify-between gap-4 border-b border-separator px-5 py-4">
+      <div><h2 className="text-sm font-semibold">系统版本</h2><p className="mt-1 text-xs text-muted">检查部署镜像并通过内部更新服务切换到最新构建。</p></div>
+      <Button isIconOnly size="sm" variant="ghost" aria-label="重新检查系统版本" isDisabled={refreshing} onClick={onRefresh}><RefreshCw className={cn('size-4', refreshing && 'animate-spin')} /></Button>
+    </div>
+    {loading && !version ? <div className="grid min-h-44 place-items-center"><div className="flex items-center gap-3 text-sm text-muted"><Spinner aria-label="加载系统版本" color="accent" size="sm" />正在检查版本</div></div> : version ? <div className="max-w-4xl space-y-4 px-5 py-5">
+      <div className="grid overflow-hidden rounded-md border border-separator bg-default-soft sm:grid-cols-3">
+        <div className="border-b border-separator px-4 py-3 sm:border-b-0 sm:border-r"><p className="text-[11px] font-medium text-muted">当前版本</p><p className="mt-1 truncate font-mono text-sm font-semibold" title={version.currentVersion}>{version.currentVersion}</p></div>
+        <div className="border-b border-separator px-4 py-3 sm:border-b-0 sm:border-r"><p className="text-[11px] font-medium text-muted">最新构建</p><p className="mt-1 truncate font-mono text-sm font-semibold" title={version.latestBuild?.version}>{version.latestBuild?.version ?? '暂不可用'}</p></div>
+        <div className="px-4 py-3"><p className="text-[11px] font-medium text-muted">更新通道</p><div className="mt-1 flex items-center gap-2"><span className="font-mono text-sm font-semibold">{version.channel}</span><Badge tone={phaseTone}>{phaseLabel}</Badge></div></div>
+      </div>
+
+      {version.latestBuild?.publishedAt && <p className="text-xs text-muted">最新构建时间：{formatDateTime(version.latestBuild.publishedAt)}</p>}
+      <MutationError error={error ?? updateError} />
+      {version.warning && <p className="rounded-md border border-warning bg-warning-soft px-3 py-2 text-xs text-warning-soft-foreground">{version.warning}</p>}
+      {operation?.message && <p className={cn('rounded-md border px-3 py-2 text-xs', operation.phase === 'failed' ? 'border-danger bg-danger-soft text-danger-soft-foreground' : 'border-separator bg-default-soft text-muted')}>{operation.message}</p>}
+      {!version.updateEnabled && <p className="rounded-md border border-separator bg-default-soft px-3 py-2 text-xs text-muted">自动更新未启用，请先配置内部 updater 地址和共享 Token。</p>}
+
+      <div className="flex flex-col gap-3 border-t border-separator pt-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0 text-xs text-muted">
+          {sourceUrl ? <a className="block truncate font-medium text-accent hover:underline" href={sourceUrl} target="_blank" rel="noreferrer noopener">查看构建来源</a> : <span>构建来源暂不可用</span>}
+          {operation?.startedAt && <p className="mt-1">开始时间：{formatDateTime(operation.startedAt)}</p>}
+        </div>
+        <Button variant="primary" className="shrink-0" isDisabled={!canUpdate || updating} onClick={() => { if (window.confirm(`确认更新 MediaHub？\n\n将拉取 ${version.channel}-latest 镜像并替换当前容器，API 可能短暂不可用。`)) onUpdate() }}>{(running || updating) && <LoaderCircle className="size-4 animate-spin" />}{updateLabel}</Button>
+      </div>
+    </div> : <div className="px-5 py-5"><MutationError error={error} /><Button variant="secondary" isDisabled={refreshing} onClick={onRefresh}>{refreshing && <LoaderCircle className="size-4 animate-spin" />}重试版本检查</Button></div>}
+  </section>
 }
 
 function ApplicationQuotaEditor({ application, pending, error, onClose, onSave }: { application: AdminApplication; pending: boolean; error: unknown; onClose: () => void; onSave: (quotaBytes: number) => void }) {

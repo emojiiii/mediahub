@@ -1,6 +1,29 @@
 services:
+  mediahub-updater:
+    image: containrrr/watchtower:1.7.1
+    restart: unless-stopped
+    environment:
+      # Watchtower 1.7.x requires the Docker API version used by the host
+      # daemon. Keep this pinned for compatibility with current Docker Engine.
+      DOCKER_API_VERSION: "1.40"
+      WATCHTOWER_HTTP_API_UPDATE: "true"
+      WATCHTOWER_HTTP_API_PERIODIC_POLLS: "false"
+      WATCHTOWER_HTTP_API_TOKEN: ${MEDIAHUB_UPDATER_TOKEN:?set_a_watchtower_token}
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_SCOPE: mediahub-prod
+      WATCHTOWER_CLEANUP: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount registry credentials read-only when MEDIAHUB_IMAGE is private.
+      - ${DOCKER_CONFIG_PATH:-/root/.docker/config.json}:/config.json:ro
+    expose:
+      - "8080"
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+
   mediahub:
     image: ${MEDIAHUB_IMAGE:-ghcr.io/emojiiii/mediahub:latest}
+    pull_policy: always
     build:
       context: .
     ports:
@@ -45,12 +68,20 @@ services:
       MEDIAHUB_RESEND_API_KEY: ${MEDIAHUB_RESEND_API_KEY:?set_a_resend_api_key}
       MEDIAHUB_EMAIL_FROM: ${MEDIAHUB_EMAIL_FROM:?set_a_verified_sender_address}
       MEDIAHUB_WEB_URL: ${MEDIAHUB_WEB_URL:?set_the_public_https_web_origin}
+      MEDIAHUB_UPDATER_URL: http://mediahub-updater:8080/v1/update
+      MEDIAHUB_UPDATER_TOKEN: ${MEDIAHUB_UPDATER_TOKEN:?set_a_watchtower_token}
+      MEDIAHUB_GITHUB_TOKEN: ${MEDIAHUB_GITHUB_TOKEN:-}
     volumes:
       - mediahub-data:/data
     depends_on:
       postgres:
         condition: service_healthy
+      mediahub-updater:
+        condition: service_started
     restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: mediahub-prod
 
   postgres:
     image: postgres:17-bookworm

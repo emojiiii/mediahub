@@ -74,6 +74,8 @@ pub(super) async fn run() -> anyhow::Result<()> {
     }
     let access_key_cipher = Arc::new(access_key_cipher);
     let email_provider = config.resend.map(ResendEmailProvider::new).map(Arc::new);
+    let system_update = SystemUpdateService::new(config.system_update)
+        .map_err(|error| anyhow::anyhow!("failed to initialize system update service: {error}"))?;
     let webdav = webdav::WebDavService::new(
         repository.clone(),
         object_store.clone(),
@@ -95,6 +97,7 @@ pub(super) async fn run() -> anyhow::Result<()> {
             variant_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             http_metrics: HttpMetrics::default(),
             metrics_bearer_token: config.metrics_bearer_token.map(Arc::from),
+            system_update,
         },
         config.web_root,
     );

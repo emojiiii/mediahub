@@ -33,7 +33,70 @@ pub(super) struct ServerConfig {
     pub(super) resend: Option<ResendConfig>,
     pub(super) bootstrap_admin_email: Option<String>,
     pub(super) metrics_bearer_token: Option<String>,
+    pub(super) system_update: SystemUpdateConfig,
     pub(super) web_root: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+pub(super) struct SystemUpdateConfig {
+    pub(super) updater_url: Option<String>,
+    pub(super) updater_token: Option<String>,
+    pub(super) github_token: Option<String>,
+}
+
+impl SystemUpdateConfig {
+    fn from_env() -> Result<Self, String> {
+        let updater_url = env::var("MEDIAHUB_UPDATER_URL")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if let Some(value) = updater_url.as_deref() {
+            let url =
+                Url::parse(value).map_err(|_| "MEDIAHUB_UPDATER_URL is invalid".to_owned())?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err("MEDIAHUB_UPDATER_URL must be an HTTP(S) URL without credentials, query, or fragment".to_owned());
+            }
+        }
+        let updater_token = env::var("MEDIAHUB_UPDATER_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if updater_url.is_some() != updater_token.is_some() {
+            return Err(
+                "MEDIAHUB_UPDATER_URL and MEDIAHUB_UPDATER_TOKEN must be configured together"
+                    .to_owned(),
+            );
+        }
+        if let Some(value) = updater_token.as_deref()
+            && (value.len() < 32
+                || value.len() > 512
+                || value.bytes().any(|byte| byte.is_ascii_control()))
+        {
+            return Err("MEDIAHUB_UPDATER_TOKEN must contain 32-512 printable bytes".to_owned());
+        }
+        let github_token = env::var("MEDIAHUB_GITHUB_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if let Some(value) = github_token.as_deref()
+            && (value.len() > 512 || value.bytes().any(|byte| byte.is_ascii_control()))
+        {
+            return Err(
+                "MEDIAHUB_GITHUB_TOKEN must contain at most 512 printable bytes".to_owned(),
+            );
+        }
+        Ok(Self {
+            updater_url,
+            updater_token,
+            github_token,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +325,7 @@ impl ServerConfig {
                 }
             })
             .transpose()?;
+        let system_update = SystemUpdateConfig::from_env()?;
         let web_root_value = match env::var("MEDIAHUB_WEB_ROOT") {
             Ok(value) => Some(value),
             Err(env::VarError::NotPresent) => None,
@@ -314,6 +378,7 @@ impl ServerConfig {
             resend,
             bootstrap_admin_email,
             metrics_bearer_token,
+            system_update,
             web_root,
         })
     }

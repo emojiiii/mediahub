@@ -65,6 +65,12 @@ struct UpdateApplicationRequest {
 struct AdminListQuery {
     limit: Option<usize>,
 }
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AdminSystemVersionQuery {
+    #[serde(default)]
+    force: bool,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdminUpdateUserStatusRequest {

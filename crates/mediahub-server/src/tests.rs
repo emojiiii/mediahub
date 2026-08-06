@@ -61,6 +61,12 @@ async fn auth_test_state(pool: sqlx::PgPool, registration_enabled: bool) -> Arc<
         variant_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         http_metrics: HttpMetrics::default(),
         metrics_bearer_token: None,
+        system_update: SystemUpdateService::new(server_config::SystemUpdateConfig {
+            updater_url: None,
+            updater_token: None,
+            github_token: None,
+        })
+        .expect("system update service"),
     })
 }
 

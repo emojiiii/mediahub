@@ -21,6 +21,14 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route("/api/v1/admin/storage", get(admin_storage))
         .route(
+            "/api/v1/admin/system/version",
+            get(admin_system_version),
+        )
+        .route(
+            "/api/v1/admin/system/update",
+            post(admin_system_update),
+        )
+        .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
         )

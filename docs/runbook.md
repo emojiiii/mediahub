@@ -43,6 +43,36 @@ publishes only `latest` and `master`; pin `MEDIAHUB_IMAGE` to an image digest
 when deployment reproducibility is required. The image contains the Web console,
 API, and workers. Open the public MediaHub origin to use the console.
 
+### Automatic image updates
+
+The production Compose profile includes a `containrrr/watchtower:1.7.1`
+`mediahub-updater` service. Set `MEDIAHUB_UPDATER_TOKEN` in `.env` to a random
+value of at least 32 characters. The updater exposes port 8080 only to the
+Compose network and accepts authenticated requests from MediaHub at
+`http://mediahub-updater:8080/v1/update`; it is never published on the host.
+
+Watchtower is restricted to the `mediahub-prod` scope and label-enabled
+containers. The updater itself is explicitly excluded, while only the
+`mediahub` application service is eligible for replacement. Its Docker Socket
+mount is therefore isolated from the application container. `WATCHTOWER_CLEANUP`
+removes superseded images after a successful replacement.
+
+Keep `MEDIAHUB_IMAGE` on a mutable release tag (the default `:latest`) to allow
+Watchtower to discover new builds. Digest-pinned images intentionally do not
+change automatically. For a private registry, run `docker login` on the host
+and set `DOCKER_CONFIG_PATH` to the read-only Docker config that Watchtower
+should use. Set the optional `MEDIAHUB_GITHUB_TOKEN` to a read-only GitHub token
+when the version endpoint must inspect builds in a private repository; this
+token is not passed to Watchtower.
+
+After an update request, inspect the replacement and readiness checks with:
+
+```powershell
+docker compose ps
+docker compose logs --tail=100 mediahub-updater mediahub
+Invoke-WebRequest http://127.0.0.1:3000/health/ready -UseBasicParsing
+```
+
 The web console has no embedded demo or Mock API. It always calls the real API,
 using the browser's current origin in production. Vite development mode calls
 port 3000 on the current host. Start the local console in a second terminal with:

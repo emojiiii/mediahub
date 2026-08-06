@@ -344,6 +344,87 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/system/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request a controlled container image update */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Request accepted */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SystemUpdateOperation"];
+                    };
+                };
+                400: components["responses"]["InvalidRequest"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                409: components["responses"]["Conflict"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/system/version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the current build and update status */
+        get: {
+            parameters: {
+                query?: {
+                    force?: components["parameters"]["ForceVersionRefresh"];
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AdminSystemVersion"];
+                    };
+                };
+                400: components["responses"]["InvalidRequest"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/users": {
         parameters: {
             query?: never;
@@ -2768,6 +2849,17 @@ export interface components {
             /** Format: int64 */
             variants: number;
         };
+        AdminSystemVersion: {
+            channel: string;
+            current_revision?: string | null;
+            current_source_url: string;
+            current_version: string;
+            has_update?: boolean | null;
+            latest_build?: null | components["schemas"]["SystemLatestBuild"];
+            operation: components["schemas"]["SystemUpdateOperation"];
+            update_enabled: boolean;
+            warning?: string | null;
+        };
         AdminUpdateApplicationQuota: {
             /** Format: int64 */
             quota_bytes: number;
@@ -3122,6 +3214,27 @@ export interface components {
             expires_at: string;
             url: string;
         };
+        SystemLatestBuild: {
+            /** Format: date-time */
+            published_at: string;
+            revision: string;
+            source_url: string;
+            version: string;
+        };
+        SystemUpdateOperation: {
+            /** Format: date-time */
+            completed_at?: string | null;
+            from_version?: string | null;
+            message?: string | null;
+            operation_id?: string | null;
+            /** @enum {string} */
+            phase: "idle" | "running" | "completed" | "failed";
+            /** Format: date-time */
+            started_at?: string | null;
+            target_version?: string | null;
+        };
+        /** @enum {string} */
+        SystemUpdatePhase: "idle" | "running" | "completed" | "failed";
         UpdateAccessKey: {
             expires_at?: string | null;
             name?: string | null;
@@ -3336,6 +3449,7 @@ export interface components {
         Delimiter: string;
         DeliveryStatus: string;
         EventId: string;
+        ForceVersionRefresh: boolean;
         IdempotencyKey: string;
         IfMatch: string;
         IfNoneMatch: string;
