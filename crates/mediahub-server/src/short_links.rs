@@ -117,24 +117,12 @@ fn validate_short_link_target(
             "target_url must be a public object URL without credentials, query, or fragment",
         ));
     }
-    let encoded_segments = url
-        .path_segments()
-        .ok_or_else(|| ApiError::bad_request("target_url path is invalid"))?
-        .collect::<Vec<_>>();
-    if encoded_segments.len() < 3 {
+    let segments = decoded_path_segments(&url)?;
+    if segments.len() < 3 {
         return Err(ApiError::bad_request(
             "target_url must identify an application, bucket, and object",
         ));
     }
-    let segments = encoded_segments
-        .into_iter()
-        .map(|segment| {
-            percent_encoding::percent_decode_str(segment)
-                .decode_utf8()
-                .map(|value| value.into_owned())
-                .map_err(|_| ApiError::bad_request("target_url path encoding is invalid"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     if segments[0] != expected_app_id || segments[1].is_empty() {
         return Err(ApiError::bad_request(
             "target_url does not belong to the active application",
@@ -145,7 +133,9 @@ fn validate_short_link_target(
         return Err(ApiError::bad_request("target_url object key is invalid"));
     }
     let canonical_path = object_content_path(expected_app_id, &segments[1], &object_key);
-    if canonical_path != url.path() {
+    let canonical_url = Url::parse(&format!("http://mediahub.invalid{canonical_path}"))
+        .expect("canonical object paths form valid HTTP URLs");
+    if decoded_path_segments(&canonical_url)? != segments {
         return Err(ApiError::bad_request(
             "target_url path is not in canonical object URL form",
         ));
@@ -155,6 +145,18 @@ fn validate_short_link_target(
         object_key,
         canonical_path,
     })
+}
+
+fn decoded_path_segments(url: &Url) -> Result<Vec<String>, ApiError> {
+    url.path_segments()
+        .ok_or_else(|| ApiError::bad_request("target_url path is invalid"))?
+        .map(|segment| {
+            percent_encoding::percent_decode_str(segment)
+                .decode_utf8()
+                .map(|value| value.into_owned())
+                .map_err(|_| ApiError::bad_request("target_url path encoding is invalid"))
+        })
+        .collect()
 }
 
 fn validate_short_link_code(code: &str) -> Result<(), ApiError> {
@@ -201,6 +203,25 @@ mod short_link_tests {
                 "target should be rejected: {target}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_equivalent_browser_path_encoding_but_rejects_encoded_separators() {
+        let target = validate_short_link_target(
+            "https://media.example/app_demo/public/report%2Bfinal%3Dv1.mp4",
+            "app_demo",
+        )
+        .expect("equivalent browser encoding should be accepted");
+        assert_eq!(target.object_key, "report+final=v1.mp4");
+        assert_eq!(target.canonical_path, "/app_demo/public/report+final=v1.mp4");
+
+        assert!(
+            validate_short_link_target(
+                "https://media.example/app_demo/public/folder%2Fclip.mp4",
+                "app_demo",
+            )
+            .is_err()
+        );
     }
 
     #[test]

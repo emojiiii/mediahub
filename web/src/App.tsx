@@ -1790,7 +1790,7 @@ function HomePage() {
 
 function AdminPage() {
   api.setApplication(undefined)
-  const [tab, setTab] = useState<'users' | 'applications' | 'jobs' | 'storage' | 'settings' | 'audit'>('users')
+  const [tab, setTab] = useState<'users' | 'applications' | 'jobs' | 'storage' | 'settings' | 'updates' | 'audit'>('users')
   const [quotaEditor, setQuotaEditor] = useState<AdminApplication | null>(null)
   const users = useQuery({ queryKey: ['admin', 'users'], queryFn: api.getAdminUsers })
   const applications = useQuery({ queryKey: ['admin', 'applications'], queryFn: api.getAdminApplications })
@@ -1800,7 +1800,7 @@ function AdminPage() {
   const systemVersion = useQuery({
     queryKey: ['admin', 'system-version'],
     queryFn: () => api.getAdminSystemVersion(),
-    enabled: tab === 'settings',
+    enabled: tab === 'updates',
     refetchInterval: (query) => query.state.data?.operation.phase === 'running' ? 2000 : false,
   })
   const audit = useQuery({ queryKey: ['admin', 'audit'], queryFn: api.getAdminAudit })
@@ -1822,7 +1822,7 @@ function AdminPage() {
   const pendingJobs = jobs.data?.filter((job) => job.state === 'pending' || job.state === 'running').length
   const failedJobs = jobs.data?.filter((job) => job.state === 'failed').length
   const error = users.error ?? applications.error ?? jobs.error ?? storage.error ?? systemSettings.error ?? audit.error ?? statusMutation.error ?? quotaMutation.error
-  const tabs: Array<{ id: typeof tab; label: string }> = [{ id: 'users', label: '用户' }, { id: 'applications', label: '应用' }, { id: 'jobs', label: '后台任务' }, { id: 'storage', label: '存储' }, { id: 'settings', label: '系统设置' }, { id: 'audit', label: '审计日志' }]
+  const tabs: Array<{ id: typeof tab; label: string }> = [{ id: 'users', label: '用户' }, { id: 'applications', label: '应用' }, { id: 'jobs', label: '后台任务' }, { id: 'storage', label: '存储' }, { id: 'settings', label: '系统设置' }, { id: 'updates', label: '系统更新' }, { id: 'audit', label: '审计日志' }]
   const loading = <div className="grid min-h-56 place-items-center"><div className="flex items-center gap-3 text-sm text-muted"><Spinner aria-label="加载管理数据" color="accent" size="sm" />正在加载</div></div>
   const empty = (message: string) => <div className="grid min-h-56 place-items-center px-5 text-center"><div><p className="text-sm font-medium text-foreground">暂无数据</p><p className="mt-1 text-xs text-muted">{message}</p></div></div>
   const metricBorders = ['border-b border-separator sm:border-r xl:border-b-0', 'border-b border-separator xl:border-b-0 xl:border-r', 'border-b border-separator sm:border-b-0 sm:border-r', '']
@@ -1870,6 +1870,9 @@ function AdminPage() {
         {tab === 'settings' && <div role="tabpanel">
           <div className="border-b border-separator px-5 py-4"><h2 className="text-sm font-semibold">传输设置</h2><p className="mt-1 text-xs text-muted">限制每个对象响应的下载速度；多个下载仍可并行。</p></div>
           {systemSettings.isLoading ? loading : systemSettings.data ? <AdminSystemSettingsPanel value={systemSettings.data} pending={settingsMutation.isPending} error={settingsMutation.error} onSave={(bytesPerSecond) => settingsMutation.mutate(bytesPerSecond)} /> : empty('系统设置暂不可用。')}
+        </div>}
+
+        {tab === 'updates' && <div role="tabpanel">
           <AdminSystemVersionPanel version={systemVersion.data} loading={systemVersion.isLoading} refreshing={systemVersion.isFetching || refreshVersionMutation.isPending} error={systemVersion.error ?? refreshVersionMutation.error} updateError={updateVersionMutation.error} updating={updateVersionMutation.isPending} onRefresh={() => refreshVersionMutation.mutate()} onUpdate={() => updateVersionMutation.mutate()} />
         </div>}
 
