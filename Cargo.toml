@@ -33,6 +33,7 @@ hex = "0.4.3"
 fs2 = "0.4.3"
 hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+md-5 = "0.11.0"
 http = "1.4.2"
 mime = "0.3.17"
 mime_guess = "2.0.5"

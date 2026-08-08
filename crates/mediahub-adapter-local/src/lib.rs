@@ -15,6 +15,7 @@ use std::fs::File;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, pin_mut};
+use md5::Md5;
 use mediahub_app::{
     ComposedObject, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, PreparedUpload,
     StoredUpload, StreamedObject, StreamingUploadError, UploadSessionStorage, UploadTarget,
@@ -153,7 +154,8 @@ impl LocalObjectStore {
 
         pin_mut!(stream);
         let mut received = 0_u64;
-        let mut digest = Sha256::new();
+        let mut sha256 = Sha256::new();
+        let mut md5 = Md5::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -187,7 +189,8 @@ impl LocalObjectStore {
                 let _ = tokio::fs::remove_file(&stage_object).await;
                 return Err(StreamingUploadError::Storage(io_error(&error)));
             }
-            digest.update(&chunk);
+            sha256.update(&chunk);
+            md5.update(&chunk);
         }
         if received != expected_size {
             drop(file);
@@ -241,7 +244,8 @@ impl LocalObjectStore {
         result.map_err(StreamingUploadError::Storage)?;
         Ok(StreamedObject {
             size: received,
-            sha256: hex::encode(digest.finalize()),
+            sha256: hex::encode(sha256.finalize()),
+            md5: hex::encode(md5.finalize()),
         })
     }
 

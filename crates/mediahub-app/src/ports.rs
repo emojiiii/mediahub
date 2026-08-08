@@ -63,10 +63,14 @@ pub struct ComposedObject {
 }
 
 /// Facts calculated while streaming one request body into temporary storage.
+/// Both digests cover the same byte sequence. `md5` is lowercase hexadecimal
+/// for the client-facing single-part S3 ETag, while `sha256` is the durable
+/// integrity checksum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamedObject {
     pub size: u64,
     pub sha256: String,
+    pub md5: String,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

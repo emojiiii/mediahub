@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="PrismArk">
+  <defs>
+    <linearGradient id="prismark" x1="7" y1="5" x2="57" y2="59" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#prismark)"/>
+  <path d="M32 13 49 42H15L32 13Z" fill="none" stroke="white" stroke-width="4" stroke-linejoin="round"/>
+  <path d="m25 30 7-12 7 12-7 12-7-12Z" fill="white" fill-opacity=".2"/>
+  <path d="M19 47c4.2 3 8.5 4.5 13 4.5S40.8 50 45 47" fill="none" stroke="white" stroke-width="4" stroke-linecap="round"/>
+  <path d="m39 30 9-4M40.5 34l10-1M38.5 38l9 2" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" opacity=".9"/>
+</svg>

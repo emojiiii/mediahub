@@ -10,6 +10,10 @@ mod error;
 mod ids;
 mod media;
 mod metadata;
+mod object_version;
+mod s3_bucket;
+mod s3_lifecycle;
+mod s3_storage;
 mod upload_session;
 mod variant;
 mod visibility;
@@ -30,6 +34,26 @@ pub use media::{
 pub use metadata::{
     CURRENT_METADATA_VERSION, ClientMetadata, MAX_METADATA_BYTES, MAX_METADATA_DEPTH,
     MAX_METADATA_KEYS, MAX_METADATA_STRING_BYTES, MediaMetadata, SystemMetadata,
+};
+pub use object_version::{
+    ObjectId, ObjectRetention, ObjectVersion, ObjectVersionId, ObjectVersionPayload,
+    ObjectVersionState, PersistedObjectVersion, PersistedS3Object, S3Object, S3VersionId,
+    SourceProtocol, StoredObjectVersion,
+};
+pub use s3_bucket::{
+    BucketS3Configuration, DefaultRetention, DefaultRetentionPeriod,
+    PersistedBucketS3Configuration, PersistedS3Bucket, RetentionMode, S3Bucket, S3ModelError,
+    VersioningStatus,
+};
+pub use s3_lifecycle::{
+    MAX_S3_LIFECYCLE_RULES, S3AbortIncompleteMultipartUpload, S3Expiration,
+    S3LifecycleConfiguration, S3LifecycleFilter, S3LifecycleRule, S3LifecycleRuleStatus,
+    S3NoncurrentVersionExpiration,
+};
+pub use s3_storage::{
+    Checksum, ChecksumAlgorithm, EntityTag, NewStorageGcTask, PersistedUploadIntent,
+    StorageGcReason, StorageGcTask, StorageGcTaskId, StorageGcTaskState, UploadIntent,
+    UploadIntentId, UploadIntentState,
 };
 pub use upload_session::{
     NewUploadSession, PersistedUploadSession, UploadSession, UploadSessionState,

@@ -166,7 +166,7 @@ impl SystemUpdateService {
     ) -> Result<Self, reqwest::Error> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(format!("MediaHub/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("PrismArk/{}", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             client,

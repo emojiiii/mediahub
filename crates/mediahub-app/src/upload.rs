@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ApplicationError, BucketRepository, Clock, MediaRepository, ObjectStore, OutboxEvent, Redacted,
-    RepositoryError, S3MultipartRepository,
+    RepositoryError,
 };
 
 pub const MEDIA_UPLOAD_LEASE_SECONDS: i64 = 120;
@@ -33,26 +33,6 @@ pub struct UploadMediaRequest {
     pub metadata: ClientMetadata,
 }
 
-/// A complete object already staged by a transport-specific flow such as S3
-/// Multipart. Size and SHA-256 must be derived while composing the staged
-/// bytes, never inferred from multipart ETags.
-#[derive(Clone)]
-pub struct StagedUploadMediaRequest {
-    pub application_id: ApplicationId,
-    pub bucket_id: BucketId,
-    pub object_key: String,
-    pub original_name: Option<String>,
-    pub display_name: String,
-    pub extension: Option<String>,
-    pub mime: String,
-    pub temporary_key: String,
-    pub size: u64,
-    pub sha256: String,
-    pub visibility_override: Option<Visibility>,
-    pub expire_at: Option<OffsetDateTime>,
-    pub metadata: ClientMetadata,
-}
-
 impl fmt::Debug for UploadMediaRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -65,27 +45,6 @@ impl fmt::Debug for UploadMediaRequest {
             .field("extension", &self.extension)
             .field("mime", &self.mime)
             .field("content", &Redacted(&self.content))
-            .field("visibility_override", &self.visibility_override)
-            .field("expire_at", &self.expire_at)
-            .field("metadata", &Redacted(&self.metadata))
-            .finish()
-    }
-}
-
-impl fmt::Debug for StagedUploadMediaRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("StagedUploadMediaRequest")
-            .field("application_id", &self.application_id)
-            .field("bucket_id", &self.bucket_id)
-            .field("object_key", &self.object_key)
-            .field("original_name", &self.original_name)
-            .field("display_name", &self.display_name)
-            .field("extension", &self.extension)
-            .field("mime", &self.mime)
-            .field("temporary_key", &Redacted(&self.temporary_key))
-            .field("size", &self.size)
-            .field("sha256", &Redacted(&self.sha256))
             .field("visibility_override", &self.visibility_override)
             .field("expire_at", &self.expire_at)
             .field("metadata", &Redacted(&self.metadata))
@@ -266,248 +225,6 @@ where
         }
     }
 
-    /// Commits a transport-composed temporary object through the same Media,
-    /// quota, policy, outbox, and rollback invariants as a single PUT.
-    pub async fn upload_staged(
-        &self,
-        request: &StagedUploadMediaRequest,
-    ) -> Result<UploadReceipt, ApplicationError> {
-        let bucket = self
-            .bucket_repository
-            .find_by_id(request.bucket_id)
-            .await?
-            .ok_or(ApplicationError::BucketNotFound)?;
-        if bucket.application_id() != request.application_id {
-            return Err(ApplicationError::BucketDoesNotBelongToApplication);
-        }
-        bucket.validate_upload(&request.mime, request.size)?;
-        if self
-            .media_repository
-            .find_by_object_key(
-                request.application_id,
-                request.bucket_id,
-                &request.object_key,
-            )
-            .await?
-            .is_some()
-        {
-            return Err(ApplicationError::ObjectAlreadyExists);
-        }
-        self.media_repository
-            .reserve_quota(request.application_id, request.size)
-            .await
-            .map_err(map_quota_error)?;
-
-        let now = self.clock.now();
-        let media_id = MediaId::new();
-        let final_key = format!("objects/{media_id}");
-        let expire_at = request.expire_at.or_else(|| {
-            bucket
-                .policy()
-                .default_ttl_seconds()
-                .and_then(|seconds| i64::try_from(seconds).ok())
-                .map(|seconds| now + time::Duration::seconds(seconds))
-        });
-        let system_metadata = match SystemMetadata::new(
-            &request.mime,
-            request.size,
-            None,
-            None,
-            None,
-            request.sha256.clone(),
-        ) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                let _ = self
-                    .media_repository
-                    .release_quota(request.application_id, request.size)
-                    .await;
-                return Err(error.into());
-            }
-        };
-        let media = match Media::new(
-            NewMedia {
-                id: media_id,
-                application_id: request.application_id,
-                bucket_id: request.bucket_id,
-                object_key: request.object_key.clone(),
-                original_name: request.original_name.clone(),
-                display_name: request.display_name.clone(),
-                extension: request.extension.clone(),
-                storage_backend: self.object_store.backend_name().to_owned(),
-                storage_key: final_key,
-                visibility_override: request.visibility_override,
-                expire_at,
-                system_metadata,
-                client_metadata: request.metadata.clone(),
-            },
-            now,
-        ) {
-            Ok(media) => media,
-            Err(error) => {
-                let _ = self
-                    .media_repository
-                    .release_quota(request.application_id, request.size)
-                    .await;
-                return Err(error.into());
-            }
-        };
-        let lease_token = MediaId::new().to_string();
-        let leased_until = now + time::Duration::seconds(MEDIA_UPLOAD_LEASE_SECONDS);
-        if let Err(error) = self
-            .media_repository
-            .create_uploading(
-                media.clone(),
-                &request.temporary_key,
-                &lease_token,
-                leased_until,
-            )
-            .await
-        {
-            let _ = self
-                .media_repository
-                .release_quota(media.application_id(), media.size())
-                .await;
-            return Err(map_create_error(error));
-        }
-        if let Err(error) = run_storage_with_upload_lease(
-            &self.media_repository,
-            &self.clock,
-            media.id(),
-            &lease_token,
-            self.object_store
-                .commit_temporary(&request.temporary_key, media.storage_key()),
-        )
-        .await
-        {
-            return Err(error.into_application_error());
-        }
-        let event = OutboxEvent::media_uploaded(&media, now);
-        match self
-            .media_repository
-            .commit_upload(media.id(), &lease_token, self.clock.now(), event.clone())
-            .await
-        {
-            Ok(media) => Ok(UploadReceipt {
-                media,
-                event_id: event.id,
-            }),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Commits a Multipart-composed object whose bytes already own a durable
-    /// quota reservation. The completion token binds Media creation and
-    /// rollback to the active Multipart claim.
-    pub async fn upload_multipart_staged(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        request: &StagedUploadMediaRequest,
-    ) -> Result<UploadReceipt, ApplicationError>
-    where
-        M: S3MultipartRepository,
-    {
-        let bucket = self
-            .bucket_repository
-            .find_by_id(request.bucket_id)
-            .await?
-            .ok_or(ApplicationError::BucketNotFound)?;
-        if bucket.application_id() != request.application_id {
-            return Err(ApplicationError::BucketDoesNotBelongToApplication);
-        }
-        bucket.validate_upload(&request.mime, request.size)?;
-        if self
-            .media_repository
-            .find_by_object_key(
-                request.application_id,
-                request.bucket_id,
-                &request.object_key,
-            )
-            .await?
-            .is_some()
-        {
-            return Err(ApplicationError::ObjectAlreadyExists);
-        }
-
-        let now = self.clock.now();
-        let media_id = MediaId::new();
-        let final_key = format!("objects/{media_id}");
-        let expire_at = request.expire_at.or_else(|| {
-            bucket
-                .policy()
-                .default_ttl_seconds()
-                .and_then(|seconds| i64::try_from(seconds).ok())
-                .map(|seconds| now + time::Duration::seconds(seconds))
-        });
-        let media = self.build_staged_media(request, media_id, final_key, expire_at, now)?;
-        self.media_repository
-            .create_uploading_for_multipart(upload_id, completion_token, media.clone())
-            .await
-            .map_err(map_create_error)?;
-        if let Err(error) = self
-            .object_store
-            .commit_temporary(&request.temporary_key, media.storage_key())
-            .await
-        {
-            return Err(error.into());
-        }
-        let event = OutboxEvent::media_uploaded(&media, now);
-        match self
-            .media_repository
-            .commit_upload_for_multipart(
-                upload_id,
-                completion_token,
-                media.id(),
-                self.clock.now(),
-                event.clone(),
-            )
-            .await
-        {
-            Ok(media) => Ok(UploadReceipt {
-                media,
-                event_id: event.id,
-            }),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn build_staged_media(
-        &self,
-        request: &StagedUploadMediaRequest,
-        media_id: MediaId,
-        storage_key: String,
-        expire_at: Option<OffsetDateTime>,
-        now: OffsetDateTime,
-    ) -> Result<Media, ApplicationError> {
-        let system_metadata = SystemMetadata::new(
-            &request.mime,
-            request.size,
-            None,
-            None,
-            None,
-            request.sha256.clone(),
-        )?;
-        Ok(Media::new(
-            NewMedia {
-                id: media_id,
-                application_id: request.application_id,
-                bucket_id: request.bucket_id,
-                object_key: request.object_key.clone(),
-                original_name: request.original_name.clone(),
-                display_name: request.display_name.clone(),
-                extension: request.extension.clone(),
-                storage_backend: self.object_store.backend_name().to_owned(),
-                storage_key,
-                visibility_override: request.visibility_override,
-                expire_at,
-                system_metadata,
-                client_metadata: request.metadata.clone(),
-            },
-            now,
-        )?)
-    }
-
     fn build_uploading_media(
         &self,
         request: &UploadMediaRequest,
@@ -651,14 +368,13 @@ mod tests {
         ApplicationId, Bucket, BucketId, BucketPolicy, ClientMetadata, MediaState, OffsetDateTime,
         Visibility,
     };
-    use sha2::Digest as _;
 
     use crate::{
         ApplicationError, FixedClock, InMemoryBucketRepository, InMemoryMediaRepository,
-        InMemoryObjectStore, ObjectStore, ObjectStoreError, OutboxRepository, RepositoryError,
+        InMemoryObjectStore, ObjectStoreError, OutboxRepository, RepositoryError,
     };
 
-    use super::{StagedUploadMediaRequest, UploadMediaRequest, UploadMediaService};
+    use super::{UploadMediaRequest, UploadMediaService};
 
     fn setup() -> (
         ApplicationId,
@@ -751,47 +467,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn staged_upload_commits_composed_bytes_and_independent_sha256() {
-        let (application_id, bucket_id, object_store, repository, service) = setup();
-        let content = b"multipart-content";
-        block_on(object_store.put_temporary(
-            "temporary/multipart-complete",
-            content,
-            "application/octet-stream",
-        ))
-        .expect("stage composed content");
-        let sha256 = hex::encode(sha2::Sha256::digest(content));
-        let receipt = block_on(service.upload_staged(&StagedUploadMediaRequest {
-            application_id,
-            bucket_id,
-            object_key: "multipart/result.bin".to_owned(),
-            original_name: Some("result.bin".to_owned()),
-            display_name: "result.bin".to_owned(),
-            extension: Some("bin".to_owned()),
-            mime: "application/octet-stream".to_owned(),
-            temporary_key: "temporary/multipart-complete".to_owned(),
-            size: content.len() as u64,
-            sha256: sha256.clone(),
-            visibility_override: Some(Visibility::Public),
-            expire_at: None,
-            metadata: ClientMetadata::default(),
-        }))
-        .expect("commit staged upload");
-
-        assert_eq!(receipt.media.sha256(), sha256);
-        assert_eq!(
-            receipt.media.visibility_override(),
-            Some(Visibility::Public)
-        );
-        assert_eq!(
-            object_store.object_content(receipt.media.storage_key()),
-            Some(content.to_vec())
-        );
-        assert_eq!(object_store.temporary_count(), 0);
-        assert_eq!(repository.media_count(), 1);
     }
 
     #[test]

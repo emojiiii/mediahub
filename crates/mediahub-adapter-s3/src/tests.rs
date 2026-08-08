@@ -17,6 +17,7 @@
         ApplicationId, BucketId, ClientMetadata, MediaId, NewUploadSession, OffsetDateTime,
         UploadSession, UploadSessionId,
     };
+    use md5::Md5;
     use object_store::{
         Attribute, Attributes, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
         ObjectMeta, ObjectStore as BackendObjectStore, ObjectStoreExt, PutMultipartOptions,
@@ -81,6 +82,7 @@
             .expect("streamed S3 upload");
         assert_eq!(streamed.size, expected_size);
         assert_eq!(streamed.sha256, hex::encode(Sha256::digest(&expected)));
+        assert_eq!(streamed.md5, hex::encode(Md5::digest(&expected)));
         let stored = backend
             .get(&Path::from("tenant/temporary/streamed"))
             .await
@@ -107,6 +109,54 @@
         assert!(
             backend
                 .head(&Path::from("tenant/temporary/short"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_hashes_empty_object_and_rejects_nonempty_zero_length_body() {
+        let backend = Arc::new(InMemory::new());
+        let store = S3ObjectStore::from_backend(backend.clone(), Some("tenant"))
+            .expect("test object store");
+        let streamed = store
+            .put_temporary_stream(
+                "temporary/empty",
+                futures_util::stream::empty::<Result<Bytes, &str>>(),
+                0,
+                "application/octet-stream",
+            )
+            .await
+            .expect("empty S3 upload");
+        assert_eq!(streamed.size, 0);
+        assert_eq!(streamed.sha256, hex::encode(Sha256::digest([])));
+        assert_eq!(streamed.md5, hex::encode(Md5::digest([])));
+        let stored = backend
+            .get(&Path::from("tenant/temporary/empty"))
+            .await
+            .expect("stored empty object")
+            .bytes()
+            .await
+            .expect("empty object bytes");
+        assert!(stored.is_empty());
+
+        assert!(matches!(
+            store
+                .put_temporary_stream(
+                    "temporary/not-empty",
+                    futures_util::stream::iter([Ok::<Bytes, &str>(Bytes::from_static(b"x"))]),
+                    0,
+                    "application/octet-stream",
+                )
+                .await,
+            Err(StreamingUploadError::SizeMismatch {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        assert!(
+            backend
+                .head(&Path::from("tenant/temporary/not-empty"))
                 .await
                 .is_err()
         );

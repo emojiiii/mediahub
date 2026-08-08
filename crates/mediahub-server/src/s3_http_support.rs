@@ -5,6 +5,7 @@ fn s3_complete_multipart_response(
     bucket_name: &str,
     object_key: &str,
     etag: &str,
+    version_id: &S3VersionId,
     request_id: &str,
 ) -> Result<Response, S3ApiError> {
     let quoted_etag = if etag.starts_with('"') && etag.ends_with('"') {
@@ -15,7 +16,13 @@ fn s3_complete_multipart_response(
     let body =
         complete_multipart_upload_result_xml(location, bucket_name, object_key, &quoted_etag)
             .map_err(|error| S3ApiError::from_xml(error, location, request_id))?;
-    Ok(s3_xml_response(StatusCode::OK, body, request_id))
+    let mut response = s3_xml_response(StatusCode::OK, body, request_id);
+    response.headers_mut().insert(
+        HeaderName::from_static("x-amz-version-id"),
+        HeaderValue::from_str(version_id.as_str())
+            .map_err(|_| S3ApiError::service_unavailable(location, request_id))?,
+    );
+    Ok(response)
 }
 
 async fn s3_get_object_acl(
@@ -37,21 +44,31 @@ async fn s3_get_object_acl(
             S3ApiError::service_unavailable(uri.path(), request_id)
         })?
         .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), request_id))?;
-    let media = state
+    let object = state
         .repository
-        .find_by_object_key(auth.application.id, bucket.id(), object_key)
+        .find_s3_object(auth.application.id, bucket.id(), object_key)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 object ACL lookup failed");
             S3ApiError::service_unavailable(uri.path(), request_id)
         })?
-        .filter(|media| media.state().is_readable())
         .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
-    let acl = match media.effective_visibility(bucket.policy().visibility()) {
+    let current = state
+        .repository
+        .find_current_s3_object_version(object.id())
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 current object-version ACL lookup failed");
+            S3ApiError::service_unavailable(uri.path(), request_id)
+        })?
+        .filter(|version| matches!(version.payload(), ObjectVersionPayload::Object(_)))
+        .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
+    let _ = current;
+    let acl = match bucket.policy().visibility() {
         Visibility::Private => ObjectAcl::Private,
         Visibility::Public => ObjectAcl::PublicRead,
     };
-    let body = get_object_acl_xml(&auth.application.app_id, "MediaHub Application", acl)
+    let body = get_object_acl_xml(&auth.application.app_id, "PrismArk Application", acl)
         .map_err(|error| S3ApiError::from_xml(error, uri.path(), request_id))?;
     Ok(s3_xml_response(StatusCode::OK, body, request_id))
 }
@@ -90,45 +107,27 @@ async fn s3_put_object_acl(
             S3ApiError::service_unavailable(uri.path(), request_id)
         })?
         .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), request_id))?;
-    let mut media = state
+    let object = state
         .repository
-        .find_by_object_key(auth.application.id, bucket.id(), object_key)
+        .find_s3_object(auth.application.id, bucket.id(), object_key)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 object ACL lookup failed");
             S3ApiError::service_unavailable(uri.path(), request_id)
         })?
-        .filter(|media| media.state().is_readable())
         .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
-    if media.visibility_override() != Some(visibility) {
-        let expected_revision = media.revision();
-        let now = OffsetDateTime::now_utc();
-        media
-            .set_visibility_override(Some(visibility), expected_revision, now)
-            .map_err(|error| {
-                S3ApiError::invalid_argument(error.to_string(), uri.path(), request_id)
-            })?;
-        let event = OutboxEvent::media_metadata_updated(&media, now);
-        state
-            .repository
-            .update_media(media.clone(), expected_revision, event)
-            .await
-            .map_err(ApiError::from_repository)
-            .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
-        record_audit(
-            state,
-            auth,
-            request_id,
-            "media.updated",
-            "media",
-            media.id().to_string(),
-            serde_json::json!({
-                "protocol": "s3",
-                "acl": if visibility == Visibility::Public { "public-read" } else { "private" },
-                "object_key": object_key,
-            }),
-        )
-        .await;
+    state
+        .repository
+        .find_current_s3_object_version(object.id())
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 current object-version ACL lookup failed");
+            S3ApiError::service_unavailable(uri.path(), request_id)
+        })?
+        .filter(|version| matches!(version.payload(), ObjectVersionPayload::Object(_)))
+        .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
+    if visibility != bucket.policy().visibility() {
+        return Err(S3ApiError::acl_not_supported(uri.path(), request_id));
     }
     Ok(s3_empty_response(StatusCode::OK, request_id))
 }
@@ -170,25 +169,6 @@ fn validate_s3_object_key(
     }
 }
 
-pub(super) fn s3_object_names(
-    object_key: &str,
-    resource: &str,
-    request_id: &str,
-) -> Result<(String, Option<String>), S3ApiError> {
-    validate_s3_object_key(object_key, resource, request_id)?;
-    let display_name = object_key
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            S3ApiError::invalid_argument("The object key is invalid.", resource, request_id)
-        })?
-        .to_owned();
-    let extension = display_name
-        .rsplit_once('.')
-        .and_then(|(_, extension)| (!extension.is_empty()).then(|| extension.to_owned()));
-    Ok((display_name, extension))
-}
 
 fn s3_query_value(
     uri: &Uri,
@@ -212,6 +192,66 @@ fn s3_query_value(
 
 fn s3_query_flag(uri: &Uri, name: &'static str, request_id: &str) -> Result<bool, S3ApiError> {
     s3_query_value(uri, name, request_id).map(|value| value.is_some())
+}
+
+fn parse_s3_bypass_governance(
+    headers: &HeaderMap,
+    uri: &Uri,
+    request_id: &str,
+) -> Result<bool, S3ApiError> {
+    const HEADER: &str = "x-amz-bypass-governance-retention";
+    let values = headers.get_all(HEADER).iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        return Ok(false);
+    }
+    if values.len() != 1 {
+        return Err(S3ApiError::invalid_argument(
+            "x-amz-bypass-governance-retention must occur exactly once.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    let bypass = match values[0].to_str().ok() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => {
+            return Err(S3ApiError::invalid_argument(
+                "x-amz-bypass-governance-retention must be true or false.",
+                uri.path(),
+                request_id,
+            ));
+        }
+    };
+    // ParsedSigV4 intentionally keeps its canonical headers private. Since authentication
+    // has already succeeded, this protocol-level declaration check is sufficient to prove
+    // that the supplied governance header participated in that verified signature.
+    if !s3_sigv4_declares_signed_header(headers, uri, HEADER) {
+        return Err(S3ApiError::access_denied(
+            "x-amz-bypass-governance-retention must be included in SignedHeaders.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    Ok(bypass)
+}
+
+fn s3_sigv4_declares_signed_header(headers: &HeaderMap, uri: &Uri, expected: &str) -> bool {
+    let declared = if let Some(authorization) = headers.get("authorization") {
+        authorization.to_str().ok().and_then(|authorization| {
+            authorization.split(',').find_map(|field| {
+                field
+                    .trim()
+                    .strip_prefix("SignedHeaders=")
+                    .map(str::to_owned)
+            })
+        })
+    } else {
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .find_map(|(name, value)| {
+                (name == "X-Amz-SignedHeaders").then(|| value.into_owned())
+            })
+    };
+    declared.is_some_and(|headers| headers.split(';').any(|header| header == expected))
 }
 
 fn reject_s3_versioning(uri: &Uri, request_id: &str) -> Result<(), S3ApiError> {
@@ -323,8 +363,8 @@ pub(super) async fn s3_delete_object(
 ) -> Result<Response, S3ApiError> {
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    reject_s3_versioning(&uri, &request_id.0.0)?;
     if let Some(upload_id) = s3_query_value(&uri, "uploadId", &request_id.0.0)? {
+        reject_s3_versioning(&uri, &request_id.0.0)?;
         return s3_abort_multipart_upload(
             &state,
             &auth,
@@ -336,21 +376,50 @@ pub(super) async fn s3_delete_object(
         )
         .await;
     }
+
     auth.authorize("media:delete")
         .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
-    let bucket = state
-        .repository
-        .find_bucket_by_name(auth.application.id, &bucket_name)
+    validate_s3_object_key(&object_key, uri.path(), &request_id.0.0)?;
+    let version_id = parse_s3_version_id(&uri, &request_id.0.0)?;
+    let bypass_governance =
+        parse_s3_bypass_governance(&headers, &uri, &request_id.0.0)?;
+    let service = runtime_s3_object_service(&state, uri.path(), &request_id.0.0)?;
+    let receipt = service
+        .delete(&DeleteObjectRequest {
+            application_id: auth.application.id,
+            bucket_name,
+            object_key,
+            version_id,
+            bypass_governance,
+            deleted_by: auth.actor_id.clone(),
+        })
         .await
         .map_err(|error| {
-            warn!(error = %error, "S3 Bucket lookup failed");
-            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
-    schedule_s3_delete(&state, &auth, bucket.id(), &object_key, &request_id.0.0)
-        .await
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
-    Ok(s3_empty_response(StatusCode::NO_CONTENT, &request_id.0.0))
+            map_s3_object_service_error(error, uri.path(), &request_id.0.0)
+        })?;
+    s3_delete_object_response(&receipt, uri.path(), &request_id.0.0)
+}
+
+fn s3_delete_object_response(
+    receipt: &DeleteObjectReceipt,
+    resource: &str,
+    request_id: &str,
+) -> Result<Response, S3ApiError> {
+    let mut response = s3_empty_response(StatusCode::NO_CONTENT, request_id);
+    if let Some(version_id) = &receipt.version_id {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-amz-version-id"),
+            HeaderValue::from_str(version_id.as_str())
+                .map_err(|_| S3ApiError::internal_error(resource, request_id))?,
+        );
+    }
+    if receipt.delete_marker {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-amz-delete-marker"),
+            HeaderValue::from_static("true"),
+        );
+    }
+    Ok(response)
 }
 
 #[derive(Debug)]
@@ -360,6 +429,7 @@ pub(super) struct S3ApiError {
     message: String,
     resource: String,
     request_id: String,
+    response_headers: Box<HeaderMap>,
 }
 
 impl S3ApiError {
@@ -376,6 +446,7 @@ impl S3ApiError {
             message: message.into(),
             resource: resource.to_owned(),
             request_id: request_id.to_owned(),
+            response_headers: Box::default(),
         }
     }
 
@@ -426,6 +497,114 @@ impl S3ApiError {
         )
     }
 
+    fn invalid_bucket_name(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidBucketName",
+            "The specified bucket is not valid.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn bucket_already_owned_by_you(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "BucketAlreadyOwnedByYou",
+            "Your previous request to create the named bucket succeeded and you already own it.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn bucket_not_empty(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "BucketNotEmpty",
+            "The bucket you tried to delete is not empty.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_location_constraint(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidLocationConstraint",
+            "The specified location-constraint is not valid.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn malformed_xml(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_request(message: impl Into<String>, resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            message,
+            resource,
+            request_id,
+        )
+    }
+
+    fn access_denied(message: impl Into<String>, resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            message,
+            resource,
+            request_id,
+        )
+    }
+
+    fn no_such_lifecycle_configuration(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchLifecycleConfiguration",
+            "The lifecycle configuration does not exist.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_bucket_state(message: impl Into<String>, resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "InvalidBucketState",
+            message,
+            resource,
+            request_id,
+        )
+    }
+
+    fn method_not_allowed(message: impl Into<String>, resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            message,
+            resource,
+            request_id,
+        )
+    }
+    fn internal_error(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "We encountered an internal error. Please try again.",
+            resource,
+            request_id,
+        )
+    }
     fn no_such_key(resource: &str, request_id: &str) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
@@ -434,6 +613,43 @@ impl S3ApiError {
             resource,
             request_id,
         )
+    }
+
+    fn no_such_version(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchVersion",
+            "The specified version does not exist.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn delete_marker(
+        version_id: &S3VersionId,
+        is_current: bool,
+        resource: &str,
+        request_id: &str,
+    ) -> Self {
+        let mut error = if is_current {
+            Self::no_such_key(resource, request_id)
+        } else {
+            Self::method_not_allowed(
+                "The specified method is not allowed against this resource.",
+                resource,
+                request_id,
+            )
+        };
+        error.response_headers.insert(
+            HeaderName::from_static("x-amz-delete-marker"),
+            HeaderValue::from_static("true"),
+        );
+        if let Ok(value) = HeaderValue::from_str(version_id.as_str()) {
+            error
+                .response_headers
+                .insert(HeaderName::from_static("x-amz-version-id"), value);
+        }
+        error
     }
 
     fn no_such_upload(resource: &str, request_id: &str) -> Self {
@@ -451,6 +667,56 @@ impl S3ApiError {
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
             message,
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_digest(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidDigest",
+            "The Content-MD5 you specified is invalid.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn bad_digest(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "BadDigest",
+            "The Content-MD5 you specified did not match what we received.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn metadata_too_large(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "MetadataTooLarge",
+            "Your metadata headers exceed the maximum allowed metadata size.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_range(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "InvalidRange",
+            "The requested range is not satisfiable.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn precondition_failed(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold.",
             resource,
             request_id,
         )
@@ -621,6 +887,7 @@ impl IntoResponse for S3ApiError {
             HeaderValue::from_str(&self.request_id)
                 .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
         );
+        response.headers_mut().extend(*self.response_headers);
         response
     }
 }

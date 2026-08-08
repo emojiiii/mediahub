@@ -1,4 +1,4 @@
-// Multipart locking, validation, and row conversion helpers.
+// Multipart locking, validation, persistent cleanup, and row conversion helpers.
 
 async fn lock_upload(
     transaction: &mut Transaction<'_, Postgres>,
@@ -34,8 +34,13 @@ async fn validate_completion_owner(
     transaction: &mut Transaction<'_, Postgres>,
     upload: &S3MultipartUpload,
     completion_token: &str,
+    now: OffsetDateTime,
 ) -> Result<(), RepositoryError> {
-    if upload.state != S3MultipartUploadState::Completing {
+    if upload.state != S3MultipartUploadState::Completing
+        || upload
+            .completion_lease_until
+            .is_none_or(|lease_until| lease_until <= now)
+    {
         return Err(RepositoryError::Conflict);
     }
     let owns_claim = sqlx::query_scalar::<_, bool>(
@@ -53,7 +58,7 @@ async fn validate_completion_owner(
     }
 }
 
-async fn multipart_reserved_bytes(
+async fn multipart_stored_bytes(
     transaction: &mut Transaction<'_, Postgres>,
     upload_id: &str,
 ) -> Result<i64, RepositoryError> {
@@ -64,65 +69,6 @@ async fn multipart_reserved_bytes(
     .fetch_one(&mut **transaction)
     .await
     .map_err(database_error)
-}
-
-async fn adjust_reserved_bytes(
-    transaction: &mut Transaction<'_, Postgres>,
-    application_id: ApplicationId,
-    delta: i64,
-) -> Result<(), RepositoryError> {
-    if delta == 0 {
-        return Ok(());
-    }
-    let changed = if delta > 0 {
-        sqlx::query(
-            "UPDATE applications SET reserved_bytes = reserved_bytes + $1 WHERE id = $2 \
-             AND quota_bytes - used_bytes - reserved_bytes >= $1",
-        )
-        .bind(delta)
-        .bind(application_id.as_uuid())
-        .execute(&mut **transaction)
-        .await
-        .map_err(database_error)?
-    } else {
-        let released = delta.checked_neg().ok_or_else(|| {
-            RepositoryError::Invariant("multipart reservation delta overflow".into())
-        })?;
-        sqlx::query(
-            "UPDATE applications SET reserved_bytes = reserved_bytes - $1 WHERE id = $2 \
-             AND reserved_bytes >= $1",
-        )
-        .bind(released)
-        .bind(application_id.as_uuid())
-        .execute(&mut **transaction)
-        .await
-        .map_err(database_error)?
-    };
-    if changed.rows_affected() == 1 {
-        Ok(())
-    } else if delta > 0 {
-        Err(RepositoryError::QuotaExceeded)
-    } else {
-        Err(RepositoryError::Invariant(
-            "multipart upload has no matching quota reservation".into(),
-        ))
-    }
-}
-
-async fn abort_and_release_parts(
-    transaction: &mut Transaction<'_, Postgres>,
-    upload: &S3MultipartUpload,
-    now: OffsetDateTime,
-) -> Result<(), RepositoryError> {
-    if !matches!(
-        upload.state,
-        S3MultipartUploadState::Pending | S3MultipartUploadState::Completing
-    ) {
-        return Err(RepositoryError::Conflict);
-    }
-    let reserved = multipart_reserved_bytes(transaction, &upload.upload_id).await?;
-    adjust_reserved_bytes(transaction, upload.application_id, -reserved).await?;
-    mark_aborted(transaction, &upload.upload_id, now).await
 }
 
 async fn mark_aborted(
@@ -173,6 +119,155 @@ async fn list_storage_keys(
     .map_err(database_error)
 }
 
+fn multipart_gc_task(
+    upload: &S3MultipartUpload,
+    upload_intent_id: Option<UploadIntentId>,
+    storage_key: String,
+    now: OffsetDateTime,
+) -> NewStorageGcTask {
+    NewStorageGcTask {
+        id: StorageGcTaskId::new(),
+        application_id: upload.application_id,
+        bucket_id: upload.bucket_id,
+        object_version_id: None,
+        upload_intent_id,
+        multipart_upload_id: Some(upload.upload_id.clone()),
+        storage_backend: upload.storage_backend.clone(),
+        storage_key,
+        reason: StorageGcReason::MultipartTemporary,
+        not_before: now,
+        max_attempts: DEFAULT_S3_MULTIPART_GC_MAX_ATTEMPTS,
+        created_at: now,
+    }
+}
+
+async fn enqueue_multipart_storage_keys(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    upload_intent_id: Option<UploadIntentId>,
+    storage_keys: impl IntoIterator<Item = String>,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    for storage_key in storage_keys {
+        let task = multipart_gc_task(upload, upload_intent_id, storage_key, now);
+        insert_storage_gc_task(transaction, &task).await?;
+    }
+    Ok(())
+}
+
+fn validate_intent_identity(
+    upload: &S3MultipartUpload,
+    intent: &UploadIntent,
+) -> Result<(), RepositoryError> {
+    if intent.application_id() != upload.application_id
+        || intent.bucket_id() != upload.bucket_id
+        || intent.object_key() != upload.object_key
+        || intent.storage_backend() != upload.storage_backend
+        || intent.content_type() != Some(upload.content_type.as_str())
+        || intent.user_metadata() != &upload.user_metadata
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    Ok(())
+}
+
+fn validate_attachable_intent(
+    upload: &S3MultipartUpload,
+    intent: &UploadIntent,
+    completion_token: &str,
+    total_size: u64,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    validate_intent_identity(upload, intent)?;
+    if intent.state() != UploadIntentState::Committing
+        || intent.lease_token() != Some(completion_token)
+        || intent.lease_until().is_none_or(|lease_until| lease_until <= now)
+        || intent.expected_size_bytes() != total_size
+        || intent.size_bytes() != Some(total_size)
+        || intent.entity_tag().is_none_or(|etag| !is_multipart_etag(etag.as_str()))
+        || intent.checksum().is_none()
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    Ok(())
+}
+
+async fn enqueue_attached_intent_cleanup(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    intent: &UploadIntent,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    validate_intent_identity(upload, intent)?;
+    enqueue_multipart_storage_keys(
+        transaction,
+        upload,
+        Some(intent.id()),
+        [
+            intent.temporary_storage_key().to_owned(),
+            intent.final_storage_key().to_owned(),
+        ],
+        now,
+    )
+    .await
+}
+
+async fn abort_attached_intent(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    completion_token: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    let Some(intent_id) = upload.upload_intent_id else {
+        return Ok(());
+    };
+    let intent = lock_upload_intent(transaction, intent_id).await?;
+    validate_intent_identity(upload, &intent)?;
+    if intent.state() == UploadIntentState::Committed {
+        return Err(RepositoryError::Conflict);
+    }
+    if completion_token.is_some()
+        && intent.state() == UploadIntentState::Committing
+        && intent.lease_token() != completion_token
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    enqueue_attached_intent_cleanup(transaction, upload, &intent, now).await?;
+    if !matches!(intent.state(), UploadIntentState::Aborted | UploadIntentState::Expired) {
+        let changed = sqlx::query(
+            "UPDATE s3_upload_intents SET state = 'aborted', lease_token = NULL, \
+             lease_until = NULL, updated_at = $2 WHERE id = $1 AND state <> 'committed'",
+        )
+        .bind(intent_id.as_uuid())
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        if changed.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+    }
+    Ok(())
+}
+
+async fn abort_upload_and_enqueue_cleanup(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    completion_token: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    if !matches!(
+        upload.state,
+        S3MultipartUploadState::Pending | S3MultipartUploadState::Completing
+    ) {
+        return Err(RepositoryError::Conflict);
+    }
+    abort_attached_intent(transaction, upload, completion_token, now).await?;
+    let storage_keys = list_storage_keys(transaction, &upload.upload_id).await?;
+    enqueue_multipart_storage_keys(transaction, upload, None, storage_keys, now).await?;
+    mark_aborted(transaction, &upload.upload_id, now).await
+}
+
 fn validate_manifest(
     manifest: &[CompletedS3MultipartPart],
     parts: &[S3MultipartPart],
@@ -210,7 +305,39 @@ fn validate_manifest(
         .collect()
 }
 
+fn selected_total_size(parts: &[S3MultipartPart]) -> Result<u64, RepositoryError> {
+    parts.iter().try_fold(0_u64, |total, part| {
+        total
+            .checked_add(part.size)
+            .ok_or_else(|| RepositoryError::Invariant("multipart total size exceeds u64".into()))
+    })
+}
+
 fn row_to_multipart_upload(row: PgRow) -> Result<S3MultipartUpload, RepositoryError> {
+    let final_etag = row
+        .try_get::<Option<String>, _>("final_etag")
+        .map_err(database_error)?
+        .map(EntityTag::new)
+        .transpose()
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+    let checksum_algorithm = row
+        .try_get::<Option<String>, _>("final_checksum_algorithm")
+        .map_err(database_error)?;
+    let checksum_value = row
+        .try_get::<Option<String>, _>("final_checksum_value")
+        .map_err(database_error)?;
+    let final_checksum = match (checksum_algorithm.as_deref(), checksum_value) {
+        (None, None) => None,
+        (Some("sha256"), Some(value)) => Some(
+            Checksum::sha256_hex(value)
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?,
+        ),
+        _ => {
+            return Err(RepositoryError::Invariant(
+                "persisted multipart checksum fields are inconsistent".into(),
+            ));
+        }
+    };
     Ok(S3MultipartUpload {
         upload_id: row.try_get("upload_id").map_err(database_error)?,
         application_id: ApplicationId::from_uuid(
@@ -219,21 +346,30 @@ fn row_to_multipart_upload(row: PgRow) -> Result<S3MultipartUpload, RepositoryEr
         bucket_id: BucketId::from_uuid(row.try_get("bucket_id").map_err(database_error)?),
         object_key: row.try_get("object_key").map_err(database_error)?,
         content_type: row.try_get("content_type").map_err(database_error)?,
-        visibility_override: row
-            .try_get::<Option<String>, _>("visibility_override")
+        user_metadata: row
+            .try_get::<Json<serde_json::Value>, _>("user_metadata")
             .map_err(database_error)?
-            .map(|value| parse_visibility(&value))
-            .transpose()?,
+            .0,
+        storage_backend: row.try_get("storage_backend").map_err(database_error)?,
         state: parse_state(&row.try_get::<String, _>("state").map_err(database_error)?)?,
         expires_at: row.try_get("expires_at").map_err(database_error)?,
         completion_lease_until: row
             .try_get("completion_lease_until")
             .map_err(database_error)?,
-        media_id: row
-            .try_get::<Option<uuid::Uuid>, _>("media_id")
+        upload_intent_id: row
+            .try_get::<Option<uuid::Uuid>, _>("upload_intent_id")
             .map_err(database_error)?
-            .map(MediaId::from_uuid),
-        final_etag: row.try_get("final_etag").map_err(database_error)?,
+            .map(UploadIntentId::from_uuid),
+        object_id: row
+            .try_get::<Option<uuid::Uuid>, _>("object_id")
+            .map_err(database_error)?
+            .map(ObjectId::from_uuid),
+        object_version_id: row
+            .try_get::<Option<uuid::Uuid>, _>("object_version_id")
+            .map_err(database_error)?
+            .map(ObjectVersionId::from_uuid),
+        final_etag,
+        final_checksum,
         completed_at: row.try_get("completed_at").map_err(database_error)?,
         aborted_at: row.try_get("aborted_at").map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
@@ -252,6 +388,7 @@ fn row_to_multipart_part(row: PgRow) -> Result<S3MultipartPart, RepositoryError>
         })?,
         size: as_u64(row.try_get("size_bytes").map_err(database_error)?)?,
         sha256: row.try_get("sha256").map_err(database_error)?,
+        md5: row.try_get("md5").map_err(database_error)?,
         etag: row.try_get("etag").map_err(database_error)?,
         storage_key: row.try_get("storage_key").map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,

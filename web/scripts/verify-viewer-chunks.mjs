@@ -32,8 +32,8 @@ const mainMatch = html.match(/<script[^>]+src="\/assets\/([^"?]+\.js)"/)
 if (!mainMatch) throw new Error('Unable to resolve the main JavaScript asset from index.html')
 
 const mainAsset = mainMatch[1]
-const objectViewerAsset = findAsset(/^ObjectFileViewer-.*\.js$/, 'ObjectFileViewer JavaScript')
-const objectViewerCssAsset = findAsset(/^ObjectFileViewer-.*\.css$/, 'ObjectFileViewer CSS')
+const objectViewerAsset = findAsset(/^PreviewSurface-.*\.js$/, 'PreviewSurface JavaScript')
+const objectViewerCssAsset = findAsset(/^PreviewSurface-.*\.css$/, 'PreviewSurface CSS')
 const archivePluginAsset = findAsset(/^ArchivePreviewPlugin-.*\.js$/, 'ArchivePreviewPlugin')
 const archiveWorkerAsset = findAsset(/^archive\.worker-.*\.js$/, 'archive Worker')
 const archiveWasmAsset = findAsset(/^libarchive-.*\.wasm$/, 'libarchive WASM')
@@ -142,7 +142,7 @@ const [cMapFiles, standardFontFiles] = await Promise.all([
 if (cMapFiles.length < 100) throw new Error(`Expected local PDF CMaps, found only ${cMapFiles.length}`)
 if (standardFontFiles.length < 10) throw new Error(`Expected local PDF standard fonts, found only ${standardFontFiles.length}`)
 if (!objectViewer.includes('pdfjs/') || !objectViewer.includes('cmaps/') || !objectViewer.includes('standard_fonts/')) {
-  throw new Error('ObjectFileViewer does not reference the locally bundled PDF support assets')
+  throw new Error('PreviewSurface does not reference the locally bundled PDF support assets')
 }
 
 console.log(

@@ -11,11 +11,15 @@ mod data_plane;
 mod error;
 mod image;
 mod memory;
+#[cfg(test)]
+mod memory_s3;
 #[cfg(feature = "object-store-contract-tests")]
 #[doc(hidden)]
 pub mod object_store_contract;
 mod ports;
 mod s3_multipart;
+mod s3_object_service;
+mod s3_repository;
 mod upload;
 mod upload_session;
 mod variant;
@@ -59,16 +63,30 @@ pub use ports::{
     WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
 };
 pub use s3_multipart::{
-    CompletedS3MultipartPart, MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION,
-    MAX_S3_MULTIPART_EXPIRY_LIMIT, MAX_S3_MULTIPART_PART_NUMBER, MIN_S3_MULTIPART_PART_NUMBER,
-    NewS3MultipartPart, NewS3MultipartUpload, S3MultipartAbort, S3MultipartCompletionClaim,
-    S3MultipartCompletionFinish, S3MultipartCompletionRelease, S3MultipartExpiredUpload,
-    S3MultipartManifest, S3MultipartManifestError, S3MultipartPart, S3MultipartPartPut,
-    S3MultipartRepository, S3MultipartUpload, S3MultipartUploadState,
+    CompletedS3MultipartPart, DEFAULT_S3_MULTIPART_GC_MAX_ATTEMPTS,
+    MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION, MAX_S3_MULTIPART_EXPIRY_LIMIT,
+    MAX_S3_MULTIPART_PART_NUMBER, MIN_S3_MULTIPART_PART_NUMBER, NewS3MultipartPart,
+    NewS3MultipartUpload, S3MultipartAbort, S3MultipartCompletionClaim,
+    S3MultipartCompletionRelease, S3MultipartExpiredUpload, S3MultipartManifest,
+    S3MultipartManifestError, S3MultipartPart, S3MultipartPartPut, S3MultipartRepository,
+    S3MultipartUpload, S3MultipartUploadState, is_lowercase_md5_hex, is_multipart_etag,
+};
+pub use s3_object_service::{
+    AbortStagedPutRequest, BeginPutObjectReceipt, BeginPutObjectRequest, CompletePutObjectReceipt,
+    CompletePutObjectRequest, DEFAULT_S3_UPLOAD_INTENT_TTL_SECONDS,
+    DEFAULT_S3_UPLOAD_LEASE_SECONDS, DeleteObjectReceipt, DeleteObjectRequest,
+    ListObjectVersionsRequest, S3GetObjectReceipt, S3HeadObjectReceipt, S3ObjectRequest,
+    S3ObjectService, S3ObjectServiceError,
+};
+pub use s3_repository::{
+    DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion, MAX_S3_OBJECT_LIST_LIMIT,
+    MAX_STORAGE_GC_CLAIM_LIMIT, MAX_UPLOAD_INTENT_EXPIRY_LIMIT, S3BucketRepository,
+    S3DeleteLockReason, S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectPage,
+    S3ObjectRepository, S3ObjectVersionCommit, S3UploadIntentRepository, StorageGcRepository,
 };
 pub use upload::{
-    MEDIA_UPLOAD_HEARTBEAT_SECONDS, MEDIA_UPLOAD_LEASE_SECONDS, StagedUploadMediaRequest,
-    UploadMediaRequest, UploadMediaService, UploadReceipt,
+    MEDIA_UPLOAD_HEARTBEAT_SECONDS, MEDIA_UPLOAD_LEASE_SECONDS, UploadMediaRequest,
+    UploadMediaService, UploadReceipt,
 };
 pub use upload_session::{
     CancelUploadSessionReceipt, CancelUploadSessionRequest, CompleteUploadSessionRequest,

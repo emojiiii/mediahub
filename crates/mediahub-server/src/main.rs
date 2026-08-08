@@ -47,19 +47,19 @@ use mediahub_app::{
     MEDIA_UPLOAD_HEARTBEAT_SECONDS, MEDIA_UPLOAD_LEASE_SECONDS, MIN_DOWNLOAD_BYTES_PER_SECOND,
     MediaDirectoryListCursor, MediaDirectoryListQuery, MediaListCursor, MediaListQuery,
     MediaRepository, NewAccessKey, NewWebhookEndpoint, ObjectStore, ObjectStoreError,
-    OneTimeTokenPurpose, OutboxEvent, S3MultipartRepository, SecretKeyVersionRepository,
-    SessionRecord, UploadMediaRequest, UploadMediaService, UploadSessionRepository,
-    UploadSessionService, UploadSessionStorage, UploadTarget, UserAccount, VariantApplicationError,
-    VariantService, WebhookDelivery, WebhookDeliveryFailureDisposition,
-    WebhookDeliveryHistoryCursor, WebhookDeliveryHistoryItem, WebhookDeliveryHistoryQuery,
-    WebhookDeliveryHistoryStatus, WebhookDeliveryRepository, WebhookEndpoint,
-    WebhookEndpointRepository, WebhookEndpointUpdate,
+    OneTimeTokenPurpose, OutboxEvent, S3MultipartRepository, S3UploadIntentRepository,
+    SecretKeyVersionRepository, SessionRecord, StorageGcRepository, UploadMediaRequest,
+    UploadMediaService, UploadSessionRepository, UploadSessionService, UploadSessionStorage,
+    UploadTarget, UserAccount, VariantApplicationError, VariantService, WebhookDelivery,
+    WebhookDeliveryFailureDisposition, WebhookDeliveryHistoryCursor, WebhookDeliveryHistoryItem,
+    WebhookDeliveryHistoryQuery, WebhookDeliveryHistoryStatus, WebhookDeliveryRepository,
+    WebhookEndpoint, WebhookEndpointRepository, WebhookEndpointUpdate,
 };
 use mediahub_core::{
     ApplicationId, AsyncJobAction, AsyncJobId, AsyncJobItemResult, Bucket, BucketId, BucketPolicy,
     ClientMetadata, CropPosition, DomainError, LifecycleRule, Media, MediaId, MediaState,
-    OffsetDateTime, UploadSession, UploadSessionId, UploadSessionState, UserId, VariantFit,
-    VariantFormat, VariantTransform, Visibility,
+    OffsetDateTime, StorageGcTask, UploadSession, UploadSessionId, UploadSessionState, UserId,
+    VariantFit, VariantFormat, VariantTransform, Visibility,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -85,6 +85,7 @@ mod s3_gateway;
 mod s3_http;
 mod s3_list;
 mod s3_multipart_storage;
+mod s3_router;
 mod s3_xml;
 mod server_config;
 mod system_update;
@@ -268,6 +269,7 @@ impl MediaUrlSigner {
 struct AppState {
     repository: PostgresRepository,
     object_store: RuntimeObjectStore,
+    s3_gc_grace: time::Duration,
     webdav: webdav::WebDavService,
     access_key_cipher: Arc<AccessKeyCipher>,
     media_url_signer: Arc<MediaUrlSigner>,

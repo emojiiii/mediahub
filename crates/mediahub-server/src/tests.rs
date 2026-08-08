@@ -1,6 +1,8 @@
 use base64::engine::general_purpose::STANDARD;
+use mediahub_app::{S3MultipartUploadState, S3ObjectRepository};
+use mediahub_core::ObjectVersionPayload;
 
-use super::s3_http::{S3ApiError, s3_object_names};
+use super::s3_http::S3ApiError;
 use super::*;
 
 #[test]
@@ -46,6 +48,7 @@ async fn auth_test_state(pool: sqlx::PgPool, registration_enabled: bool) -> Arc<
     Arc::new(AppState {
         repository,
         object_store,
+        s3_gc_grace: time::Duration::hours(24),
         webdav,
         access_key_cipher,
         media_url_signer: Arc::new(MediaUrlSigner::new(vec![7; 32])),
@@ -392,7 +395,7 @@ fn s3_test_xml_value(xml: &str, element: &str) -> Option<String> {
 }
 
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
-async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx::PgPool) {
+async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(pool: sqlx::PgPool) {
     let state = auth_test_state(pool, true).await;
     let storage_root = state.object_store.root().to_path_buf();
     let (user_id, _) = authenticated_test_user(&state, "s3-gateway@example.com", "user").await;
@@ -468,7 +471,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
             secret_key_version: state.access_key_cipher.version(),
             secret_last_four: "cret".into(),
             name: "sub2api backup S3".into(),
-            permissions: vec!["media:upload".into()],
+            permissions: vec!["media:upload".into(), "bucket:list".into()],
             expires_at: None,
             created_at: OffsetDateTime::now_utc(),
         })
@@ -478,7 +481,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
-        let application = router((*state).clone(), None);
+        let application = s3_router::router(Arc::clone(&state));
         async move {
             axum::serve(listener, application)
                 .await
@@ -486,7 +489,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         }
     });
     let client = reqwest::Client::new();
-    let bucket_url = format!("http://{address}/s3/{}", bucket.name());
+    let bucket_url = format!("http://{address}/{}", bucket.name());
     let mut head_bucket = http::Request::builder()
         .method(Method::HEAD)
         .uri(&bucket_url)
@@ -518,7 +521,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
             .is_empty()
     );
     let object_key = "images/imgtask_test-0.png";
-    let url = format!("http://{address}/s3/{}/{}", bucket.name(), object_key);
+    let url = format!("http://{address}/{}/{}", bucket.name(), object_key);
     let content = b"generated-image-png".to_vec();
 
     let mut put = http::Request::builder()
@@ -534,20 +537,39 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     assert_eq!(put_response.status(), StatusCode::OK);
     assert!(put_response.headers().contains_key(ETAG));
     assert!(put_response.headers().contains_key("x-amz-request-id"));
+    assert_eq!(put_response.headers()["x-amz-version-id"], "null");
 
-    let media = state
+    let object = state
         .repository
-        .find_by_object_key(application.id, bucket.id(), object_key)
+        .find_s3_object(application.id, bucket.id(), object_key)
         .await
-        .expect("media lookup")
-        .expect("MediaHub media record");
-    assert_eq!(media.mime(), "image/png");
-    assert_eq!(media.size(), content.len() as u64);
+        .expect("S3 object lookup")
+        .expect("S3 object");
+    let version = state
+        .repository
+        .find_current_s3_object_version(object.id())
+        .await
+        .expect("current object-version lookup")
+        .expect("current object version");
+    assert_eq!(version.external_version_id().as_str(), "null");
+    let ObjectVersionPayload::Object(payload) = version.payload() else {
+        panic!("regular PutObject must commit an object payload");
+    };
+    assert_eq!(payload.content_type(), Some("image/png"));
+    assert_eq!(payload.size_bytes(), content.len() as u64);
+    assert_eq!(
+        state
+            .object_store
+            .read(payload.storage_key())
+            .await
+            .expect("read committed regular object"),
+        content
+    );
 
     // This crosses the former Axum Bytes-extractor limit and exercises the
     // same ordinary PutObject shape used by sub2api backups.
     let large_key = "backups/sub2api-backup.sql.gz";
-    let large_url = format!("http://{address}/s3/{}/{}", bucket.name(), large_key);
+    let large_url = format!("http://{address}/{}/{}", bucket.name(), large_key);
     let large_size = 64 * 1024 * 1024 + 1;
     let mut large_put = http::Request::builder()
         .method(Method::PUT)
@@ -566,14 +588,23 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         StatusCode::OK,
         "large backup PUT response: {large_body}"
     );
-    let large_media = state
+    let large_object = state
         .repository
-        .find_by_object_key(application.id, bucket.id(), large_key)
+        .find_s3_object(application.id, bucket.id(), large_key)
         .await
-        .expect("large backup media lookup")
-        .expect("large backup MediaHub media record");
-    assert_eq!(large_media.size(), large_size as u64);
-    assert_eq!(large_media.mime(), "application/gzip");
+        .expect("large backup object lookup")
+        .expect("large backup S3 object");
+    let large_version = state
+        .repository
+        .find_current_s3_object_version(large_object.id())
+        .await
+        .expect("large backup current-version lookup")
+        .expect("large backup current version");
+    let ObjectVersionPayload::Object(large_payload) = large_version.payload() else {
+        panic!("large PutObject must commit an object payload");
+    };
+    assert_eq!(large_payload.size_bytes(), large_size as u64);
+    assert_eq!(large_payload.content_type(), Some("application/gzip"));
 
     let mut get = http::Request::builder()
         .method(Method::GET)
@@ -595,21 +626,50 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         content
     );
 
-    let mut versioned_get = http::Request::builder()
+    let mut null_version_get = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{url}?versionId=null"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("null-version GET request");
+    sign_s3_test_request(
+        &mut null_version_get,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let null_version_get = send_s3_test_request(&client, null_version_get).await;
+    assert_eq!(null_version_get.status(), StatusCode::OK);
+    assert_eq!(null_version_get.headers()["x-amz-version-id"], "null");
+    assert_eq!(
+        null_version_get
+            .bytes()
+            .await
+            .expect("null-version GET body")
+            .as_ref(),
+        content
+    );
+
+    let mut unknown_version_get = http::Request::builder()
         .method(Method::GET)
         .uri(format!("{url}?versionId=1"))
         .header("host", address.to_string())
         .body(Vec::new())
-        .expect("versioned GET request");
-    sign_s3_test_request(&mut versioned_get, access_key_id, access_key_secret, None);
-    let versioned_get = send_s3_test_request(&client, versioned_get).await;
-    assert_eq!(versioned_get.status(), StatusCode::NOT_IMPLEMENTED);
+        .expect("unknown-version GET request");
+    sign_s3_test_request(
+        &mut unknown_version_get,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let unknown_version_get = send_s3_test_request(&client, unknown_version_get).await;
+    assert_eq!(unknown_version_get.status(), StatusCode::NOT_FOUND);
     assert!(
-        versioned_get
+        unknown_version_get
             .text()
             .await
-            .expect("Versioning error XML")
-            .contains("<Code>NotImplemented</Code>")
+            .expect("NoSuchVersion XML")
+            .contains("<Code>NoSuchVersion</Code>")
     );
 
     let mut head = http::Request::builder()
@@ -636,7 +696,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         .method(Method::PUT)
         .uri(format!("{url}?acl"))
         .header("host", address.to_string())
-        .header("x-amz-acl", "public-read")
+        .header("x-amz-acl", "private")
         .body(Vec::new())
         .expect("PutObjectAcl request");
     sign_s3_test_request(&mut put_acl, access_key_id, access_key_secret, None);
@@ -659,14 +719,15 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     let get_acl = send_s3_test_request(&client, get_acl).await;
     assert_eq!(get_acl.status(), StatusCode::OK);
     let acl_xml = get_acl.text().await.expect("ACL XML");
-    assert!(acl_xml.contains("groups/global/AllUsers"));
-    assert!(acl_xml.contains("<Permission>READ</Permission>"));
+    assert!(acl_xml.contains("PrismArk Application"));
+    assert!(!acl_xml.contains("groups/global/AllUsers"));
+    assert!(acl_xml.contains("<Permission>FULL_CONTROL</Permission>"));
 
     let mut unsupported_acl = http::Request::builder()
         .method(Method::PUT)
         .uri(format!("{url}?acl"))
         .header("host", address.to_string())
-        .header("x-amz-acl", "authenticated-read")
+        .header("x-amz-acl", "public-read")
         .body(Vec::new())
         .expect("unsupported ACL request");
     sign_s3_test_request(&mut unsupported_acl, access_key_id, access_key_secret, None);
@@ -681,13 +742,14 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     );
 
     let multipart_key = "images/multipart-result.bin";
-    let multipart_url = format!("http://{address}/s3/{}/{}", bucket.name(), multipart_key);
+    let multipart_url = format!("http://{address}/{}/{}", bucket.name(), multipart_key);
     let mut create_multipart = http::Request::builder()
         .method(Method::POST)
         .uri(format!("{multipart_url}?uploads"))
         .header("host", address.to_string())
         .header(CONTENT_TYPE, "application/octet-stream")
         .header("x-amz-acl", "private")
+        .header("x-amz-meta-project", "prismark")
         .body(Vec::new())
         .expect("CreateMultipartUpload request");
     sign_s3_test_request(
@@ -750,7 +812,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         .uri(format!("{multipart_url}?uploadId={upload_id}"))
         .header("host", address.to_string())
         .header(CONTENT_TYPE, "application/xml")
-        .body(complete_body)
+        .body(complete_body.clone())
         .expect("CompleteMultipartUpload request");
     sign_s3_test_request(
         &mut complete_multipart,
@@ -760,42 +822,93 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     );
     let complete_multipart = send_s3_test_request(&client, complete_multipart).await;
     let complete_status = complete_multipart.status();
+    let complete_version_id = complete_multipart
+        .headers()
+        .get("x-amz-version-id")
+        .expect("multipart version id")
+        .to_str()
+        .expect("multipart version id text")
+        .to_owned();
     let complete_xml = complete_multipart.text().await.expect("complete XML");
     assert_eq!(
         complete_status,
         StatusCode::OK,
         "CompleteMultipartUpload response: {complete_xml}"
     );
+    assert_eq!(complete_version_id, "null");
     assert!(complete_xml.contains("<CompleteMultipartUploadResult"));
     assert!(complete_xml.contains("<ETag>&quot;"));
+    let completed_etag = s3_test_xml_value(&complete_xml, "ETag").expect("completed ETag");
 
-    let multipart_media = state
+    let multipart_object = state
         .repository
-        .find_by_object_key(application.id, bucket.id(), multipart_key)
+        .find_s3_object(application.id, bucket.id(), multipart_key)
         .await
-        .expect("multipart media lookup")
-        .expect("multipart Media");
+        .expect("multipart object lookup")
+        .expect("multipart S3 object");
+    let multipart_version = state
+        .repository
+        .find_current_s3_object_version(multipart_object.id())
+        .await
+        .expect("multipart current-version lookup")
+        .expect("multipart current version");
+    assert_eq!(multipart_version.external_version_id().as_str(), "null");
+    let ObjectVersionPayload::Object(multipart_payload) = multipart_version.payload() else {
+        panic!("CompleteMultipartUpload must commit an object payload");
+    };
     assert_eq!(
-        multipart_media.size(),
+        multipart_payload.size_bytes(),
         (first_part.len() + second_part.len()) as u64
     );
     assert_eq!(
-        multipart_media.visibility_override(),
-        Some(Visibility::Private)
+        multipart_payload.content_type(),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        multipart_payload.user_metadata()["project"],
+        serde_json::json!("prismark")
     );
     let mut expected_multipart = first_part.clone();
     expected_multipart.extend_from_slice(&second_part);
     assert_eq!(
         state
             .object_store
-            .read(multipart_media.storage_key())
+            .read(multipart_payload.storage_key())
             .await
-            .expect("read composed multipart"),
+            .expect("read composed multipart ObjectVersion payload"),
         expected_multipart
+    );
+    let completion_gc_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM storage_gc_tasks WHERE multipart_upload_id = $1",
+    )
+    .bind(&upload_id)
+    .fetch_one(state.repository.pool())
+    .await
+    .expect("multipart completion GC tasks");
+    assert_eq!(completion_gc_count, 3);
+
+    let mut replay_complete = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("{multipart_url}?uploadId={upload_id}"))
+        .header("host", address.to_string())
+        .header(CONTENT_TYPE, "application/xml")
+        .body(complete_body)
+        .expect("replayed CompleteMultipartUpload request");
+    sign_s3_test_request(&mut replay_complete, access_key_id, access_key_secret, None);
+    let replay_complete = send_s3_test_request(&client, replay_complete).await;
+    assert_eq!(replay_complete.status(), StatusCode::OK);
+    assert_eq!(
+        replay_complete.headers()["x-amz-version-id"],
+        complete_version_id
+    );
+    let replay_xml = replay_complete.text().await.expect("replayed complete XML");
+    assert_eq!(
+        s3_test_xml_value(&replay_xml, "ETag").expect("replayed ETag"),
+        completed_etag
     );
 
     let aborted_key = "images/aborted-multipart.bin";
-    let aborted_url = format!("http://{address}/s3/{}/{}", bucket.name(), aborted_key);
+    let aborted_url = format!("http://{address}/{}/{}", bucket.name(), aborted_key);
     let mut create_aborted = http::Request::builder()
         .method(Method::POST)
         .uri(format!("{aborted_url}?uploads"))
@@ -831,27 +944,34 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         send_s3_test_request(&client, abort).await.status(),
         StatusCode::NO_CONTENT
     );
-    assert!(
-        state
-            .repository
-            .list_multipart_parts(&aborted_upload_id)
-            .await
-            .expect("aborted multipart metadata")
-            .is_empty()
-    );
+    let aborted_upload = state
+        .repository
+        .find_multipart_upload(&aborted_upload_id)
+        .await
+        .expect("aborted multipart lookup")
+        .expect("aborted multipart row");
+    assert_eq!(aborted_upload.state, S3MultipartUploadState::Aborted);
+    let aborted_parts = state
+        .repository
+        .list_multipart_parts(&aborted_upload_id)
+        .await
+        .expect("aborted multipart metadata");
+    assert_eq!(aborted_parts.len(), 1);
     assert!(
         state
             .object_store
-            .list(
-                &s3_multipart_storage::multipart_upload_prefix(&aborted_upload_id),
-                None,
-                1_000,
-            )
+            .exists(&aborted_parts[0].storage_key)
             .await
-            .expect("aborted multipart storage prefix")
-            .objects
-            .is_empty()
+            .expect("aborted part still awaits persistent GC")
     );
+    let aborted_gc_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM storage_gc_tasks WHERE multipart_upload_id = $1",
+    )
+    .bind(&aborted_upload_id)
+    .fetch_one(state.repository.pool())
+    .await
+    .expect("aborted multipart GC tasks");
+    assert_eq!(aborted_gc_count, 1);
 
     let mut first_list = http::Request::builder()
         .method(Method::GET)
@@ -906,6 +1026,21 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         send_s3_test_request(&client, repeat_delete).await.status(),
         StatusCode::NO_CONTENT
     );
+    let deleted_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), object_key)
+        .await
+        .expect("deleted object lookup")
+        .expect("logical object is retained for audit");
+    assert!(deleted_object.current_version_id().is_none());
+    assert!(
+        state
+            .repository
+            .find_current_s3_object_version(deleted_object.id())
+            .await
+            .expect("deleted object current-version lookup")
+            .is_none()
+    );
 
     let delete_body = format!(
             "<Delete><Object><Key>{multipart_key}</Key></Object><Object><Key>images/missing.png</Key></Object></Delete>"
@@ -948,6 +1083,29 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
     let delete_xml = delete_objects.text().await.expect("DeleteResult XML");
     assert!(delete_xml.contains(multipart_key));
     assert!(delete_xml.contains("images/missing.png"));
+    let deleted_multipart_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), multipart_key)
+        .await
+        .expect("deleted multipart object lookup")
+        .expect("deleted multipart logical object");
+    assert!(deleted_multipart_object.current_version_id().is_none());
+    assert!(
+        state
+            .repository
+            .find_current_s3_object_version(deleted_multipart_object.id())
+            .await
+            .expect("deleted multipart current-version lookup")
+            .is_none()
+    );
+    assert!(
+        state
+            .repository
+            .find_s3_object(application.id, bucket.id(), "images/missing.png")
+            .await
+            .expect("missing delete object lookup")
+            .is_none()
+    );
 
     let mut bad_get = http::Request::builder()
         .method(Method::GET)
@@ -973,7 +1131,7 @@ async fn s3_gateway_persists_media_and_serves_presigned_get_and_head(pool: sqlx:
         .await
         .expect("S3 audit");
     assert!(audit.iter().any(|event| {
-        event.action == "media.uploaded"
+        event.action == "s3.object.uploaded"
             && event.actor_id == access_key_id
             && event.summary["protocol"] == "s3"
     }));
@@ -1095,7 +1253,7 @@ fn upload_size_validation_enforces_two_gib_limit() {
     );
     let s3_error = S3ApiError::from_api(
         validate_upload_expected_size(oversized).expect_err("S3 object limit"),
-        "/s3/media/oversized.bin",
+        "/media/oversized.bin",
         "request-id",
     );
     assert_eq!(s3_error.status, StatusCode::BAD_REQUEST);
@@ -1106,23 +1264,6 @@ fn upload_size_validation_enforces_two_gib_limit() {
             .status,
         StatusCode::BAD_REQUEST
     );
-}
-
-#[test]
-fn s3_multipart_object_key_requires_a_final_name() {
-    assert_eq!(
-        s3_object_names(
-            "images/final.png",
-            "/s3/media/images/final.png",
-            "request-id"
-        )
-        .expect("valid S3 object key"),
-        ("final.png".to_owned(), Some("png".to_owned()))
-    );
-    let error = s3_object_names("images/", "/s3/media/images/", "request-id")
-        .expect_err("directory marker cannot become a Media object");
-    assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    assert_eq!(error.code, "InvalidArgument");
 }
 
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
@@ -1943,7 +2084,7 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         anonymous.headers()["www-authenticate"],
-        "Basic realm=\"MediaHub WebDAV\", charset=\"UTF-8\""
+        "Basic realm=\"PrismArk WebDAV\", charset=\"UTF-8\""
     );
 
     let options = client
@@ -2527,7 +2668,7 @@ async fn resend_receives_authenticated_rendered_email() {
         .expect("captured request");
     assert_eq!(payload["from"], "MediaHub <mediahub@example.com>");
     assert_eq!(payload["to"][0], "owner@example.com");
-    assert_eq!(payload["subject"], "Verify your MediaHub email");
+    assert_eq!(payload["subject"], "Verify your PrismArk email");
     assert!(
         payload["html"]
             .as_str()

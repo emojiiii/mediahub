@@ -121,7 +121,7 @@ describe('ObjectFileViewer', () => {
       fit: 'contain',
       locale: 'zh-CN',
       theme: 'light',
-      toolbar: false,
+      toolbar: true,
     })
     expect(fileViewerSpy.mock.calls[0][0].file).toBeInstanceOf(File)
     expect((fileViewerSpy.mock.calls[0][0].file as File).size).toBe(4)

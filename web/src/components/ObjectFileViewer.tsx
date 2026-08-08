@@ -24,6 +24,7 @@ import { Download, RefreshCw, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.mjs?url'
 
+import type { ResolvedTheme } from '../theme'
 import { createMediaHubArchivePlugin, isArchiveFile } from './viewer-plugins/OpenFileViewerArchivePlugin'
 import { createMediaHubSpreadsheetPlugin, isSpreadsheetFile } from './viewer-plugins/OpenFileViewerSpreadsheetPlugin'
 import { createMediaHubSqlitePlugin, isSqliteFile } from './viewer-plugins/OpenFileViewerSqlitePlugin'
@@ -141,7 +142,9 @@ export function createViewerPlugins(sourceSize: number): PreviewPlugin[] {
   ]
 }
 
-export default function ObjectFileViewer({ fileName, mimeType, size, url }: ViewerFileProps) {
+export type ObjectFileViewerProps = ViewerFileProps & { theme?: ResolvedTheme }
+
+export default function ObjectFileViewer({ fileName, mimeType, size, url, theme = 'light' }: ObjectFileViewerProps) {
   const previewLimit = previewLimitForFile(fileName, mimeType)
 
   if (previewLimit != null && size > previewLimit) {
@@ -158,10 +161,11 @@ export default function ObjectFileViewer({ fileName, mimeType, size, url }: View
       mimeType={mimeType}
       size={size}
       url={url}
+      theme={theme}
     />
   }
 
-  return <OpenFileViewerSurface fileName={fileName} mimeType={mimeType} source={url} sourceSize={size} />
+  return <OpenFileViewerSurface fileName={fileName} mimeType={mimeType} source={url} sourceSize={size} theme={theme} />
 }
 
 type BufferedDownloadState =
@@ -170,7 +174,7 @@ type BufferedDownloadState =
   | { status: 'error'; message: string }
   | { status: 'cancelled' }
 
-function BufferedObjectFileViewer({ fileName, mimeType, size, url }: ViewerFileProps) {
+function BufferedObjectFileViewer({ fileName, mimeType, size, url, theme }: ViewerFileProps & { theme: ResolvedTheme }) {
   const [attempt, setAttempt] = useState(0)
   const [state, setState] = useState<BufferedDownloadState>({
     status: 'downloading',
@@ -206,7 +210,7 @@ function BufferedObjectFileViewer({ fileName, mimeType, size, url }: ViewerFileP
   }, [attempt, fileName, mimeType, url])
 
   if (state.status === 'ready') {
-    return <OpenFileViewerSurface fileName={fileName} mimeType={mimeType} source={state.file} sourceSize={state.file.size} />
+    return <OpenFileViewerSurface fileName={fileName} mimeType={mimeType} source={state.file} sourceSize={state.file.size} theme={theme} />
   }
   if (state.status === 'downloading') {
     return <BufferedDownloadProgress
@@ -272,9 +276,9 @@ function DownloadFailure({ title, description, onRetry }: { title: string; descr
   </div>
 }
 
-function OpenFileViewerSurface({ fileName, mimeType, source, sourceSize }: { fileName: string; mimeType: string; source: PreviewSource; sourceSize: number }) {
+function OpenFileViewerSurface({ fileName, mimeType, source, sourceSize, theme }: { fileName: string; mimeType: string; source: PreviewSource; sourceSize: number; theme: ResolvedTheme }) {
   const plugins = useMemo(() => createViewerPlugins(sourceSize), [sourceSize])
-  return <div data-testid="open-file-viewer" className="h-full min-h-0 w-full min-w-0 overflow-hidden bg-white">
+  return <div data-testid="open-file-viewer" className="h-full min-h-0 w-full min-w-0 overflow-hidden bg-surface">
     <FileViewer
       file={source}
       fileName={fileName}
@@ -284,8 +288,8 @@ function OpenFileViewerSurface({ fileName, mimeType, source, sourceSize }: { fil
       style={{ width: '100%', height: '100%', minWidth: 0, minHeight: 0 }}
       fit="contain"
       locale="zh-CN"
-      theme="light"
-      toolbar={false}
+      theme={theme}
+      toolbar
       plugins={plugins}
     />
   </div>

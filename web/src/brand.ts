@@ -1,0 +1,5 @@
+export const PRODUCT_NAME = 'PrismArk'
+export const PRODUCT_NAME_ZH = '万象仓'
+export const PRODUCT_MARK = 'P'
+export const PRODUCT_TAGLINE = 'Store every object. See every facet.'
+export const PRODUCT_DESCRIPTION = '支持 S3 与 WebDAV 的自托管对象存储、全格式预览与 Variant 平台。存下每一个对象，看见内容的每一面。'

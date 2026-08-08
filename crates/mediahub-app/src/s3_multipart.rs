@@ -1,13 +1,18 @@
 use async_trait::async_trait;
-use mediahub_core::{ApplicationId, BucketId, Media, MediaId, OffsetDateTime, Visibility};
+use mediahub_core::{
+    ApplicationId, BucketId, Checksum, EntityTag, ObjectId, ObjectVersionId, OffsetDateTime,
+    UploadIntentId,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::{OutboxEvent, RepositoryError};
+use crate::RepositoryError;
 
 pub const MIN_S3_MULTIPART_PART_NUMBER: u16 = 1;
 pub const MAX_S3_MULTIPART_PART_NUMBER: u16 = 10_000;
 pub const MAX_S3_MULTIPART_EXPIRY_LIMIT: usize = 1_000;
 pub const MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION: usize = 1_000;
+pub const DEFAULT_S3_MULTIPART_GC_MAX_ATTEMPTS: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum S3MultipartUploadState {
@@ -24,16 +29,22 @@ pub struct NewS3MultipartUpload {
     pub bucket_id: BucketId,
     pub object_key: String,
     pub content_type: String,
-    pub visibility_override: Option<Visibility>,
+    pub user_metadata: Value,
+    pub storage_backend: String,
     pub expires_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
 }
 
 impl NewS3MultipartUpload {
     pub fn validate(&self) -> Result<(), RepositoryError> {
-        if self.upload_id.is_empty() || self.object_key.is_empty() || self.content_type.is_empty() {
+        if self.upload_id.is_empty()
+            || self.object_key.is_empty()
+            || self.content_type.is_empty()
+            || self.storage_backend.is_empty()
+            || !self.user_metadata.is_object()
+        {
             return Err(RepositoryError::Invariant(
-                "multipart upload id, object key, and content type must not be empty".into(),
+                "multipart identity, content type, backend, and metadata are invalid".into(),
             ));
         }
         if self.expires_at <= self.created_at {
@@ -52,12 +63,16 @@ pub struct S3MultipartUpload {
     pub bucket_id: BucketId,
     pub object_key: String,
     pub content_type: String,
-    pub visibility_override: Option<Visibility>,
+    pub user_metadata: Value,
+    pub storage_backend: String,
     pub state: S3MultipartUploadState,
     pub expires_at: OffsetDateTime,
     pub completion_lease_until: Option<OffsetDateTime>,
-    pub media_id: Option<MediaId>,
-    pub final_etag: Option<String>,
+    pub upload_intent_id: Option<UploadIntentId>,
+    pub object_id: Option<ObjectId>,
+    pub object_version_id: Option<ObjectVersionId>,
+    pub final_etag: Option<EntityTag>,
+    pub final_checksum: Option<Checksum>,
     pub completed_at: Option<OffsetDateTime>,
     pub aborted_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
@@ -69,6 +84,7 @@ pub struct NewS3MultipartPart {
     pub part_number: u16,
     pub size: u64,
     pub sha256: String,
+    pub md5: String,
     pub etag: String,
     pub storage_key: String,
 }
@@ -82,14 +98,19 @@ impl NewS3MultipartPart {
                 "multipart part number must be between 1 and 10000".into(),
             ));
         }
-        if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !is_sha256_hex(&self.sha256) {
             return Err(RepositoryError::Invariant(
                 "multipart part sha256 must be 64 hexadecimal characters".into(),
             ));
         }
-        if self.etag.is_empty() || self.storage_key.is_empty() {
+        if !is_lowercase_md5_hex(&self.md5) || self.etag != self.md5 {
             return Err(RepositoryError::Invariant(
-                "multipart part etag and storage key must not be empty".into(),
+                "multipart part md5 and etag must be the same lowercase MD5 hex value".into(),
+            ));
+        }
+        if self.storage_key.is_empty() {
+            return Err(RepositoryError::Invariant(
+                "multipart part storage key must not be empty".into(),
             ));
         }
         Ok(())
@@ -101,9 +122,9 @@ pub struct S3MultipartPart {
     pub upload_id: String,
     pub part_number: u16,
     pub size: u64,
-    /// Independently calculated checksum for this part. This is never derived
-    /// from, or substituted with, the S3 multipart ETag.
     pub sha256: String,
+    pub md5: String,
+    /// Canonical unquoted lowercase MD5 hex.
     pub etag: String,
     pub storage_key: String,
     pub created_at: OffsetDateTime,
@@ -112,20 +133,15 @@ pub struct S3MultipartPart {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum S3MultipartPartPut {
-    Stored {
-        part: S3MultipartPart,
-        replaced_storage_key: Option<String>,
-    },
+    Stored(S3MultipartPart),
     NotPending(S3MultipartUpload),
-    Expired {
-        upload: S3MultipartUpload,
-        storage_keys: Vec<String>,
-    },
+    Expired(S3MultipartUpload),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletedS3MultipartPart {
     pub part_number: u16,
+    /// Canonical unquoted lowercase MD5 hex supplied by CompleteMultipartUpload.
     pub etag: String,
 }
 
@@ -152,19 +168,8 @@ pub enum S3MultipartCompletionClaim {
     AlreadyCompleted(S3MultipartUpload),
     InProgress(S3MultipartUpload),
     Aborted(S3MultipartUpload),
-    Expired {
-        upload: S3MultipartUpload,
-        storage_keys: Vec<String>,
-    },
+    Expired(S3MultipartUpload),
     InvalidManifest(S3MultipartManifestError),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum S3MultipartCompletionFinish {
-    Completed(S3MultipartUpload),
-    AlreadyCompleted(S3MultipartUpload),
-    OwnershipLost(S3MultipartUpload),
-    NotCompleting(S3MultipartUpload),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,14 +182,8 @@ pub enum S3MultipartCompletionRelease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum S3MultipartAbort {
-    Aborted {
-        upload: S3MultipartUpload,
-        storage_keys: Vec<String>,
-    },
-    AlreadyAborted {
-        upload: S3MultipartUpload,
-        storage_keys: Vec<String>,
-    },
+    Aborted(S3MultipartUpload),
+    AlreadyAborted(S3MultipartUpload),
     Completing(S3MultipartUpload),
     Completed(S3MultipartUpload),
 }
@@ -192,12 +191,37 @@ pub enum S3MultipartAbort {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct S3MultipartExpiredUpload {
     pub upload: S3MultipartUpload,
-    pub storage_keys: Vec<String>,
 }
 
-/// Durable boundary for the S3 multipart lifecycle. Implementations must lock
-/// the upload while replacing parts or changing state so concurrent handlers
-/// cannot claim, finish, replace, or abort the same upload inconsistently.
+#[must_use]
+pub fn is_lowercase_md5_hex(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[must_use]
+pub fn is_multipart_etag(value: &str) -> bool {
+    let Some((digest, part_count)) = value.split_once('-') else {
+        return false;
+    };
+    is_lowercase_md5_hex(digest)
+        && !part_count.is_empty()
+        && !part_count.starts_with('0')
+        && part_count
+            .parse::<u16>()
+            .is_ok_and(|count| (1..=MAX_S3_MULTIPART_PART_NUMBER).contains(&count))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Durable boundary for the S3 multipart lifecycle. Implementations lock the
+/// upload while replacing parts or changing state. Storage cleanup is always
+/// represented by persistent GC tasks written in the same transaction as the
+/// metadata transition.
 #[allow(clippy::missing_errors_doc)]
 #[async_trait]
 pub trait S3MultipartRepository: Send + Sync {
@@ -224,8 +248,6 @@ pub trait S3MultipartRepository: Send + Sync {
         upload_id: &str,
     ) -> Result<Vec<S3MultipartPart>, RepositoryError>;
 
-    /// Atomically validates the ordered client manifest and acquires a
-    /// completion lease. An expired lease may be taken over with a new token.
     async fn claim_multipart_completion(
         &self,
         upload_id: &str,
@@ -235,46 +257,18 @@ pub trait S3MultipartRepository: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<S3MultipartCompletionClaim, RepositoryError>;
 
-    /// Creates the uploading Media record for the current completion owner
-    /// without reserving quota again. Uploaded parts already own the required
-    /// reservation.
-    async fn create_uploading_for_multipart(
+    /// Fenced association created after the manifest has frozen total size and
+    /// the caller has persisted a matching UploadIntent.
+    async fn attach_multipart_upload_intent(
         &self,
         upload_id: &str,
         completion_token: &str,
-        media: Media,
-    ) -> Result<(), RepositoryError>;
-
-    /// Removes a failed uploading Media record without releasing quota. The
-    /// reservation remains owned by the persisted multipart parts.
-    async fn abort_uploading_for_multipart(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        media_id: MediaId,
-    ) -> Result<(), RepositoryError>;
-
-    /// Activates the multipart Media, transfers its selected part reservation
-    /// to used quota, and appends the outbox event only while the caller still
-    /// owns the completion token.
-    async fn commit_upload_for_multipart(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        media_id: MediaId,
-        committed_at: OffsetDateTime,
-        event: OutboxEvent,
-    ) -> Result<Media, RepositoryError>;
-
-    async fn finish_multipart_completion(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        media_id: MediaId,
-        final_etag: &str,
+        intent_id: UploadIntentId,
         now: OffsetDateTime,
-    ) -> Result<S3MultipartCompletionFinish, RepositoryError>;
+    ) -> Result<S3MultipartUpload, RepositoryError>;
 
+    /// Returns a failed completion to Pending. Any attached intent is aborted
+    /// and all of its reserved storage keys are durably queued for GC.
     async fn release_multipart_completion(
         &self,
         upload_id: &str,
@@ -288,17 +282,23 @@ pub trait S3MultipartRepository: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<S3MultipartAbort, RepositoryError>;
 
-    /// Atomically claims due active uploads and terminal uploads whose part
-    /// cleanup must be retried. `FOR UPDATE SKIP LOCKED` implementations allow
-    /// concurrent lifecycle workers to divide the work.
     async fn expire_multipart_uploads(
         &self,
         now: OffsetDateTime,
         limit: usize,
     ) -> Result<Vec<S3MultipartExpiredUpload>, RepositoryError>;
+}
 
-    /// Removes persisted part metadata after all temporary objects have been
-    /// deleted. Terminal upload rows remain available for idempotent S3
-    /// replays. Pending or completing uploads must be rejected as conflicts.
-    async fn clear_multipart_parts(&self, upload_id: &str) -> Result<usize, RepositoryError>;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_canonical_part_and_multipart_etags() {
+        assert!(is_lowercase_md5_hex("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(!is_lowercase_md5_hex("D41D8CD98F00B204E9800998ECF8427E"));
+        assert!(is_multipart_etag("0123456789abcdef0123456789abcdef-10000"));
+        assert!(!is_multipart_etag("0123456789abcdef0123456789abcdef-0"));
+        assert!(!is_multipart_etag("0123456789abcdef0123456789abcdef-10001"));
+    }
 }

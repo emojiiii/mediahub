@@ -34,8 +34,8 @@ impl AuthEmailKind {
 
     fn subject(self) -> &'static str {
         match self {
-            Self::VerifyEmail => "Verify your MediaHub email",
-            Self::ResetPassword => "Reset your MediaHub password",
+            Self::VerifyEmail => "Verify your PrismArk email",
+            Self::ResetPassword => "Reset your PrismArk password",
         }
     }
 
@@ -48,8 +48,8 @@ impl AuthEmailKind {
 
     fn introduction(self) -> &'static str {
         match self {
-            Self::VerifyEmail => "Use the link below to verify your MediaHub email address.",
-            Self::ResetPassword => "Use the link below to reset your MediaHub password.",
+            Self::VerifyEmail => "Use the link below to verify your PrismArk email address.",
+            Self::ResetPassword => "Use the link below to reset your PrismArk password.",
         }
     }
 }
@@ -186,7 +186,7 @@ mod tests {
     fn config() -> ResendConfig {
         ResendConfig {
             api_key: "re_test".into(),
-            from: "MediaHub <noreply@example.com>".into(),
+            from: "PrismArk <noreply@example.com>".into(),
             web_url: Url::parse("https://console.example.com").expect("Web URL"),
         }
     }

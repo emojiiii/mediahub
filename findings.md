@@ -1,443 +1,110 @@
-# Findings
+﻿# 研究发现：mediaHub 与 pgsty/silo
 
-## Pre-release crates quality review (2026-07-20)
+## 当前项目：MediaHub
 
-- Review started from a clean worktree.
-- Scope: every workspace package under `crates/`, plus cross-crate dependency and runtime contracts needed to assess release risk.
-- Findings will be recorded only after corroboration against the current source.
-- The workspace contains eight crates: `mediahub-core`, `mediahub-app`, local/image/PostgreSQL/S3 adapters, `mediahub-openapi`, and `mediahub-server`.
-- The intended dependency direction is domain (`core`) to use cases/ports (`app`) to infrastructure adapters and the server composition root. `mediahub-openapi` is structurally independent from the runtime crates, so contract drift must be checked explicitly.
-- Review work is split into four ownership groups: core/app, local/image/S3 adapters, PostgreSQL/OpenAPI, and server/protocol composition.
-- `mediahub-server` is the clear complexity hotspot: 49 Rust source files, with several 500-800 line protocol/HTTP modules and a 2,867-line integration-style `tests.rs`.
-- The server binary still uses crate-root `include!` composition for API/handler/HTTP files. This preserves broad private access but weakens enforceable module boundaries; its release impact will be assessed separately from correctness findings.
-- Initial panic-marker review found most `expect` calls in tests or on proven invariants. Production occurrences require case-by-case validation rather than being findings by themselves.
-- Candidate correctness finding: registration persists the user, default Application, default Bucket, and verification token in four independent repository calls (`handlers_auth.rs` lines 25-67). A failure after user insertion can leave a unique email with no usable default Application, so retrying registration conflicts and later login can return `application not found`.
-- Candidate production-operability finding: authentication rate limits key the IP bucket from Axum `ConnectInfo` (the TCP peer) (`media_http.rs` lines 621-669). Behind the documented reverse-proxy deployment, all clients can share the proxy address and exhaust a global login/register/reset budget unless the proxy topology preserves client peer addresses outside ordinary HTTP forwarding.
-- The in-memory rate limiter only attempts cleanup after 4,096 entries and retains every entry younger than one hour. A sufficiently distributed source can therefore grow the map beyond the threshold without a hard cap; this is a bounded-severity availability concern, not yet a top release blocker.
-- The handler authorization matrix currently shows explicit Application resolution plus per-operation permission checks across JSON/path/S3/WebDAV surfaces; apparent omissions such as `put_path_object` delegate authorization to a shared upload helper and are not findings.
-- Candidate worker reliability finding: all three background worker `JoinHandle`s are dropped at startup (`bootstrap.rs` lines 98-100), so a worker panic/termination is neither surfaced nor reflected by readiness.
-- Candidate webhook availability finding: the sole outbox worker awaits `tokio::net::lookup_host` without a timeout before building a 10-second HTTP client (`workers.rs` lines 584-612). A stuck resolver can suspend all webhook deliveries and outbox finalization indefinitely.
-- Confirmed high-risk async-job finding: jobs may contain 1,000 media IDs, but the service grants a fixed 30-second lease and the worker claims eight jobs then processes every item sequentially without lease renewal (`mediahub-app/src/async_job.rs` lines 14-16, 241-255; `handlers_jobs.rs` lines 18-20; `workers.rs` lines 300-389). Once processing exceeds 30 seconds, another replica can reclaim the same unfinished job; the original completion is fenced out, work is repeated, and repeated lease expiry can consume all attempts without ever committing item results.
-- Candidate retry-semantics finding: `execute_batch_action` errors, including repository/unavailability errors, are converted immediately into permanent failed item results and the job is completed (`workers.rs` lines 321-388). The job-level retry path is reached only if constructing an `AsyncJobItemResult` itself fails, so configured `max_attempts` does not protect ordinary transient execution failures.
-- Webhook claims have the same fixed-batch lease shape: 32 deliveries share a 30-second lease and are sent sequentially with up to 10 seconds per request (`workers.rs` lines 223-296). Multi-replica deployments can reclaim later entries before the original worker reaches them, producing avoidable duplicate deliveries.
-- Confirmed Application-deletion boundary bug: `delete_application_for_user` blocks only on Buckets/media, then deletes replay nonces, access keys, and audit rows before deleting the Application (`control_applications.rs` lines 145-201). Other Application-owned tables use non-cascading foreign keys (idempotency keys, webhook endpoints/outbox, upload sessions, async jobs, S3 multipart uploads), so an otherwise empty Application that has used those features fails deletion with a database conflict and has no aggregate-level cleanup path.
-- The same deletion implementation explicitly removes `audit_logs` (`control_applications.rs` lines 189-193), contradicting the console promise that related audit records are retained. This is a behavioral/compliance boundary mismatch even when deletion succeeds.
-- Confirmed variant resource-limit ordering bug: transformed media requests read the entire stored object into a `Vec` before the image adapter's 64 MiB `MAX_INPUT_BYTES` guard runs (`media_read_auth.rs` lines 11-35; `mediahub-adapter-image/src/lib.rs` lines 51-61/77-87). A valid 2 GiB object can therefore trigger multi-gigabyte allocation on a public `?transform` request and exhaust the server before the intended limit rejects it.
-- Candidate one-time-token race: resend-verification and forgot-password issue a new token by update-then-insert without a `(user_id, purpose)` uniqueness/locking constraint (`handlers_auth.rs` lines 114-155/213-261; `control_auth.rs` lines 163-197; migration `0002_control_plane.sql` lines 40-53). Concurrent requests can leave multiple active tokens despite the single-current-token design intent; impact is bounded because each token is still random and independently expiring.
-- Candidate webhook-history pagination bug: cursoring uses mutable delivery `updated_at` as both ordering and resume boundary (`webhooks_audit.rs` lines 218-278; adapter `webhook.rs` lines 153-164). A delivery/replay update between pages can move an item behind the cursor and make it disappear from the traversal; current contract tests cover only static pages.
-- Confirmed upload commit ambiguity bug: all three upload paths treat any repository `commit_upload*` error as proof that the transaction did not commit, then delete the final object and abort the DB row (`mediahub-app/src/upload.rs` lines 177-191, 297-310, 379-405). A network failure after PostgreSQL commit can leave an active row/quota/outbox while the physical object is deleted; rollback errors are discarded, so the inconsistency is silent.
-- Architecture gap in direct-upload preparation: `UploadSessionService::prepare` asks storage for a target/key before `UploadSession::new` validates object/display/storage fields and expiry (`mediahub-app/src/upload_session.rs` lines 165-220), and the port cannot abort a `PreparedUpload` without a constructed session. Current Local/S3 adapters only compute a target/signature and do not allocate multipart state here, so this is latent rather than a present byte leak; future stateful adapters would have no cleanup path.
-- Confirmed expired-upload cleanup leak: `expire_due` durably marks pending sessions expired and releases quota, then ignores `storage.abort_upload` errors (`upload_session.rs` lines 331-344). The repository's next scan only returns pending sessions (`ports.rs` lines 232-238), so a failed cleanup is never retried and temporary bytes can remain indefinitely.
-- Confirmed client-metadata quota bypass: `ClientMetadata::from_value` validates depth/key/string shape but not the 64 KiB aggregate limit (`core/src/metadata.rs` lines 82-137); `UploadSession::new` stores it directly, and the server passes it from the upload-session endpoint (`core/src/upload_session.rs` lines 115-151; `handlers_upload.rs` lines 134-151). A caller can create pending sessions carrying hundreds of kilobytes or more of JSON, repeatedly consuming database/storage resources before any MediaMetadata validation runs. The two namespace maps also each reset `key_count`, allowing 512 keys against a nominal 256-key total.
-- Confirmed S3 presigned-upload replay: `prepare_upload` signs the permanent `objects/{media_id}` key (`adapter-s3/src/lib.rs` lines 353-384), while the signer uses `UnsignedPayload` and no create-only/precondition header (`lines 172-183`). During the URL TTL, anyone holding the URL can PUT different bytes with the same length/MIME after completion, overwriting the object while the database SHA-256 remains unchanged; a later completion replay returns the existing DB media without re-inspection.
-- Confirmed S3 commit race: `commit_temporary` HEADs the final key and then uses overwrite-capable `backend.copy` when absent (`adapter-s3/src/lib.rs` lines 555-587). Two concurrent commits can both observe NotFound and the latter overwrites the former, violating the ObjectStore no-overwrite contract. Existing tests cover sequential conflict only, not the race.
-- Confirmed cross-layer S3 rollback bug: after a successful copy, failure deleting the temporary object is returned as a generic commit error (`adapter-s3/src/lib.rs` lines 577-587; Local has the same two-step promotion/cleanup shape). `UploadMediaService` responds by deleting the already-promoted final object (`app/src/upload.rs` lines 167-174, 477-480), turning a cleanup failure into data loss.
-- Confirmed image resize DoS: Rust `Cover` computes an unconstrained intermediate resize before cropping (`adapter-image/src/image_rust.rs` lines 89-104); only final dimensions/pixels are checked. A legal extreme-aspect input can request a 4,096x4,096 cover and force an intermediate allocation on the order of hundreds of gigabytes.
-- Confirmed transformed-read allocation DoS: server variant handling reads the complete stored object before the adapter's 64 MiB input guard (`media_read_auth.rs` lines 11-35; adapter-image `lib.rs` lines 51-61/77-87). A public transform request on a large valid object can exhaust process memory before rejection.
-- Candidate local-storage boundary risks: the adapter reserves `.mediahub-metadata` inside the user key namespace and `delete("foo")` can remove metadata for `.mediahub-metadata/foo` (`adapter-local/src/lib.rs` lines 27, 209-214, 561-564); lexical path checks also follow pre-existing/attacker-controlled symlinks under the root (`lines 205-237`). These become P2 security/data-integrity issues when the volume is writable by another principal.
-- Confirmed OpenAPI application-selector drift: the contract declares optional UUID `X-Application-Id` (`mediahub-openapi/src/contract_parameters.rs` lines 74-80), while the server reads `x-mediahub-app-id` as an app-id string (`mediahub-server/src/media_read_auth.rs` lines 162-202). A generated client following the published schema cannot switch a multi-Application session and silently falls back to the default Application, risking reads/writes in the wrong tenant context.
-- Confirmed OpenAPI pagination drift: `AdminLimit` is documented as max 100/default 50 (`contract_parameters.rs` lines 113-117), while the handler accepts 1..=200/default 100 (`handlers_admin.rs` lines 231-236). Clients generated from the schema reject valid server requests above 100 and disagree on default page size.
-- Confirmed OpenAPI nullable-field drift: generated DTOs model CreateBucket arrays and webhook `enabled`/`rotate_secret` as nullable options (`openapi/src/dto.rs` lines 410-416, 461-465, 650-655), while server request DTOs require concrete values with defaults and reject JSON `null` (`server/src/api_requests.rs` lines 86-98, 219-251). This makes schema-valid requests fail at runtime.
-- Confirmed AsyncJob response drift: the jobs handler serializes core `AsyncJobDetails` directly (`server/src/handlers_jobs.rs` lines 171-185), whose `AsyncJob` includes lease fields, while the OpenAPI AsyncJob DTO omits them (`openapi/src/dto.rs` lines 250-271). Strict generated clients can reject real responses with undocumented fields.
-- Confirmed PostgreSQL tenant-integrity gap: `media`, `upload_sessions`, and S3 multipart rows carry independent `application_id` and `bucket_id` foreign keys rather than a composite reference to the bucket's Application (`migrations/0001_repository_profile.sql` lines 38-42, 178-183; `0006_s3_multipart.sql` lines 1-5`). Repository insert paths accept mismatched IDs, so any future caller that misses an application-level check can associate data across tenants and misattribute quota.
-- Candidate idempotency fencing gap: claim/complete/release identify rows only by Application/scope/key/hash and have no claim token (`adapter-postgres/src/idempotency.rs` lines 16-192); after expiry or a release, a delayed request can complete a newer claim with the same key/hash and duplicate side effects. Current 24-hour TTL makes this a P2 long-running/retry race.
-- Confirmed webhook-history cursor instability: the handler encodes the last row's mutable `updated_at` and the adapter resumes on that field (`server/src/webhooks_audit.rs` lines 218-278; adapter-postgres `webhook.rs` lines 153-164). Delivery/replay updates between page requests can move rows behind the cursor and permanently omit them; existing contract tests do not cover mutation between pages.
-- Confirmed upload-session TTL race: completion captures `now`, checks expiry, then performs potentially slow storage inspection and passes the stale timestamp into the repository (`app/src/upload_session.rs` lines 235-265). If inspection crosses `session_expires_at`, the locked repository transition still completes the already-expired session; expiry must be re-read/fenced at commit time.
-- Confirmed synchronous-batch crash window: media mutations are committed item by item after claiming idempotency, and the idempotency response is completed only afterward (`server/src/handlers_jobs.rs` lines 87-153). A crash leaves real side effects behind an in-progress key for 24 hours; retry can reapply revision/outbox changes and calculate TTL from a later action time.
+### 产品定位与入口
 
-### Verification summary
+- `readme.md:3` 将项目定位为“面向 AI 时代媒体产物的自托管对象存储与处理服务”。
+- `readme.md:162-225` 列出 JSON 控制面 API、原生路径对象 API、WebDAV、S3 兼容后端和受限 S3 网关。
+- `readme.md:241-267` 列出 Application/AccessKey/Bucket 管理、图片/视频/静态文件上传读取删除、Metadata、配额、审计、Webhook、后台管理，以及 Local/S3 后端。
 
-- Passed: `cargo fmt --all -- --check`.
-- Passed: `cargo check --workspace`.
-- Passed: `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
-- Passed: `cargo test --workspace --no-run`.
-- Passed unit/package tests: core 25, app 16, local 6, image 9, S3 3 plus wrapper contract 1, OpenAPI 7, PostgreSQL lib 6, server lib 8.
-- Passed: `cargo run -p mediahub-openapi -- --check` (generated JSON matches the hand-written generator, though it does not prove runtime/server parity).
-- Not run: destructive PostgreSQL repository contract because `MEDIAHUB_TEST_POSTGRES_URL` is not configured and no test database is running; real S3 contract remains intentionally ignored because `MEDIAHUB_TEST_S3_*` is absent.
+### 技术与实现证据
 
-### Architecture assessment
+- `Cargo.toml` 是 Rust 2024 workspace，拆为 core、app、local adapter、image adapter、postgres adapter、S3 adapter、OpenAPI 和 server 八个 crate。
+- Rust 依赖包含 Axum、SQLx/PostgreSQL、`object_store` AWS 后端、WebDAV、AES-GCM/Argon2/HMAC、图片处理和 OpenAPI 生成。
+- `web/package.json` 显示 React 19 + Vite + TanStack Query + OpenAPI client + Vitest；viewer plugin 包含 PDF、归档、表格和 SQLite 相关能力。
+- `readme.md:199-224` 说明 PostgreSQL 保存 Metadata、权限、配额、Variant 和任务状态，Local/S3 保存二进制；形成控制面/数据面分离。
+- `readme.md:166-168,902-954` 与代码显示邮箱认证、Session/CSRF、Application AccessKey、HMAC-SHA256、Nonce/Idempotency-Key 和 scoped permissions。
+- `readme.md:137,1007-1019` 说明 AccessKey/Webhook Secret 使用独立的 AES-256-GCM 版本化 keyring；Webhook worker 支持投递历史、重试、dead-letter 和 replay。
 
-- `mediahub-core` and `mediahub-app` maintain the intended dependency direction and keep runtime/storage dependencies out of the domain layer. Their main boundary weaknesses are validation that can be bypassed through derived deserialization, overly generic repository errors for leased state machines, and cleanup/commit protocols that cannot represent uncertain or retryable outcomes.
-- Local/image/S3 adapters implement distinct infrastructure concerns behind shared ports, but large `lib.rs` files and `include!` composition keep internal responsibilities in one module. Cross-backend object-key, listing, immutability, and crash-recovery contracts are underspecified and not covered by the shared contract suite.
-- The PostgreSQL adapter uses transactions, row locks, advisory locks, `SKIP LOCKED`, and lease tokens appropriately in many individual repositories. Failures concentrate at aggregate boundaries spanning multiple repository calls (registration, Application deletion, synchronous batch) and at missing database-enforced tenant relationships.
-- `mediahub-openapi` is a parallel hand-maintained model rather than a projection of real server DTOs/routes. Its generator is internally consistent but confirmed header, pagination, nullability, binary upload, and AsyncJob response drift show that it is not an effective release contract gate.
-- `mediahub-server` remains the largest package (about 16.5k Rust lines plus a 2.8k-line test module). Several handler groups are split using crate-root `include!`, which reduces file size without enforcing visibility/ownership boundaries; worker supervision and lease renewal are also composition-root responsibilities that currently have no dedicated runtime abstraction.
+### 当前真实能力边界（代码优先）
 
-## Pre-release crates remediation (2026-07-20)
+- `crates/mediahub-server/src/handlers_health.rs:139-148` 当前 capabilities：Docker profile、Local/S3 storage、S3 gateway、image processing 开启；video processing、resumable upload、archive restore 关闭。
+- `crates/mediahub-server/src/s3_http_support.rs:217-227` 的 `reject_s3_versioning` 对 `versionId` 返回 `NotImplemented`，集成测试也断言该行为。
+- `readme.md:217-225` 明确将 `/s3` 定义为受限网关，不是完整 AWS S3 Bucket 管理服务；当前重点是 HeadBucket、Put/Get/Head/Delete、受限 List 和 Multipart。
+- `crates/mediahub-core/src/bucket.rs:12-20` 的生命周期规则主要是 `ExpireAfter` 与 `KeepLatest`，不是带版本、保留和远端 tier 的完整 ILM。
 
-- Repair work is split into four ownership areas: core/app, image/local, PostgreSQL/OpenAPI, and root-owned server/S3/cross-crate integration.
-- Upload-session cleanup will use a durable acknowledgement: PostgreSQL retains terminal sessions with `storage_cleanup_completed_at IS NULL`; periodic cleanup retries idempotent storage deletion and marks completion only after success.
-- S3 direct uploads must use a session-scoped temporary key rather than the permanent Media key. Completion will promote with an atomic create-only copy, so replaying a presigned URL cannot overwrite active media.
-- Object promotion cleanup is not part of the commit decision. A failure deleting temporary bytes after the final object exists must be logged/retried, not returned as a failed promotion that triggers final-object rollback.
+## pgsty/silo 外部资料
 
-## Repository shape
+### 产品边界
 
-- Root src/main.rs is only a placeholder; the production binary is crates/mediahub-server/src/main.rs.
-- The production entrypoint was 7,432 lines and about 255 KB before refactoring.
-- Existing server support modules include configuration, identity, access keys, runtime storage, S3, and WebDAV.
+- GitHub README 将 Silo 定义为 PGSTY 维护的 MinIO fork，核心目标是持续维护 S3-compatible object storage。
+- README quick start 是单进程/容器启动 Silo Server，9000 提供 S3 API、9001 提供 Console；镜像内置 `mcli`。
+- README 列出多架构容器、Linux/macOS/Windows amd64/arm64 二进制、RPM/DEB/APK、Kubernetes Helm；发布物包含 checksums、SPDX SBOM、Sigstore 签名 manifest 和 GitHub build attestations。
+- 兼容性承诺覆盖 S3 API、`MINIO_*` 配置、`minio_*` 指标、`x-minio-*` headers、`/minio/*` 路由、MinIO import paths 和 on-disk format。
 
-## Refactor decisions
+### 能力面
 
-- main.rs now contains shared imports/constants/state, module declarations, source includes, and a small Tokio entrypoint.
-- Responsibility-oriented files:
-  - api_error.rs
-  - api_types.rs
-  - media_http.rs
-  - handlers_webhooks.rs
-  - handlers_path.rs
-  - handlers_media.rs
-  - handlers_admin_auth.rs
-  - http.rs
-- workers.rs is a real child module and exposes only the worker functions/helpers required by startup and handlers.
-- bootstrap.rs is a real child module; the binary entrypoint delegates to bootstrap::run.
-- The handler implementation files remain crate-level includes for now because they share many private request/response types. This avoids making dozens of DTO fields public as a side effect of the first structural refactor.
-## Workspace-wide second pass
+- 数据面/可靠性：distributed deployment、availability/resiliency、erasure coding、object healing、object scanner、阈值/限制。
+- 对象治理：bucket versioning、object locking/WORM、生命周期过期、远端 tier/transition、压缩。
+- 身份与安全：内置用户/组、OIDC、LDAP/AD、外部 identity/access-management plugin；SSE-KMS、SSE-S3、SSE-C、KES 和 TLS。
+- 复制与事件：单向/双向/多站点 bucket replication、resync、batch replication；bucket notifications 可接 AMQP、MQTT、NATS、NSQ、Elasticsearch、Kafka、MySQL、PostgreSQL、Redis 和 Webhook。
+- 运维/生态：Silo Console、Prometheus/InfluxDB metrics、外部日志/audit、Grafana、Kubernetes Operator/Tenant、裸机/容器/Windows/macOS 安装、硬件/节点/站点故障恢复、多个语言 SDK、STS、Object Lambda、FTP/SFTP。
+- `mcli` admin surface 覆盖匿名策略、复制、ILM、legal hold、retention、share URL、批处理、加密、标签、版本、heal/scanner/rebalance/KMS/policy/user/service-account 等。
 
-- The largest non-test modules were concentrated in the server protocol layer and storage adapters.
-- S3 HTTP is now split into core object/list operations, multipart operations, and support/error helpers.
-- WebDAV is now split into authentication, guarded filesystem operations, file handles/resources, and support helpers.
-- Server handlers are split into health, admin, auth, applications, buckets, media listing, path mutations, async jobs, uploads, path HTTP, media access/auth, webhooks/audit, and access keys.
-- API DTOs are split into request DTOs, response DTOs, and shared validation/cursor helpers.
-- Local and S3 adapter tests are now outside their production lib.rs files.
-- Parent files remain intentionally small include/module facades where the implementation shares private types; this preserves encapsulation while making ownership and navigation explicit.
-- PostgreSQL media persistence is split into bucket operations, media/lifecycle queries, media mutations, and support helpers.
-- PostgreSQL S3 multipart persistence is split into lifecycle operations and locking/validation/row-conversion helpers.
-## Final workspace pass
+### 兼容性审计证据
 
-- In-memory adapters are split by object store, buckets, media, upload sessions, and outbox/clock.
-- PostgreSQL control plane is split by auth/session, applications, access keys, and helpers.
-- Image adapter is split by libvips, blocking runtime, Rust image pipeline, and tests.
-- OpenAPI contract is split by model/helpers, paths, parameters, and components.
-- Core async-job domain is split by identity/action, item results, aggregate model, errors/validation, and tests.
-- Dedicated database: mediahub_codex_contract in the running mediahub-codex-postgres container.
-## Application resource isolation investigation
+- Silo 官方兼容性审计说明它保持 MinIO S3-facing 与 on-disk compatibility，但 binary、package、service、默认配置目录、container path、Helm resource names、embedded Console、update behavior、部分授权和错误响应已变化。
+- 审计记录的 2026-08-06 prepared snapshot 相对 baseline 有 523 files、+36,715/-21,450 行净源代码差异；仓库主页当前 HEAD 为命名切换后的 `100e2e57`。
+- 审计记录 137 compatible imports、436 environment names、19 metric namespaces、84 headers、330 routes、58 policy identifiers、9,014 exported symbols，以及 `.minio.sys`、IAM/KMS/replication/healing state 和现有磁盘元数据兼容。
+- Silo Console v2.1.1、维护版 MCLI 和 Silo Pkg 已纳入；SUBNET/callhome 被强制关闭，OCI 镜像内置 `/usr/bin/mcli` 并保留 `mc` 客户端兼容别名。
 
-- The backend client already scopes bucket, media, upload, and Webhook requests with X-MediaHub-App-Id; access keys use an explicit Application path.
-- React Query keys already include appId for Buckets, objects, access keys, and Webhooks, so switching causes separate cache entries.
-- The Mock implementation is the defect: objects, buckets, accessKeys, webhooks, deliveries, jobs, and uploads are module-global arrays/maps.
-- selectedMockApplicationId currently affects only signed URL generation. Resource reads and mutations ignore it, so every Application exposes the same data.
-- A newly created Mock Application receives no dedicated resource store, which makes the shared global resources appear immediately.
-- The create-application dialog is a single narrow field followed by a full divider and right-aligned actions; it lacks a compact identity cue and balanced spacing.
-- Implementation decision: store Mock resources in a Map keyed by public appId; studio keeps demo seeds, marketing/new Applications start empty.
-- All Mock mutations must resolve the current Application state, including batch jobs, upload sessions, Webhook deliveries, and key mutations.
-- UI decision: use a small dialog, an application identity icon, concise ownership copy, a full-width input, and a compact action footer.
-- All mutable global references were enumerated. Admin storage/jobs must aggregate all per-app stores, while normal resource calls use the selected app store.
-- Existing pure Mock API tests rely on app_studio as the implicit default, so the state resolver must fall back to the first Application when setApplication has not been called.
-- Access-key list/create already receive appId explicitly; update/revoke and all Webhook methods will resolve the selected app store.
-- Upload sessions and async jobs are also app-owned and will move into the same per-app state to prevent indirect leakage.
-- Regression coverage belongs in App.test.tsx for end-to-end Application switching and in direct Mock API assertions for key/Webhook/Bucket/object isolation.
-- ApplicationSwitcher itself already behaves correctly; the visual change belongs to a dedicated create modal component in App.tsx, not the switcher menu.
+## 差距矩阵摘要
 
-## Real backend wiring investigation
+| 维度 | MediaHub 当前 | Silo | 判断 |
+|---|---|---|---|
+| S3 协议 | 受限网关，支持常用对象操作和 Multipart | MinIO 兼容的完整 S3/admin 生态 | MediaHub 硬差距 |
+| 分布式可靠性 | Docker 单 profile + Local/S3 adapter；无自身纠删码/集群修复 | 分布式、纠删码、healing、scanner、rebalance | MediaHub 硬差距 |
+| 版本与保留 | `versionId` 明确未实现；无 WORM/legal hold | versioning、object lock、retention/legal hold | MediaHub 硬差距 |
+| 复制与分层 | 有异步删除/生命周期，但无 Silo 级 bucket/site replication 与 tiering | 单/双向/多站点复制、resync、远端 tier | MediaHub 硬差距 |
+| IAM/企业认证 | 邮箱用户、Application、AccessKey、scope、HMAC | 用户/组/policy、OIDC、LDAP/AD、STS | 两者定位不同，MediaHub 缺企业 IAM |
+| 对象加密 | 主要保护 AccessKey/Webhook secret；未见完整 SSE/KMS 对象层 | SSE-KMS、SSE-S3、SSE-C、KES | MediaHub 缺口 |
+| 事件 | 面向应用的 Webhook + outbox/retry/replay | Bucket event + 多种消息/数据库/搜索系统 | MediaHub 集成广度差距，但业务闭环更强 |
+| 生命周期 | `ExpireAfter`、`KeepLatest`、异步收敛 | ILM、过期、版本、远端 transition/tiering | MediaHub 功能窄但语义更贴媒体业务 |
+| 媒体处理/查看 | 图片 Variant/裁剪/格式、Metadata、归档/表格/SQLite/PDF viewer 方向 | 通用对象存储；Object Lambda 不是同类媒体产品 | MediaHub 优势 |
+| 应用控制面 | 多 Application、配额、审计、短链、公开/私有签名 URL | 通用 IAM/Console，非媒体 SaaS 控制面 | MediaHub 优势 |
+| 交付运维 | Docker Compose/单 Origin 方向；当前 capabilities 为 Docker | 容器、二进制、包、Helm、Operator、丰富运维工具 | Silo 优势 |
+| 许可证 | MIT | AGPL-3.0-or-later | MediaHub 对闭源商业集成更友好 |
 
-- The previous browser verification deliberately exercised Mock mode; it did not prove integration with the existing backend.
-- The current frontend mode switch treats a missing `VITE_API_BASE_URL` as permission to use Mock data, which is an unsafe default for normal local/deployed runs.
-- Intended correction: tests and an explicit Mock flag may use Mock; ordinary development and production runs must resolve a real backend endpoint.
-- `web/src/api/client.ts` already defaults the API URL to `http://localhost:3000` and normalizes localhost/127.0.0.1, but `web/src/api/mock.ts` ignores that readiness and selects Mock solely from whether the environment variable exists.
-- The backend listens on port 3000 and exposes credentialed CORS/CSRF support; `MEDIAHUB_CORS_ALLOWED_ORIGINS` controls the development console origin allowlist.
-- Runtime configuration is concentrated in `docker-compose.yml`, `Dockerfile`, `web/vite.config.ts`, and `web/nginx.local.conf`; there are no checked-in `.env` files.
-- `docker-compose.yml` currently starts only the API and PostgreSQL, not the web console, and it does not set `MEDIAHUB_CORS_ALLOWED_ORIGINS`.
-- Compose intentionally requires production-grade secret/email variables, so it cannot be used as a zero-configuration local backend without supplying them; this is separate from the frontend accidentally choosing Mock.
-- The root `Dockerfile` packages only the Rust server on port 3000; frontend delivery is expected through a separate Vite/Nginx path.
-- `web/vite.config.ts` has no development proxy, and `web/nginx.local.conf` only serves SPA assets; therefore the current architecture intentionally uses a direct API origin, defaulting locally to port 3000.
-- Because the browser calls port 3000 directly, local development must allow `http://localhost:5173` and/or `http://127.0.0.1:5173` through backend CORS and must keep `credentials: include` for session cookies.
-- `backendApi` is already feature-complete for authentication, Applications, Buckets, media, access keys, Webhooks, uploads, jobs, and admin endpoints; replacing it is unnecessary.
-- `createMediaHubClient` already sends cookies, CSRF headers on mutations, and `X-MediaHub-App-Id` when an Application is selected.
-- The concrete mode-selection defect is only `const useBackendApi = Boolean(configuredApiBaseUrl)`: the resolved default URL exists but is not used to decide the mode.
-- Existing Vitest suites import the same API facade and rely on Mock data without setting environment variables, so test mode must remain Mock automatically.
-- A minimal compatible policy is: `MODE === 'test'` or `VITE_USE_MOCK_API === 'true'` selects Mock; every other run selects the real backend, with `VITE_API_BASE_URL` overriding the existing localhost:3000 default.
-- Backend CORS is credentialed and supports the Application/CSRF headers, but an empty `MEDIAHUB_CORS_ALLOWED_ORIGINS` list permits no cross-origin console requests.
-- Backend cookies are secure by default. A direct HTTP local console/API pairing needs `MEDIAHUB_ALLOW_INSECURE_COOKIES=true`; localhost ports are same-site, so the default `SameSite=Lax` remains compatible.
-- The runbook already documents the correct local backend flags, including insecure local cookies and a CORS allowlist for the separate Vite origin, but the frontend start path does not enforce or surface them.
-- The currently running Vite console has no API base environment configured and is therefore in Mock mode under the old selector.
-- `admin@example.com` is only a Mock seed account and its Mock password is `mediahub-admin`, not `admin`; this explains the previously reported `admin@example.com admin` login failure in Mock mode and is not evidence of a real backend admin account.
-- Port 3000 is currently backed by Docker/WSL forwarding and returns a MediaHub JSON error envelope, so a real server is already reachable; `/health` is not the correct health route and falls through to the application content route.
-- The host process environment has no `VITE_*` or `MEDIAHUB_*` variables, consistent with the frontend having selected Mock while the backend runs separately in Docker.
-- User clarified the final requirement: delete all runtime Mock-related code rather than retaining an explicit opt-in or test-mode fallback.
-- The production facade should be renamed away from `mock.ts`; demo accounts/data and tests coupled to those seeds must no longer be part of the application runtime.
-- `web/src/api/mock.ts` is a 955-line mixed module: shared UI-facing types/API interface occupy lines 11-296, Mock data/implementation occupies lines 297-708, and the real backend adapter occupies lines 709-954.
-- Only `App.tsx`, `App.test.tsx`, and `App.variant-preview.test.tsx` import the mixed module, so extraction can be contained to a new real-only API facade plus those three imports.
-- The runtime Mock block includes seeded Applications, objects, Buckets, accounts, sessions, jobs, uploads, keys, and Webhooks; deleting lines 297-708 removes the fake backend rather than merely disabling it.
-- Most of `App.test.tsx` is an in-process integration suite that directly mutates the runtime Mock API; those cases cannot remain after the fake backend is removed.
-- Pure frontend coverage in `App.test.tsx` (path helpers, pagination UI, access-key form, one-time secret behavior) can be retained without a fake backend; backend contracts already have Rust/API tests.
-- `App.variant-preview.test.tsx` uses API method spies for a bounded component interaction rather than relying on seeded Mock state, so it can target the real API facade module without carrying a runtime Mock implementation.
-- The reusable, backend-independent tests are clearly separable: Object path normalization, directory breadcrumbs, pagination controls, delete-pending cache helpers, access-key form submission, and one-time-secret disposal.
-- Auth, Application switching, admin, upload, directory navigation, and object workflow cases in `App.test.tsx` all rely on seeded accounts/resources and should move to real-backend E2E coverage rather than recreate a fake service inside unit tests.
-- Mock leakage also exists outside `mock.ts`: the login form is prefilled with `you@example.com`/`mediahub`, multiple route components default missing `appId` to `app_studio`, and Playwright E2E assumes the same seeded account/Application.
-- Removing Mock completely therefore requires clearing login defaults, removing the `app_studio` route fallback, and replacing seed-coupled E2E assumptions with environment-supplied real-backend credentials/Application IDs or skipping when they are absent.
-- The live Docker deployment already has separate `mediahub-api-docker` (port 3000) and `mediahub-web-local` Nginx (port 5173) containers, plus PostgreSQL on host port 55432.
-- Correct backend health endpoints are `/health/live` and `/health/ready`; the earlier `/health` request was expected to miss.
-- The running API container is correctly configured for direct browser access: insecure local cookies are enabled and CORS allows both localhost and 127.0.0.1 on port 5173.
-- Both live and readiness checks return HTTP 200 with `{\"status\":\"ok\"}`.
-- The Nginx container bind-mounts `web/dist`, so rebuilding the frontend in place immediately updates the Docker-served console without adding a frontend image stage.
-- The only helper shared across the Mock and real adapter blocks is `lifecycleSummary`; it must be retained during extraction because real Bucket mapping uses it.
-- The real adapter closes cleanly before the final conditional export, so the new facade can export `backendApi` directly after removing mode selection.
-- The one-time-secret UI exposes a stable accessible close button and a readonly secret input, so E2E assertions do not need the Mock-only `secret_` value prefix.
-- Existing E2E paths and credentials are entirely seed-coupled; they will be gated by `MEDIAHUB_E2E_EMAIL`, `MEDIAHUB_E2E_PASSWORD`, and `MEDIAHUB_E2E_APP_ID` and will target that real Application.
-- The real-only facade extraction produced `web/src/api/index.ts` with 521 lines and removed the 400+ line in-memory service block plus the conditional mode export.
-- After extraction, the only remaining `app_studio` strings are neutral client-test fixture values; they should be renamed so no demo Application identifier remains in the web tree.
-- The runbook documents CORS/cookie requirements but the Compose service does not currently pass `MEDIAHUB_CORS_ALLOWED_ORIGINS`, `MEDIAHUB_ALLOW_INSECURE_COOKIES`, or `MEDIAHUB_COOKIE_SAME_SITE` through to the container.
-- The product spec already states that Pages inject `VITE_API_BASE_URL`; documentation should now state that there is no standalone/demo data mode and the default local API origin is port 3000.
-- The post-removal residue scan found no `api/mock`, Mock mode selector, demo accounts, or demo Application/resource identifiers under the web source tree.
-- The first full Vitest run reached the suite successfully but reported three test failures; one is a stale `/营销素材库/` selector after the neutral fixture was renamed to `归档素材库`.
-- Focused tests identified the primary failure as a syntax error at `api/index.ts:365`: the generated extraction patch was truncated inside a long `mimeBreakdown`/backend helper span and inserted an ellipsis marker.
-- Both focused suites failed during transform before executing tests, so their behavior has not yet been evaluated.
-- No application source map/cache contains the deleted mixed source, but inspection shows the corruption is confined to one line between `mimeBreakdown` and the body of `backendObjectById`.
-- The missing span is reconstructible from the previously inspected real adapter: MIME breakdown, backend DTO mappers, full media pagination, Bucket/media aggregation, and the `backendObjectById` signature/opening.
-- The recovered facade now contains no truncation marker, old Mock import/mode/data identifiers, demo account, or demo Application IDs.
-- The remaining ApplicationSwitcher failure is only the selector label still reading `营销素材库` while the fixture now renders `归档素材库`.
-- After recovery, focused App/API-facing component suites pass: 3 files and 16 tests.
-- TypeScript project compilation passes with the real-only facade.
-- Existing HeroUI `PressResponder` test warnings remain informational and are unrelated to backend/Mock removal.
-- Full frontend verification passes: 26 Vitest files and 128 tests.
-- Production build passes, verifies all 44 OpenAPI paths/67 operations, and rebuilds the Nginx-mounted `web/dist` bundle.
-- Existing third-party viewer/CSS/chunk-size build warnings remain unchanged and do not affect the real API wiring.
+## 战略判断
 
-## Browser verification
+- 两者不是同一层产品：Silo 是存储基础设施/数据面，MediaHub 是媒体应用控制面/体验层。
+- 不建议把“做成第二个 Silo”作为 MediaHub 的默认路线；分布式存储、全量 S3 兼容、纠删码、修复、复制和运维生态是多年累积的基础设施工程。
+- 更有价值的组合是：MediaHub 继续负责用户/Application/权限/配额/Metadata/Variant/分享/Webhook/UI，Silo 作为 S3 数据面或外部存储后端，利用现有 `MEDIAHUB_STORAGE_BACKEND=s3` 连接能力。
 
-- Docker-served `http://127.0.0.1:5173/login` loads successfully with title `MediaHub Console` after rebuilding `web/dist`.
-- The live login form contains empty email/password controls and no demo credential hint or prefilled account.
-- Submitting `admin@example.com` / `admin` now succeeds against the real backend and navigates to the backend-owned Application `app_019f6607ca6f7471a34fa4f7aa0b22b2` named `代码搬运工`.
-- The real dashboard reports 36 objects, one `media` Bucket, 98.0 MB used, local storage capability, and no browser console errors; these values are backend data, not the removed demo seeds.
-- The earlier error wait timed out because authentication succeeded and navigation occurred, not because the request stalled.
-- The authenticated account currently owns one real Application, so the switcher shows that Application plus the create command; no demo Applications appear.
-- The rebuilt `web/dist` contains none of the removed demo account/Application/resource markers or runtime Mock selector symbols.
-- Live CORS preflight from `http://127.0.0.1:5173` to the Docker API succeeds with credentials and explicitly allows CSRF/Application headers.
-- `docker compose config --quiet` passes with the required deployment secrets supplied, including the new CORS/cookie pass-through entries.
-- Playwright discovers the two real-backend workflows; they are credential-gated rather than coupled to removed demo seeds.
-- Running Playwright without `MEDIAHUB_E2E_*` credentials exits successfully with both destructive real-backend workflows skipped, as designed.
-- Final filesystem verification confirms `web/src/api/mock.ts` is absent and `web/src/api/index.ts` directly exports `backendApi`.
+## 当前工作区状态
 
-## Open-source release and container audit
+- Git 分支：`master`，跟踪 `origin/master`。
+- 用户未提交变更：`sub2api/` 未跟踪；本研究不修改它。
+- 本研究生成/更新：`task_plan.md`、`findings.md`、`progress.md`。
 
-### Requirements
+## PrismArk S3 实施审计（2026-08-08）
 
-- Validate whether the checked-in GitHub Actions workflows build successfully and follow a deployable image publishing contract.
-- Build the deployment image locally and inspect the resulting runtime image.
-- Review the repository for security, licensing, documentation, packaging, and release-readiness issues before it is made public.
-- Fix issues that can be confirmed locally without inventing deployment-specific policy.
+- 当前 `media` 单行模型和 `(application_id, bucket_id, object_key)` 唯一约束无法正确表达覆盖写、并发版本、Delete Marker 和 null version。
+- 最小正确模型必须拆成逻辑 `objects` 与不可变 `object_versions`，由 `objects.current_version_id` 指向当前数据版本或 Delete Marker。
+- Versioning 状态应为 `Unversioned / Enabled / Suspended`；一旦启用不能回到 Unversioned，Object Lock Bucket 不能暂停版本控制。
+- `external_version_id` 的唯一性必须限定在 `object_id` 内，因为不同 Key 都可能拥有 `versionId=null`。
+- Staged 普通上传和 Multipart 不得提前进入对象版本历史；最终提交必须原子更新版本、Head、Quota、Outbox 与上传终态。
+- Object Lock 的 Retention/Legal Hold 必须在逻辑删除事务内重新检查，物理 blob 删除改由持久化 GC Task 幂等执行。
+- Lifecycle 首批仅支持 Expiration、NoncurrentVersionExpiration、ExpiredObjectDeleteMarker、AbortIncompleteMultipartUpload 和 Prefix Filter；不支持的动作必须明确拒绝。
+- 推荐顺序：Schema/Core → ObjectService 纵向闭环 → Multipart → Object Lock → Lifecycle → JSON/DAV/Preview/Variant 切换 → 删除旧 Media 并压平迁移。
+- 既有方案需修正：开发期间不能先删除全部 migrations/Media，也不能在 Versioning 之前重接 Multipart；最终发布仍不保留双写或旧兼容层。
 
-### Initial inventory
+## PrismArk S3 当前落地结论（2026-08-08）
 
-- The repository has one workflow, `.github/workflows/ci.yml`; it tests Rust and the web console but does not build or publish a container image.
-- CI uses PostgreSQL 17, stable Rust with rustfmt/clippy, Node.js 22, `npm ci`, OpenAPI drift checks, unit tests, production web build, libvips tests, and an all-feature Clippy pass.
-- The root `Dockerfile` builds only `mediahub-server` with a checksum-pinned libvips source tarball and runs as UID 10001 on Debian Bookworm slim.
-- The runtime image exposes port 3000 and persists `/data`; the separate Vite web console is not included in the image or Compose stack.
-- Compose requires access-key encryption, media-signing, and email-provider secrets at interpolation time, and persists both PostgreSQL and local object data in named volumes.
-- The workspace declares `license = "MIT"`, but the tracked repository has no root `LICENSE` file.
-- The repository currently has no `SECURITY.md`, contribution guide, code of conduct, issue templates, or dependency-update configuration.
-- Local Docker, Rust, Node.js, npm, and Git are available. `actionlint`, Gitleaks, Trivy, Syft, and Hadolint are not installed locally; containerized or downloaded equivalents may be used for read-only validation.
-- The worktree was clean before this audit and the Git remote is `https://github.com/emojiiii/mediahub.git`.
+- S3 已切换为独立 9000 listener，生产 Router 不再保留 `/s3` 入口。
+- 普通 Put 与 Multipart 共享 UploadIntent → promotion → ObjectVersion 原子提交链路；新 S3 纵向路径不写 Media。
+- Unversioned/Enabled/Suspended、null version、delete marker、精确版本读删和当前 head 重算已经落地。
+- ListObjectsV2 只从当前 committed ObjectVersion 读取，prefix/delimiter/cursor 使用同一排序窗口。
+- DeleteObject/DeleteObjects 在同一事务中处理版本语义、Object Lock 检查与持久化 GC；Governance bypass 必须是被 SigV4 签名的严格布尔 header。
+- Multipart 已使用 Part MD5、标准 multipart ETag、恢复/重放与持久化 GC；Complete 不再创建 Media。
+- 当前仍不能宣称完整 S3：缺 CopyObject/UploadPartCopy、ListObjectVersions、Policy、Tagging、Object Lock 修改 API、完整 Lifecycle 执行器、Notification/CORS/SSE 和广泛客户端互操作验证。
+- WebDAV 作为产品兼容层已保留，但内部仍待迁移到统一 ObjectService；Preview/Variant 也仍需绑定不可变 object_version_id。
 
-### Documentation and metadata audit
+## Docker 真实后端验证结论（2026-08-08）
 
-- `readme.md` still labels the project as being in a design phase and functions primarily as a long product specification rather than a public project entry point.
-- The README deployment configuration table contains stale generic names such as `STORAGE_BACKEND`, `SESSION_SECRET`, and `MASTER_KEY_V1`; the implementation and Compose file use `MEDIAHUB_*` names documented in `docs/runbook.md`.
-- The executable deployment instructions are in the English-only runbook and currently teach source builds (`docker compose up --build`), not pulling a published image.
-- Individual Cargo packages inherit the MIT declaration but generally omit `repository`, `homepage`, `documentation`, `readme`, and sometimes `description` metadata. The web package is private, which is appropriate for an application bundle.
-- A tracked-file secret-pattern scan found only Compose/CI development passwords and explicit test fixtures. The single-commit Git history contains no historically tracked `.env`, private-key, credential, or secret-named file.
-- Docker Desktop and Buildx are healthy and advertise both `linux/amd64` and `linux/arm64`, so local image and multi-platform build validation are possible.
-
-### Confirmed CI blocker
-
-- `web/package-lock.json` is absent, while the web CI job configures `actions/setup-node` with that exact cache dependency path and runs `npm ci`.
-- `npm audit --json` reproduced the underlying failure as `ENOLOCK`; a clean GitHub runner cannot install the web dependencies until a lockfile is committed.
-- The missing lockfile also makes dependency resolution non-reproducible and prevents reliable npm vulnerability review.
-
-### Dependency and secret scan
-
-- The generated lockfile initially embedded `registry.npmmirror.com` artifact URLs from the developer-machine npm configuration; a public lockfile should use the canonical npm registry.
-- Official npm audit reports 5 vulnerable packages: 4 high and 1 moderate. Vite/esbuild advisories have a supported major-version fix; `xlsx` has prototype-pollution and ReDoS advisories with no npm-registry automatic fix.
-- `@open-file-viewer/core` and `@open-file-viewer/react` inherit the `xlsx` advisory, and the project also imports `xlsx` directly for spreadsheet preview. Because uploaded files are untrusted input, this is a real residual risk rather than an unused transitive dependency.
-- Gitleaks scanned approximately 2.44 MB and reported one finding. The path/rule still needs to be inspected without exposing the matched value before deciding whether it is a real credential or a documented test placeholder.
-- `cargo-audit` and `cargo-deny` are not installed. The attempted `rustsec/rustsec:latest` container fallback is not a published image and failed before scanning.
-- The Gitleaks finding is the public example `MEDIAHUB_MEDIA_SIGNING_KEY` in `docs/runbook.md:10`, not a live credential. Replacing fixed example keys with documented random generation will avoid false alarms and teach safer deployment behavior.
-- The latest `@open-file-viewer` release (0.1.26) still depends on `xlsx ^0.18.5`; upgrading that package alone does not resolve the SheetJS advisories.
-- SheetJS publishes the patched `xlsx` 0.20.3 package from its official CDN, where the package metadata is reachable and declares Apache-2.0. npm `overrides` can force the viewer's transitive copy to this same direct dependency.
-- A compatible current frontend toolchain is available: Vite 8.1.5, `@vitejs/plugin-react` 6.0.3, Vitest 4.1.10, and `vite-plugin-static-copy` 4.1.1. All support Vite 8 and Node.js 22+; Vite specifically requires Node 22.12 or newer.
-
-### Container and Rust audit
-
-- Clean `npm ci` succeeds from the new canonical lockfile and official npm audit now reports zero vulnerabilities.
-- Actionlint accepts the existing GitHub Actions workflow.
-- Hadolint reports only unpinned Debian apt package versions and a missing `pipefail` shell for the checksum pipeline. The checksum pipeline warning is actionable; exact apt patch pinning conflicts with normal Bookworm security updates and will remain an explicitly accepted warning.
-- RustSec found two remotely triggerable denial-of-service advisories in `quick-xml 0.40.1`; MediaHub directly iterates checked attributes while parsing untrusted S3 XML, so these are reachable.
-- `object_store 0.14.1` updates its `quick-xml` requirement from 0.40.1 to patched 0.41.0. Updating both the workspace dependency and the Server's direct dependency will remove the vulnerable version.
-- RustSec also reports the unpatched `rsa 0.9.10` advisory from `Cargo.lock`, but `cargo tree --target all --invert rsa` finds no enabled path in any MediaHub target. Re-evaluate after updating the lockfile; this is not linked into the runtime as currently configured.
-- An existing API image proves the runtime volume defect: it runs as UID/GID 10001, `/data` is root-owned mode 0755, `/data/storage` is absent, and a write as the runtime user fails with `Permission denied`.
-- `LocalObjectStore::new` creates the configured root at process startup, so a fresh Docker volume prevents local-storage deployments from starting until the image creates and owns `/data/storage` before switching users.
-
-### Implemented release hardening
-
-- Added the missing npm lockfile, upgraded the Vite/Vitest toolchain, and forced direct/transitive SheetJS use to patched 0.20.3; clean install and npm audit both pass.
-- Updated `object_store` to 0.14.1 and direct `quick-xml` to 0.41.0; both reachable XML denial-of-service advisories are removed.
-- `rsa` remains only beneath the disabled `sqlx-mysql` package recorded by Cargo's lockfile resolver; neither `cargo tree --target all --invert rsa` nor the equivalent sqlx-mysql query finds an enabled target path.
-- The image now creates `/data/storage` as UID/GID 10001, provides an HTTP liveness health check, includes CA certificates/curl, enables `pipefail` for source checksum verification, and declares OCI source/license metadata.
-- Compose can pull `ghcr.io/emojiiii/mediahub:latest` while retaining a local build definition. PostgreSQL password is now required and public registration defaults to disabled.
-- Added a multi-architecture GHCR workflow with PR build-only behavior, branch/tag/SHA labels, BuildKit cache, provenance, and SBOM publication.
-- Added Dependabot coverage for Cargo, npm, GitHub Actions, and Docker; added MIT license, security policy, contribution guide, `.env.example`, and secret-safe ignore rules.
-- README and runbook now document published-image deployment, the API-only image boundary, secure random key generation, current environment names, and the separate web-console deployment.
-- Post-change Actionlint, Compose parsing, Hadolint (excluding intentional apt patch pinning), Gitleaks, and whitespace checks pass.
-
-### Final workflow scope
-
-- The user confirmed that Cloudflare builds the Web UI directly; GitHub Actions must not install, test, or build `web/`.
-- Rust CI should run only for `crates/**`, root Cargo manifest/lock changes, or its own workflow definition.
-- Container builds should use the same backend paths plus Dockerfile and `.dockerignore` changes. Tag pushes remain release triggers.
-- `web/` uses pnpm, and the Docker build context should exclude it completely so UI changes cannot invalidate backend image layers.
-
-### Final verification
-
-- Both GitHub workflows pass Actionlint and contain no Web, Node, npm, or package-lock references.
-- `pnpm install --lockfile-only --frozen-lockfile` accepts `web/pnpm-lock.yaml`; Cloudflare can own the actual Web install/build.
-- Docker build context is approximately 963 KB with `web/` excluded. `mediahub:open-source-audit` built successfully from Rust 1.88 and custom libvips.
-- The final image runs as UID/GID 10001, owns `/data/storage` as mode 0750, can write there through a fresh anonymous volume, has no missing shared libraries, and includes the expected OCI labels and liveness health check.
-- A fresh PostgreSQL database plus fresh storage volume reached HTTP 200 on both `/health/live` and `/health/ready`; Docker reported the container as healthy.
-- The first runtime attempt correctly failed closed because the reused test database contained object metadata while the fresh storage volume was empty. This was test-state mismatch, not an image defect.
-- The first full workspace test run exposed a pre-existing CI failure: `data_plane_sql_keeps_native_types_locks_and_atomic_boundaries` searched only `media.rs` and `s3_multipart.rs`, but both are now include facades and the asserted SQL lives in their split implementation files.
-- The SQL invariants themselves remain present. Updating the test input to concatenate the facade plus all included implementation files restores the intended structural coverage without changing database behavior.
-- First post-upgrade Clippy run failed only on a current-stable `collapsible_if` lint in `async_job_error.rs`; the validation condition is being collapsed as suggested.
-- Vite 8's new Rolldown output omitted the expected `docx-preview` lazy asset and failed `verify-viewer-chunks.mjs`. Vite 7.3.6 remains above all audited Vite vulnerability ranges and preserves the existing Rollup chunk contract, so it is the safer compatibility target.
-
-## Latest dependency upgrade
-
-### Requirements
-
-- Upgrade all direct dependencies where the latest release is compatible after reasonable migration work, with Web UI as the highest priority.
-- Use pnpm and keep Cloudflare as the Web build owner; do not reintroduce Web jobs into GitHub Actions.
-- Treat latest-major upgrades as migrations that require tests, not automatic version substitutions.
-- Record explicit technical reasons for any package that must remain below latest.
-
-### Initial inventory
-
-- The pnpm lock already resolves many caret-ranged Web packages to current releases, but the manifest still advertises older minimums. Latest-major migrations are required for resolvers 5, React Router 7, Zod 4, Vite 8/plugin-react 6, jsdom 29, TypeScript 7, Lucide 1, and openapi-fetch 0.17.
-- Current Web latest versions reported by the official registry include Vite 8.1.5, TypeScript 7.0.2, React Router 7.18.1, Zod 4.4.3, Lucide React 1.25.0, jsdom 29.1.1, and `@hookform/resolvers` 5.4.0.
-- Cargo can immediately update 38 compatible locked packages on Rust 1.97. Direct major candidates include aes-gcm 0.11, AWS credential/signature crates, hmac 0.13, password-hash 0.6, rand 0.10, reqwest 0.13, sha2 0.11, sqlx 0.9, and tower-http 0.7.
-- The production Docker builder is pinned to Rust 1.88 while the current stable toolchain used locally is Rust 1.97.0.
-- GitHub Actions also have new majors available for the Docker setup/login/metadata/build actions. These need workflow schema validation after upgrading.
-
-### Direct dependency matrix
-
-- Cargo's non-aggressive direct scan confirms compatible updates for serde 1.0.229, thiserror 2.0.19, uuid 1.24.0, futures 0.3.33, AWS credential types 1.3.0, AWS SigV4 1.5.1, and md-5 0.11.0. An aggressive scan is still required for every cross-major candidate.
-- Latest official Actions tags are checkout 7.0.0, setup-qemu 4.2.0, setup-buildx 4.2.0, login 4.4.0, metadata 6.2.0, build-push 7.3.0, and rust-cache 2.9.1.
-- The Action versions seen in the screenshot are therefore real current majors rather than Dependabot noise; they can be upgraded together and validated with Actionlint.
-- pnpm 11 no longer reads `pnpm.overrides` from package.json and strictly checks the declared package-manager version. The SheetJS security override must move to `web/pnpm-workspace.yaml` before upgrading.
-- pnpm 11's first latest update was blocked by supply-chain verification: open-file-viewer 0.1.26 and postcss 8.5.20 were less than 24 hours old, while the external SheetJS 0.20.3 tarball lacked a registry-style integrity entry. No compatibility conclusion can be drawn until the policy is handled explicitly.
-- After adding exact release-age/provenance exceptions, pnpm 11 next rejected the fixed SheetJS URL override because `blockExoticSubdeps` forbids URL dependencies below the root. A package-scoped exception is preferable to disabling this policy globally.
-- The latest `openapi-typescript` release is 7.13.0 and has no newer preview line; it declares TypeScript `^5.x`. TypeScript 7.0.2 is genuinely incompatible: client generation crashes because `ts.factory` is unavailable through the API shape expected by openapi-typescript.
-- The latest compatible TypeScript is 5.9.3, so this is a required compatibility exception rather than an overlooked update.
-- The upgraded Web test suite passes: 26 files and 128 tests under pnpm 11.15.0.
-- React Router 7 removes the `BrowserRouter.future` prop used to opt into v7 behavior on React Router 6; removing the prop preserves the now-default semantics.
-- Vite 8.1.5 successfully compiles the application, but Rolldown 1.1.5 automatically merges the statically imported `docx-preview` dependency into `ObjectFileViewer`. Rolldown's supported `output.codeSplitting.groups` API can preserve the named lazy chunk without reverting Vite.
-- After explicit splitting, Vite 8 lists the DOCX chunk in the main chunk's `__vite__mapDeps` table so it can preload it when the lazy `ObjectFileViewer` import is requested. This is not a top-level import and does not load the DOCX code on the initial page.
-- `vite-plugin-static-copy` 4.1.1 always preserves matched directory structure unless `rename.stripBase` is enabled. Without migration, PDF.js assets land under `pdfjs/*/node_modules/pdfjs-dist/...` and runtime CMap/font URLs break.
-- Official npm audit found five lodash advisories through `open-file-viewer -> mammoth -> argparse@1 -> lodash@3`. Mammoth 1.12.0 does not import argparse anywhere in its JS; it is a stale CLI dependency. Overriding it to latest argparse 3.0.0 removes lodash without changing the browser conversion path.
-- After the argparse override, pnpm resolves one argparse 3.0.0 copy for both Mammoth and OpenAPI tooling; lodash is absent, peer checks pass, and official npm audit reports zero known vulnerabilities.
-- Stable argon2 0.5.3 still depends on password-hash 0.5. The direct password-hash declaration enables `getrandom` on that same dependency; upgrading it alone to 0.6 would create an unused second type universe and would not upgrade password verification.
-- After the Rust migrations, both regular and aggressive cargo-outdated scans report no outdated workspace root dependencies. Libvips 8.18.4 remains the newest stable upstream tag.
-- The only Web direct dependency behind `latest` is TypeScript 5.9.3; TypeScript 7.0.2 cannot be used until openapi-typescript publishes compatible support.
-- The only Rust direct declaration intentionally below its crate's newest stable major is password-hash 0.5.0, because stable argon2 0.5.3 exposes that exact type line and uses the direct declaration's `getrandom` feature.
-- The Rust 1.97.0 deployment image builds successfully on Linux with libvips 8.18.4. Runtime smoke confirms UID 10001, writable storage, healthy HTTP response, and resolved `libvips.so.42` with no missing libraries.
-
-## Libvips CI compatibility
-
-- `libvips` crate 2.3.0 generated `WebpsaveBufferOptions` against libvips 8.18 and always forwards every field to the variadic C API, including `exact=false`.
-- The GitHub runner's distro libvips predates the `exact` property, so WebP encoding fails before it can produce output.
-- `VipsImage::image_write_to_buffer` accepts saver suffix options and forwards only explicitly named properties. `.webp[Q=...,strip]` preserves quality and metadata stripping without depending on the new `exact` property.
-- Debian bookworm currently supplies libvips 8.14.1, making it a suitable lower-bound reproduction environment for the GitHub system-package failure.
-- Libvips 8.14.1 also predates the generated binding's `keep` saver property. All three output formats need the minimal suffix-option path, not only WebP.
-- The final `.jpg`, `.png`, and `.webp` suffix-option implementation passes all 11 libvips-enabled tests on both Debian libvips 8.14.1 and the deployment image's pinned libvips 8.18.4.
-- The release server builds successfully with the pinned library, and the rebuilt deployment image starts as the non-root `mediahub` user with both live and readiness checks returning HTTP 200.
-
-## Resend email integration
-
-- Resend sends mail through `POST https://api.resend.com/emails` with `Authorization: Bearer <API key>` and JSON fields `from`, `to`, `subject`, plus `html` and/or `text`.
-- A successful send returns a JSON `id`; API failures use non-2xx status codes and an error object containing `name`, `statusCode`, and `message`.
-- Resend accepts an `Idempotency-Key` header up to 256 characters. Keys expire after 24 hours, which can prevent duplicate verification/reset messages during ambiguous retries.
-- The default documented rate limit is 10 requests per second per team; `429` responses expose standard rate-limit headers.
-- Production senders require a verified Resend domain. The API key must remain server-side and should be scoped to sending where possible.
-- MediaHub currently owns its HTTP email client in `mediahub-server`, configured by a provider URL, bearer token, and sender address.
-- Registration, resend-verification, and forgot-password handlers all call one `send_token(email, template, token, expires_at)` method; this is the narrow integration boundary to preserve while changing the outbound Resend payload.
-- Existing server tests assert the old template-webhook body, so they must be migrated to verify Resend headers, endpoint, rendered subjects/bodies, and provider failure behavior.
-- Registration propagates an initial email-delivery failure, while resend-verification and forgot-password deliberately log failures and keep their enumeration-resistant accepted responses. The Resend migration must preserve this behavior.
-- Direct sending means MediaHub must now own the verification/reset subject and both HTML/text bodies; the old external provider previously owned template rendering.
-- The current provider configuration permits an HTTP endpoint only under an explicit development override. A direct Resend integration can use a fixed HTTPS production endpoint while retaining an injectable endpoint only for local tests.
-- The Web console already consumes `/verify-email?token=...` and `/reset-password?token=...`; direct email rendering therefore needs a configured public console origin so messages can contain actionable links.
-- No public console URL exists in the backend configuration today. It should be explicit rather than inferred from CORS, because CORS may contain multiple origins or be empty.
-- The existing server already depends on `reqwest`, `serde`, `serde_json`, `time`, `url`, and SHA-256 utilities, so the Resend integration does not require a new SDK or dependency.
-- Compose and `.env.example` currently expose the generic provider URL/token contract; these should become Resend-specific API key plus a public Web URL while retaining the verified sender setting.
-- The implementation uses the existing Web routes, a fixed Resend HTTPS endpoint, a 10-second request timeout, and a token-hash idempotency key. It validates the Resend response ID before treating a send as accepted.
-- Runtime configuration now requires `MEDIAHUB_RESEND_API_KEY`, a verified `MEDIAHUB_EMAIL_FROM`, and a clean HTTPS `MEDIAHUB_WEB_URL`; the development-only exposed-token mode can still run without Resend.
-
-## README deployment documentation
-
-- The implemented HTTP surface has four distinct entry points: JSON control-plane routes under `/api/v1/*`, native path-style object routes under `/{app_id}/...`, WebDAV under `/dav/{app_id}/...`, and a bounded S3 gateway under `/s3/{bucket}/{object_key}`.
-- The S3 gateway supports the PutObject, presigned/header-signed GetObject, and HeadObject operations needed by the documented sub2api integration; it is intentionally not a full S3-compatible administration/API implementation.
-- Docker Compose persists PostgreSQL metadata in `mediahub-postgres-data` and Local object bytes in `mediahub-data`; S3 mode stores bytes in the configured external backend while retaining PostgreSQL metadata locally.
-- The compose file also includes a `build` target, but prebuilt deployments should run from the repository root with `docker compose pull mediahub` and `docker compose up -d --no-build`; source builds use `docker compose up -d --build`.
-- The API router confirms the S3 gateway supports GET/HEAD/PUT/POST/DELETE at `/s3/{bucket}/{object_key}` plus bucket listing/POST at `/s3/{bucket}`, while WebDAV is mounted at `/dav`, `/dav/`, and `/dav/{*path}`.
-- The existing runbook contains the authoritative backup, PostgreSQL, S3, WebDAV, HMAC, and verification details; the README should be a concise operational front door linking to it rather than duplicating every contract.
-- README review found two historical phrases that described S3 and email as future/configurable provider features; the implementation now documents S3 as supported and Resend as the concrete email service.
-
-## Container placeholder-binary fix
-
-- The repository root is a virtual Cargo workspace with `crates/mediahub-server` in both `members` and `default-members`; it correctly has no root `src` directory.
-- `cargo build --package mediahub-server` selects the member package, whose conventional `crates/mediahub-server/src/main.rs` is the binary entry point without requiring an explicit root `[[bin]]` declaration.
-- The Docker dependency-cache stage writes and compiles an empty `mediahub-server/src/main.rs`, then overlays real sources whose preserved timestamps can be older than the cached artifact. Cargo may therefore retain the empty successful binary.
-- A packaged empty `fn main() {}` exactly explains the server evidence: immediate exit code 0, no application logs, no listening port, and an endless `unless-stopped` restart loop.
-- The image workflow currently emits branch, PR, semver, SHA, and latest metadata tags; the requested deployment contract is only `master` and `latest` from the default branch.
-- Cleaning only the eight workspace packages after the real-source copy preserved dependency artifacts but forced the actual `mediahub-core`, app, adapters, and server packages to compile; the build log showed the placeholder artifacts removed before a 20-second real workspace rebuild.
-- The fixed image rejects missing configuration with a visible error and exit code 1, then starts with full configuration, logs database/listener initialization, remains at restart count 0, and returns healthy live/readiness responses.
-
-## Unified Web container
-
-- The current Docker context explicitly excludes both `web` and `openapi`, so a Web build stage cannot work until those exclusions are removed.
-- The Vite client currently defaults its API base URL to `http://localhost:3000`; a Web UI served by MediaHub must default to the browser's current origin while preserving `VITE_API_BASE_URL` overrides.
-- The Rust router owns broad native object routes such as `/{app_id}` and `/{app_id}/{bucket}`, so a global SPA fallback would break the object API. Static assets and each known SPA route must be mounted explicitly.
-- Current production output contains `index.html`, hashed files under `assets/`, and PDF.js resources under `pdfjs/`; these directories are sufficient for the existing Vite application.
-- The GitHub workflow currently ignores `web/**`; once the image contains Web assets, Web changes must trigger the image workflow and invalidate the Web build layer.
-- The existing resolver can preserve local Vite behavior by using port 3000 only in `import.meta.env.DEV`; production builds can safely use `window.location.origin` when no explicit API base is configured.
-- React owns `/`, five authentication routes, `/app/:appId/*`, and `/admin/*`. These can be registered explicitly alongside `assets/` and `pdfjs/` without a global fallback.
-- An optional validated `MEDIAHUB_WEB_ROOT` keeps ordinary Cargo development independent from a prior Web build, while the Docker runtime can require `/app/web` through its image environment.
-- `tower-http` is already shared by the server; enabling its `fs` feature provides the proven `ServeDir`/`ServeFile` services instead of custom path parsing.
-- The user selected the unified image as the only Web deployment path. The obsolete static-hosting configuration, package scripts, dependency, lock entries, and standalone Cloudflare documentation should be removed.
-- The server applies CORS as a route layer to API/native routes and applies request IDs, metrics, tracing, and HMAC authentication globally. Web routes should be mounted after the API CORS layer but before global middleware so same-origin static responses retain observability without changing cross-origin API behavior.
-- README and runbook currently describe standalone hosting as mandatory and recommend SHA/version image tags even though the release workflow publishes only `master` and `latest`. The instructions must use the unified image and same-origin URL.
-- Unified console/API hosting shares an origin with native object routes. Existing object responses mitigate active content with CSP sandboxing and nosniff headers, and force HTML/SVG to download; those security contracts already have tests. A separate media/CDN origin remains a stronger optional isolation boundary.
-
-## Pre-release crates remediation final verification
-
-- Ordinary-upload reconciliation is now a durable fenced protocol rather than a `created_at` scan: active upload owners heartbeat, workers atomically claim expired leases, actual temporary keys are persisted, and every terminal mutation checks the current token.
-- PostgreSQL reconciliation excludes fenced multipart completion rows and its ordering, ownership rotation, stale-token rejection, and quota cleanup are covered by the destructive repository contract.
-- Completed direct-upload cleanup is consistent across S3 and Local: replay-protection temporary data is removed only after its target expires, while the active final object and Local MIME sidecar are preserved.
-- Webhook history pagination resumes only from immutable `history_id`; new cursors omit mutable `updated_at`, while the decoder remains backward-compatible with old tokens.
-- Synchronous batch idempotency owners are not reclaimed until the 24-hour key expiry, so normal retries cannot overlap. The fencing token still does not turn a multi-item batch into one database transaction; strict cross-item exactly-once execution remains an architectural boundary rather than a current release blocker.
-- S3 reconciliation requires size, MIME, and SHA-256. MediaHub-authored PUTs persist digest metadata; older/provider-authored objects use a streaming digest fenced by ETag/version without buffering the complete object.
-- Promotion cleanup remains inside the durable recovery protocol: final creation followed by temporary-delete failure returns an ambiguous result, retains the uploading row, and is retried before activation.
-- Webhook DNS and the complete delivery attempt are bounded below the lease lifetime; AsyncJob OpenAPI time formats, required nullable properties, and sensitive-field exclusions match the explicit server response DTOs.
-- Image intermediate allocation limits use actual bytes per pixel/sample in both Rust and libvips paths; the RGBA16 extreme-cover regression is covered.
-
-## Streaming S3 backup uploads
-
-- DeepWiki identifies `Wei-Shaw/sub2api` as the relevant client. Its service pipeline obtains a PostgreSQL dump as `io.ReadCloser`, compresses through `gzip.Writer` connected by `io.Pipe`, and passes that stream to `BackupObjectStore.Upload(ctx, key, body io.Reader, contentType)`.
-- Direct inspection of current public source corrects DeepWiki's incomplete inference: `backend/internal/repository/backup_s3_store.go::S3BackupStore.Upload` calls `io.ReadAll(body)`, then sends `bytes.NewReader(data)` through `s3.Client.PutObject`. The HTTP request therefore has a known length and a replayable in-memory body, but no multipart threshold or part-size configuration.
-- sub2api's shared S3 client installs `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` and `RequestChecksumCalculationWhenRequired`. MediaHub must accept its ordinary signed PutObject shape, including `UNSIGNED-PAYLOAD`, without requiring client-managed Multipart.
-- sub2api backup S3 configuration is distinct from asynchronous image storage. Cloudflare R2 accepts this backup stream, while MediaHub currently applies a 64 MiB Axum `Bytes` extractor and buffers the complete request before authentication/storage.
-- MediaHub already implements client-managed S3 Multipart, but that does not solve compatibility with sub2api's fixed backup PutObject path. PutObject and UploadPart should both stop extracting whole bodies into memory.
-- DeepWiki could identify `backend/internal/service/backup_service.go` and `repository.NewS3BackupStoreFactory()` but did not index the concrete factory body. A read-only clone of the public repository located it at `backend/internal/repository/backup_s3_store.go`.
-- The concrete backup store imports `github.com/aws/aws-sdk-go-v2/service/s3` and does not import `feature/s3/manager`, confirming that the fixed backup client is not using the SDK's automatic multipart uploader.
-- MediaHub's `ObjectStore::put_temporary` accepts `&[u8]`; Local and external S3 adapters therefore cannot currently receive a bounded stream. The S3 HTTP layer also copies `Bytes` into `Vec<u8>` for the ordinary upload service.
-- Multipart completion already demonstrates the correct transaction boundary: parts are durable temporary objects, composition produces size/SHA-256 without materializing the final object in application memory, and `StagedUploadMediaRequest` atomically commits the Media record and promotes storage.
-- The streaming design should reuse that staged-upload boundary. PutObject and UploadPart stream into temporary storage while calculating trustworthy size/SHA-256, validate the completed payload, then commit metadata; any auth/checksum/repository failure deletes the temporary object.
-- `LocalObjectStore` already has a durable `put_temporary_stream` implementation: it writes chunks to a unique staging file, enforces the declared size incrementally, fsyncs data and MIME metadata, atomically installs both, and removes staging files on stream/size/I/O failure.
-- External `S3ObjectStore::compose_temporary` already uses `object_store::WriteMultipart` with backpressure and calculates size/SHA-256 chunk by chunk. The same internal multipart writer can ingest a client PutObject stream into an upstream S3 temporary object without buffering the full body.
-- A naive HTTP-owned temporary key would create an untracked orphan if the process dies after storage installation but before database registration. The ordinary upload service's existing durable `uploading` row/temporary-key lease should remain the owner of a streaming PutObject whenever possible.
-- Existing `UploadSessionService` is an even better single-PUT owner: before bytes arrive it persists expected size/MIME/object identity, reserves quota, assigns a temporary storage key, and has expiry/cancellation cleanup. After the stream, adapter inspection derives trustworthy size/SHA-256 and completion promotes atomically.
-- PutObject can therefore be implemented as an internal UploadSession flow without a new migration: authenticate and validate Content-Length, create a session, stream into its opaque temporary key, then complete it. A crash during streaming leaves durable cleanup state rather than an untracked object.
-- The implemented gateway verifies `UNSIGNED-PAYLOAD` or a precomputed `x-amz-content-sha256` signature before accepting the body. A precomputed digest is compared again against the incrementally calculated payload digest after storage; requests with no explicit streaming payload mode receive S3 XML instead of being buffered for authentication.
-- Local PutObject and UploadPart bodies now flow into fsynced staging files while computing size and SHA-256. External S3/R2 storage uses `object_store::WriteMultipart` with 5 MiB internal parts and a four-upload backpressure bound; this internal transport does not require the fixed sub2api client to use Multipart Upload.
-- Ordinary PutObject uses a durable UploadSession before reading bytes, so object identity, expected size, quota reservation, temporary storage ownership, expiry, and cleanup all exist before the transfer starts. Successful completion retains the existing Media/outbox/audit transaction boundary.
-- The former 64 MiB Axum `Bytes` extraction is gone from PutObject and UploadPart. Control/XML requests retain a bounded extractor; streamed object requests are instead limited by declared Content-Length, Bucket `max_object_size`, Application quota, and the 2 GiB technical limit.
-- Cloudflare R2 accepting a large request does not prove that an ordinary Cloudflare-proxied MediaHub hostname will accept it. R2's API and the orange-cloud reverse proxy have separate upload limits; large backup traffic may need a DNS-only/source-direct hostname.
-- sub2api's backup settings test calls only `S3BackupStore.HeadBucket`; it does not upload a probe object. Axum previously routed `HEAD /s3/{bucket}` through the ListObjects handler, which required `media:list` and produced the observed bodyless 403 for a backup key with only `media:upload`.
-- MediaHub now owns an explicit HeadBucket route. It authenticates SigV4, checks that the Bucket belongs to the Access Key's Application, and accepts any S3 media capability (`media:upload`, `media:read`, or `media:list`) without granting list access.
+- 静态 SQL 测试无法替代 fresh database：真实 PostgreSQL 发现约束同名和 `chr(0)` 两个迁移缺陷，均已修复。
+- 修复后 PostgreSQL 17 fresh migration、Repository Contract 和 Server 133 个测试全部通过。
+- Silo 真实 bucket 证明 generic S3 不应假设普通 CopyObject 支持 destination create-only；PrismArk 现在使用条件 Multipart Copy 建立不可覆盖语义。
+- Multipart Copy 不保留 attributes，必须在取得随机不可变 final key 的所有权后执行同源 server-side metadata repair，并在重试时先比较字节，避免把不同对象误判为幂等提交。
+- `pgsty/silo:latest` 上的完整 ObjectStore 合同和 Presigned PUT 已通过，验证了 Local/S3 共享端口在真实兼容后端上的关键行为。

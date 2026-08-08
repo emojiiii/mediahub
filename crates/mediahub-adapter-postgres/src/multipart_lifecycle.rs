@@ -8,13 +8,6 @@ impl S3MultipartRepository for PostgresRepository {
     ) -> Result<S3MultipartUpload, RepositoryError> {
         upload.validate()?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        lock_object_identity(
-            &mut transaction,
-            upload.application_id,
-            upload.bucket_id,
-            &upload.object_key,
-        )
-        .await?;
         let application_exists = sqlx::query_scalar::<_, uuid::Uuid>(
             "SELECT id FROM applications WHERE id = $1 FOR UPDATE",
         )
@@ -34,11 +27,11 @@ impl S3MultipartRepository for PostgresRepository {
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if active_uploads
-            >= i64::try_from(MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION).map_err(|_| {
+        let active_limit = i64::try_from(MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION)
+            .map_err(|_| {
                 RepositoryError::Invariant("multipart active upload limit is too large".into())
-            })?
-        {
+            })?;
+        if active_uploads >= active_limit {
             return Err(RepositoryError::QuotaExceeded);
         }
         let bucket_exists = sqlx::query_scalar::<_, bool>(
@@ -52,34 +45,20 @@ impl S3MultipartRepository for PostgresRepository {
         if !bucket_exists {
             return Err(RepositoryError::NotFound);
         }
-        let object_is_claimed = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM media WHERE application_id = $1 AND bucket_id = $2 \
-             AND object_key = $3) OR EXISTS(SELECT 1 FROM upload_sessions \
-             WHERE application_id = $1 AND bucket_id = $2 AND object_key = $3 \
-             AND state = 'pending')",
-        )
-        .bind(upload.application_id.as_uuid())
-        .bind(upload.bucket_id.as_uuid())
-        .bind(&upload.object_key)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if object_is_claimed {
-            return Err(RepositoryError::Conflict);
-        }
         let created_at = postgres_time(upload.created_at);
         let expires_at = postgres_time(upload.expires_at);
         let row = sqlx::query(
             "INSERT INTO s3_multipart_uploads (upload_id, application_id, bucket_id, object_key, \
-             content_type, visibility_override, state, expires_at, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $8) RETURNING *",
+             content_type, user_metadata, storage_backend, state, expires_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $9) RETURNING *",
         )
         .bind(upload.upload_id)
         .bind(upload.application_id.as_uuid())
         .bind(upload.bucket_id.as_uuid())
         .bind(upload.object_key)
         .bind(upload.content_type)
-        .bind(upload.visibility_override.map(visibility_name))
+        .bind(Json(upload.user_metadata))
+        .bind(upload.storage_backend)
         .bind(expires_at)
         .bind(created_at)
         .fetch_one(&mut *transaction)
@@ -119,18 +98,13 @@ impl S3MultipartRepository for PostgresRepository {
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
         let mut upload = lock_upload(&mut transaction, upload_id).await?;
         if upload.state != S3MultipartUploadState::Pending {
-            transaction.commit().await.map_err(database_error)?;
             return Ok(S3MultipartPartPut::NotPending(upload));
         }
         if upload.expires_at <= now {
-            abort_and_release_parts(&mut transaction, &upload, now).await?;
+            abort_upload_and_enqueue_cleanup(&mut transaction, &upload, None, now).await?;
             upload = lock_upload(&mut transaction, upload_id).await?;
-            let storage_keys = list_storage_keys(&mut transaction, upload_id).await?;
             transaction.commit().await.map_err(database_error)?;
-            return Ok(S3MultipartPartPut::Expired {
-                upload,
-                storage_keys,
-            });
+            return Ok(S3MultipartPartPut::Expired(upload));
         }
         let previous = sqlx::query(
             "SELECT size_bytes, storage_key FROM s3_multipart_parts \
@@ -152,44 +126,47 @@ impl S3MultipartRepository for PostgresRepository {
             .map(|row| row.try_get::<String, _>("storage_key"))
             .transpose()
             .map_err(database_error)?;
-        let current_size = multipart_reserved_bytes(&mut transaction, upload_id).await?;
-        let new_part_size = as_i64(part.size)?;
+        let current_size = multipart_stored_bytes(&mut transaction, upload_id).await?;
         let new_total = current_size
             .checked_sub(previous_size)
-            .and_then(|size| size.checked_add(new_part_size))
+            .and_then(|size| size.checked_add(as_i64(part.size).ok()?))
             .ok_or_else(|| RepositoryError::Invariant("multipart size overflow".into()))?;
         if new_total > as_i64(maximum_upload_size)? {
             return Err(RepositoryError::QuotaExceeded);
         }
-        adjust_reserved_bytes(
-            &mut transaction,
-            upload.application_id,
-            new_part_size - previous_size,
-        )
-        .await?;
+        if let Some(replaced_key) = previous_storage_key
+            .filter(|storage_key| storage_key != &part.storage_key)
+        {
+            enqueue_multipart_storage_keys(
+                &mut transaction,
+                &upload,
+                None,
+                [replaced_key],
+                now,
+            )
+            .await?;
+        }
         let row = sqlx::query(
-            "INSERT INTO s3_multipart_parts (upload_id, part_number, size_bytes, sha256, etag, \
-             storage_key, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7) \
+            "INSERT INTO s3_multipart_parts (upload_id, part_number, size_bytes, sha256, md5, etag, \
+             storage_key, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) \
              ON CONFLICT (upload_id, part_number) DO UPDATE SET size_bytes = EXCLUDED.size_bytes, \
-             sha256 = EXCLUDED.sha256, etag = EXCLUDED.etag, storage_key = EXCLUDED.storage_key, \
-             updated_at = EXCLUDED.updated_at RETURNING *",
+             sha256 = EXCLUDED.sha256, md5 = EXCLUDED.md5, etag = EXCLUDED.etag, \
+             storage_key = EXCLUDED.storage_key, updated_at = EXCLUDED.updated_at RETURNING *",
         )
         .bind(upload_id)
         .bind(i32::from(part.part_number))
         .bind(as_i64(part.size)?)
         .bind(part.sha256)
+        .bind(part.md5)
         .bind(part.etag)
-        .bind(&part.storage_key)
+        .bind(part.storage_key)
         .bind(now)
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
         let stored = row_to_multipart_part(row)?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(S3MultipartPartPut::Stored {
-            part: stored,
-            replaced_storage_key: previous_storage_key.filter(|key| key != &part.storage_key),
-        })
+        Ok(S3MultipartPartPut::Stored(stored))
     }
 
     async fn list_multipart_parts(
@@ -224,7 +201,6 @@ impl S3MultipartRepository for PostgresRepository {
         let lease_until = postgres_time(lease_until);
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
         let mut upload = lock_upload(&mut transaction, upload_id).await?;
-        let taking_over = upload.state == S3MultipartUploadState::Completing;
         match upload.state {
             S3MultipartUploadState::Completed => {
                 return Ok(S3MultipartCompletionClaim::AlreadyCompleted(upload));
@@ -242,22 +218,12 @@ impl S3MultipartRepository for PostgresRepository {
             S3MultipartUploadState::Pending | S3MultipartUploadState::Completing => {}
         }
         if upload.expires_at <= now {
-            abort_and_release_parts(&mut transaction, &upload, now).await?;
+            abort_upload_and_enqueue_cleanup(&mut transaction, &upload, None, now).await?;
             upload = lock_upload(&mut transaction, upload_id).await?;
-            let storage_keys = list_storage_keys(&mut transaction, upload_id).await?;
             transaction.commit().await.map_err(database_error)?;
-            return Ok(S3MultipartCompletionClaim::Expired {
-                upload,
-                storage_keys,
-            });
+            return Ok(S3MultipartCompletionClaim::Expired(upload));
         }
-        if taking_over {
-            let stored_manifest = load_completion_manifest(&mut transaction, upload_id).await?;
-            if stored_manifest != manifest {
-                transaction.commit().await.map_err(database_error)?;
-                return Ok(S3MultipartCompletionClaim::InProgress(upload));
-            }
-        }
+
         let parts = list_parts(&mut transaction, upload_id).await?;
         let selected = match validate_manifest(manifest, &parts) {
             Ok(selected) => selected,
@@ -272,21 +238,15 @@ impl S3MultipartRepository for PostgresRepository {
             .filter(|part| !selected_numbers.contains(&part.part_number))
             .map(|part| part.storage_key.clone())
             .collect();
-        let total_size = selected.iter().try_fold(0_u64, |total, part| {
-            total.checked_add(part.size).ok_or_else(|| {
-                RepositoryError::Invariant("multipart total size exceeds u64".into())
-            })
-        })?;
-        let manifest_json = serde_json::to_value(manifest)
-            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        let total_size = selected_total_size(&selected)?;
         sqlx::query(
             "UPDATE s3_multipart_uploads SET state = 'completing', completion_token = $1, \
              completion_lease_until = $2, completion_manifest = $3, updated_at = $4 \
-             WHERE upload_id = $5",
+             WHERE upload_id = $5 AND state IN ('pending', 'completing')",
         )
         .bind(completion_token)
         .bind(lease_until)
-        .bind(Json(manifest_json))
+        .bind(Json(manifest.to_vec()))
         .bind(now)
         .bind(upload_id)
         .execute(&mut *transaction)
@@ -302,33 +262,17 @@ impl S3MultipartRepository for PostgresRepository {
         }))
     }
 
-    async fn create_uploading_for_multipart(
+    async fn attach_multipart_upload_intent(
         &self,
         upload_id: &str,
         completion_token: &str,
-        media: Media,
-    ) -> Result<(), RepositoryError> {
-        if completion_token.is_empty() || media.state() != MediaState::Uploading {
-            return Err(RepositoryError::Invariant(
-                "multipart completion requires an uploading Media and non-empty token".into(),
-            ));
-        }
+        intent_id: UploadIntentId,
+        now: OffsetDateTime,
+    ) -> Result<S3MultipartUpload, RepositoryError> {
+        let now = postgres_time(now);
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        lock_object_identity(
-            &mut transaction,
-            media.application_id(),
-            media.bucket_id(),
-            media.object_key(),
-        )
-        .await?;
         let upload = lock_upload(&mut transaction, upload_id).await?;
-        validate_completion_owner(&mut transaction, &upload, completion_token).await?;
-        if upload.application_id != media.application_id()
-            || upload.bucket_id != media.bucket_id()
-            || upload.object_key != media.object_key()
-        {
-            return Err(RepositoryError::Conflict);
-        }
+        validate_completion_owner(&mut transaction, &upload, completion_token, now).await?;
         let manifest = load_completion_manifest(&mut transaction, upload_id).await?;
         let parts = list_parts(&mut transaction, upload_id).await?;
         let selected = validate_manifest(&manifest, &parts).map_err(|error| {
@@ -336,177 +280,28 @@ impl S3MultipartRepository for PostgresRepository {
                 "persisted multipart manifest is invalid: {error:?}"
             ))
         })?;
-        let selected_size = selected.iter().try_fold(0_u64, |total, part| {
-            total
-                .checked_add(part.size)
-                .ok_or_else(|| RepositoryError::Invariant("multipart size overflow".into()))
-        })?;
-        if selected_size != media.size() {
-            return Err(RepositoryError::Invariant(
-                "multipart Media size does not match the claimed manifest".into(),
-            ));
-        }
-        let pending_session = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE application_id = $1 \
-             AND bucket_id = $2 AND object_key = $3 AND state = 'pending')",
+        let total_size = selected_total_size(&selected)?;
+        let intent = lock_upload_intent(&mut transaction, intent_id).await?;
+        validate_attachable_intent(&upload, &intent, completion_token, total_size, now)?;
+        let changed = sqlx::query(
+            "UPDATE s3_multipart_uploads SET upload_intent_id = $1, updated_at = $2 \
+             WHERE upload_id = $3 AND state = 'completing' AND completion_token = $4 \
+             AND completion_lease_until > $2 \
+             AND (upload_intent_id IS NULL OR upload_intent_id = $1)",
         )
-        .bind(media.application_id().as_uuid())
-        .bind(media.bucket_id().as_uuid())
-        .bind(media.object_key())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if pending_session {
-            return Err(RepositoryError::Conflict);
-        }
-        insert_media(&mut transaction, &media).await?;
-        transaction.commit().await.map_err(database_error)
-    }
-
-    async fn abort_uploading_for_multipart(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        media_id: MediaId,
-    ) -> Result<(), RepositoryError> {
-        if completion_token.is_empty() {
-            return Err(RepositoryError::Invariant(
-                "multipart completion token must not be empty".into(),
-            ));
-        }
-        let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        let upload = lock_upload(&mut transaction, upload_id).await?;
-        validate_completion_owner(&mut transaction, &upload, completion_token).await?;
-        let row = sqlx::query("SELECT * FROM media WHERE id = $1 FOR UPDATE")
-            .bind(media_id.as_uuid())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-        let Some(row) = row else {
-            transaction.commit().await.map_err(database_error)?;
-            return Ok(());
-        };
-        let media = row_to_media(row)?;
-        if media.state() != MediaState::Uploading
-            || media.application_id() != upload.application_id
-            || media.bucket_id() != upload.bucket_id
-            || media.object_key() != upload.object_key
-        {
-            return Err(RepositoryError::Conflict);
-        }
-        sqlx::query("DELETE FROM media WHERE id = $1")
-            .bind(media_id.as_uuid())
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-        transaction.commit().await.map_err(database_error)
-    }
-
-    async fn commit_upload_for_multipart(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        media_id: MediaId,
-        committed_at: OffsetDateTime,
-        event: OutboxEvent,
-    ) -> Result<Media, RepositoryError> {
-        if completion_token.is_empty() {
-            return Err(RepositoryError::Invariant(
-                "multipart completion token must not be empty".into(),
-            ));
-        }
-        let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        let upload = lock_upload(&mut transaction, upload_id).await?;
-        validate_completion_owner(&mut transaction, &upload, completion_token).await?;
-        if upload.application_id != event.application_id {
-            return Err(RepositoryError::Conflict);
-        }
-        let media =
-            commit_upload_in_transaction(&mut transaction, media_id, committed_at, &event).await?;
-        if media.application_id() != upload.application_id
-            || media.bucket_id() != upload.bucket_id
-            || media.object_key() != upload.object_key
-        {
-            return Err(RepositoryError::Conflict);
-        }
-        transaction.commit().await.map_err(database_error)?;
-        Ok(media)
-    }
-
-    async fn finish_multipart_completion(
-        &self,
-        upload_id: &str,
-        completion_token: &str,
-        media_id: MediaId,
-        final_etag: &str,
-        now: OffsetDateTime,
-    ) -> Result<S3MultipartCompletionFinish, RepositoryError> {
-        if completion_token.is_empty() || final_etag.is_empty() {
-            return Err(RepositoryError::Invariant(
-                "multipart completion token and final etag must not be empty".into(),
-            ));
-        }
-        let now = postgres_time(now);
-        let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        let mut upload = lock_upload(&mut transaction, upload_id).await?;
-        match upload.state {
-            S3MultipartUploadState::Completed => {
-                return Ok(S3MultipartCompletionFinish::AlreadyCompleted(upload));
-            }
-            S3MultipartUploadState::Completing => {}
-            S3MultipartUploadState::Pending | S3MultipartUploadState::Aborted => {
-                return Ok(S3MultipartCompletionFinish::NotCompleting(upload));
-            }
-        }
-        let owns_claim = sqlx::query_scalar::<_, bool>(
-            "SELECT completion_token = $1 FROM s3_multipart_uploads WHERE upload_id = $2",
-        )
-        .bind(completion_token)
-        .bind(upload_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if !owns_claim {
-            return Ok(S3MultipartCompletionFinish::OwnershipLost(upload));
-        }
-        let media_row = sqlx::query("SELECT * FROM media WHERE id = $1 FOR UPDATE")
-            .bind(media_id.as_uuid())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(database_error)?
-            .ok_or(RepositoryError::NotFound)?;
-        let media = row_to_media(media_row)?;
-        if media.state() != MediaState::Active
-            || media.application_id() != upload.application_id
-            || media.bucket_id() != upload.bucket_id
-            || media.object_key() != upload.object_key
-            || media.etag() != final_etag
-        {
-            return Err(RepositoryError::Conflict);
-        }
-        let all_parts_size = multipart_reserved_bytes(&mut transaction, upload_id).await?;
-        let selected_size = as_i64(media.size())?;
-        let unused_size = all_parts_size.checked_sub(selected_size).ok_or_else(|| {
-            RepositoryError::Invariant(
-                "multipart part reservation is smaller than completed Media".into(),
-            )
-        })?;
-        adjust_reserved_bytes(&mut transaction, upload.application_id, -unused_size).await?;
-        sqlx::query(
-            "UPDATE s3_multipart_uploads SET state = 'completed', completion_token = NULL, \
-             completion_lease_until = NULL, media_id = $1, final_etag = $2, completed_at = $3, \
-             updated_at = $3 WHERE upload_id = $4",
-        )
-        .bind(media_id.as_uuid())
-        .bind(final_etag)
+        .bind(intent_id.as_uuid())
         .bind(now)
         .bind(upload_id)
+        .bind(completion_token)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        upload = lock_upload(&mut transaction, upload_id).await?;
+        if changed.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        let attached = lock_upload(&mut transaction, upload_id).await?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(S3MultipartCompletionFinish::Completed(upload))
+        Ok(attached)
     }
 
     async fn release_multipart_completion(
@@ -527,10 +322,25 @@ impl S3MultipartRepository for PostgresRepository {
             }
             S3MultipartUploadState::Completing => {}
         }
+        let owns_claim = sqlx::query_scalar::<_, bool>(
+            "SELECT completion_token = $1 AND completion_lease_until > $2 \
+             FROM s3_multipart_uploads WHERE upload_id = $3",
+        )
+        .bind(completion_token)
+        .bind(now)
+        .bind(upload_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if !owns_claim {
+            return Ok(S3MultipartCompletionRelease::OwnershipLost(upload));
+        }
+        abort_attached_intent(&mut transaction, &upload, Some(completion_token), now).await?;
         let released = sqlx::query(
             "UPDATE s3_multipart_uploads SET state = 'pending', completion_token = NULL, \
-             completion_lease_until = NULL, completion_manifest = NULL, updated_at = $1 \
-             WHERE upload_id = $2 AND completion_token = $3",
+             completion_lease_until = NULL, completion_manifest = NULL, upload_intent_id = NULL, \
+             updated_at = $1 WHERE upload_id = $2 AND completion_token = $3 \
+             AND completion_lease_until > $1",
         )
         .bind(now)
         .bind(upload_id)
@@ -562,23 +372,14 @@ impl S3MultipartRepository for PostgresRepository {
                 return Ok(S3MultipartAbort::Completed(upload));
             }
             S3MultipartUploadState::Aborted => {
-                let storage_keys = list_storage_keys(&mut transaction, upload_id).await?;
-                transaction.commit().await.map_err(database_error)?;
-                return Ok(S3MultipartAbort::AlreadyAborted {
-                    upload,
-                    storage_keys,
-                });
+                return Ok(S3MultipartAbort::AlreadyAborted(upload));
             }
             S3MultipartUploadState::Pending => {}
         }
-        abort_and_release_parts(&mut transaction, &upload, now).await?;
+        abort_upload_and_enqueue_cleanup(&mut transaction, &upload, None, now).await?;
         upload = lock_upload(&mut transaction, upload_id).await?;
-        let storage_keys = list_storage_keys(&mut transaction, upload_id).await?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(S3MultipartAbort::Aborted {
-            upload,
-            storage_keys,
-        })
+        Ok(S3MultipartAbort::Aborted(upload))
     }
 
     async fn expire_multipart_uploads(
@@ -595,13 +396,9 @@ impl S3MultipartRepository for PostgresRepository {
         let limit = as_i64(limit as u64)?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
         let rows = sqlx::query(
-            "SELECT upload_id FROM s3_multipart_uploads WHERE \
-             (expires_at <= $1 AND (state = 'pending' OR (state = 'completing' \
-             AND completion_lease_until <= $1))) OR (state IN ('completed', 'aborted') \
-             AND EXISTS(SELECT 1 FROM s3_multipart_parts \
-             WHERE s3_multipart_parts.upload_id = s3_multipart_uploads.upload_id)) \
-             ORDER BY CASE WHEN state IN ('pending', 'completing') THEN 0 ELSE 1 END, \
-             expires_at, upload_id FOR UPDATE SKIP LOCKED LIMIT $2",
+            "SELECT upload_id FROM s3_multipart_uploads WHERE expires_at <= $1 \
+             AND (state = 'pending' OR (state = 'completing' AND completion_lease_until <= $1)) \
+             ORDER BY expires_at, upload_id FOR UPDATE SKIP LOCKED LIMIT $2",
         )
         .bind(now)
         .bind(limit)
@@ -613,43 +410,12 @@ impl S3MultipartRepository for PostgresRepository {
             let upload_id = row
                 .try_get::<String, _>("upload_id")
                 .map_err(database_error)?;
-            let mut upload = lock_upload(&mut transaction, &upload_id).await?;
-            if matches!(
-                upload.state,
-                S3MultipartUploadState::Pending | S3MultipartUploadState::Completing
-            ) {
-                abort_and_release_parts(&mut transaction, &upload, now).await?;
-                upload = lock_upload(&mut transaction, &upload_id).await?;
-            }
-            let storage_keys = list_storage_keys(&mut transaction, &upload_id).await?;
-            expired.push(S3MultipartExpiredUpload {
-                upload,
-                storage_keys,
-            });
+            let upload = lock_upload(&mut transaction, &upload_id).await?;
+            abort_upload_and_enqueue_cleanup(&mut transaction, &upload, None, now).await?;
+            let upload = lock_upload(&mut transaction, &upload_id).await?;
+            expired.push(S3MultipartExpiredUpload { upload });
         }
         transaction.commit().await.map_err(database_error)?;
         Ok(expired)
     }
-
-    async fn clear_multipart_parts(&self, upload_id: &str) -> Result<usize, RepositoryError> {
-        let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        let upload = lock_upload(&mut transaction, upload_id).await?;
-        if !matches!(
-            upload.state,
-            S3MultipartUploadState::Completed | S3MultipartUploadState::Aborted
-        ) {
-            return Err(RepositoryError::Conflict);
-        }
-        let deleted = sqlx::query("DELETE FROM s3_multipart_parts WHERE upload_id = $1")
-            .bind(upload_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-        let deleted = usize::try_from(deleted.rows_affected()).map_err(|_| {
-            RepositoryError::Invariant("deleted multipart part count exceeds usize".into())
-        })?;
-        transaction.commit().await.map_err(database_error)?;
-        Ok(deleted)
-    }
 }
-

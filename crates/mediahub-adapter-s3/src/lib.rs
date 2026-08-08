@@ -19,6 +19,7 @@ use aws_sigv4::{
 };
 use futures_util::{Stream, StreamExt, TryStreamExt, pin_mut};
 use http::{Method, Request};
+use md5::Md5;
 use mediahub_app::{
     ComposedObject, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError, PreparedUpload,
     StoredUpload, StreamedObject, StreamingUploadError, UploadSessionStorage, UploadTarget,
@@ -27,7 +28,7 @@ use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId, Upl
 use object_store::{
     Attribute, Attributes, Error as BackendError, GetOptions, ObjectStore as BackendObjectStore,
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, WriteMultipart,
-    aws::{AmazonS3, AmazonS3Builder},
+    aws::{AmazonS3, AmazonS3Builder, S3CopyIfNotExists},
     path::Path,
     signer::Signer,
 };
@@ -91,7 +92,12 @@ impl S3Config {
             .with_bucket_name(self.bucket.trim())
             .with_region(self.region.trim())
             .with_allow_http(self.allow_http)
-            .with_virtual_hosted_style_request(self.virtual_hosted_style);
+            .with_virtual_hosted_style_request(self.virtual_hosted_style)
+            // Generic S3 has no destination If-None-Match header for a normal
+            // CopyObject request. object_store implements create-only copy via
+            // a conditional multipart completion, which preserves PrismArk's
+            // immutable final-key contract on AWS S3 and compatible servers.
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
         if let Some(endpoint) = self.endpoint.as_deref() {
             builder = builder.with_endpoint(endpoint);
         }
@@ -106,7 +112,7 @@ impl S3Config {
         }
         let backend = builder.build().map_err(map_backend_error)?;
         let signer = AwsPresignedPutSigner::new(backend.clone(), self.region.trim().to_owned());
-        S3ObjectStore::from_parts(
+        S3ObjectStore::from_s3_parts(
             Arc::new(backend),
             self.prefix.as_deref(),
             Some(Arc::new(signer)),
@@ -244,6 +250,7 @@ pub struct S3ObjectStore {
     backend: Arc<dyn BackendObjectStore>,
     prefix: Option<Path>,
     upload_signer: Option<Arc<dyn PresignedPutSigner>>,
+    repair_create_copy_attributes: bool,
 }
 
 impl S3ObjectStore {
@@ -281,14 +288,34 @@ impl S3ObjectStore {
         let mut attributes = Attributes::new();
         attributes.insert(Attribute::ContentType, content_type.to_owned().into());
         if expected_size == 0 {
-            let sha256 = hex::encode(Sha256::digest([]));
+            let mut sha256 = Sha256::new();
+            let mut md5 = Md5::new();
+            pin_mut!(stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|error| StreamingUploadError::Stream(error.to_string()))?;
+                if !chunk.is_empty() {
+                    return Err(StreamingUploadError::SizeMismatch {
+                        expected: 0,
+                        actual: chunk.len() as u64,
+                    });
+                }
+                sha256.update(&chunk);
+                md5.update(&chunk);
+            }
+            let sha256 = hex::encode(sha256.finalize());
+            let md5 = hex::encode(md5.finalize());
             attributes.insert(
                 Attribute::Metadata(SHA256_METADATA_KEY.into()),
                 sha256.clone().into(),
             );
             self.put_create(&destination, Vec::new(), attributes)
                 .await?;
-            return Ok(StreamedObject { size: 0, sha256 });
+            return Ok(StreamedObject {
+                size: 0,
+                sha256,
+                md5,
+            });
         }
         let upload = self
             .backend
@@ -302,7 +329,8 @@ impl S3ObjectStore {
             .await
             .map_err(map_backend_error)?;
         let mut writer = WriteMultipart::new(upload);
-        let mut digest = Sha256::new();
+        let mut sha256 = Sha256::new();
+        let mut md5 = Md5::new();
         let mut received = 0_u64;
         pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
@@ -330,7 +358,8 @@ impl S3ObjectStore {
                     });
                 }
             };
-            digest.update(&chunk);
+            sha256.update(&chunk);
+            md5.update(&chunk);
             writer.put(chunk);
             if let Err(error) = writer.wait_for_capacity(4).await {
                 let _ = writer.abort().await;
@@ -351,7 +380,8 @@ impl S3ObjectStore {
             .map_err(StreamingUploadError::Storage)?;
         Ok(StreamedObject {
             size: received,
-            sha256: hex::encode(digest.finalize()),
+            sha256: hex::encode(sha256.finalize()),
+            md5: hex::encode(md5.finalize()),
         })
     }
 
@@ -360,6 +390,23 @@ impl S3ObjectStore {
         prefix: Option<&str>,
         upload_signer: Option<Arc<dyn PresignedPutSigner>>,
     ) -> Result<Self, ObjectStoreError> {
+        Self::from_parts_with_copy_mode(backend, prefix, upload_signer, false)
+    }
+
+    fn from_s3_parts(
+        backend: Arc<dyn BackendObjectStore>,
+        prefix: Option<&str>,
+        upload_signer: Option<Arc<dyn PresignedPutSigner>>,
+    ) -> Result<Self, ObjectStoreError> {
+        Self::from_parts_with_copy_mode(backend, prefix, upload_signer, true)
+    }
+
+    fn from_parts_with_copy_mode(
+        backend: Arc<dyn BackendObjectStore>,
+        prefix: Option<&str>,
+        upload_signer: Option<Arc<dyn PresignedPutSigner>>,
+        repair_create_copy_attributes: bool,
+    ) -> Result<Self, ObjectStoreError> {
         let prefix = prefix
             .map(|value| parse_path(value, "S3 prefix"))
             .transpose()?;
@@ -367,6 +414,7 @@ impl S3ObjectStore {
             backend,
             prefix,
             upload_signer,
+            repair_create_copy_attributes,
         })
     }
 
@@ -432,6 +480,21 @@ impl S3ObjectStore {
             return Ok(false);
         }
 
+        self.object_bytes_match(left_path, left, right_path, right)
+            .await
+    }
+
+    async fn object_bytes_match(
+        &self,
+        left_path: &Path,
+        left: &object_store::ObjectMeta,
+        right_path: &Path,
+        right: &object_store::ObjectMeta,
+    ) -> Result<bool, ObjectStoreError> {
+        if left.size != right.size {
+            return Ok(false);
+        }
+
         let mut start = 0;
         while start < left.size {
             let end = start
@@ -472,6 +535,38 @@ impl S3ObjectStore {
             start = end;
         }
         Ok(true)
+    }
+
+    async fn repair_conditional_copy_attributes(
+        &self,
+        temporary_path: &Path,
+        temporary: &object_store::ObjectMeta,
+        final_path: &Path,
+    ) -> Result<(), ObjectStoreError> {
+        // object_store's portable S3 create-only copy uses multipart upload,
+        // which intentionally omits source attributes. The destination key is
+        // a random immutable version key owned by one UploadIntent, so a normal
+        // server-side copy can safely restore Content-Type/custom metadata after
+        // the conditional create has established ownership. A failed repair is
+        // retryable because the byte comparison below never trusts metadata.
+        self.backend
+            .copy(temporary_path, final_path)
+            .await
+            .map_err(map_backend_error)?;
+        let repaired = self
+            .backend
+            .head(final_path)
+            .await
+            .map_err(map_backend_error)?;
+        if !self
+            .object_contents_match(temporary_path, temporary, final_path, &repaired)
+            .await?
+        {
+            return Err(ObjectStoreError::Unavailable(
+                "S3 conditional-copy metadata repair did not preserve the staged object".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn object_content_type(
@@ -516,7 +611,24 @@ impl S3ObjectStore {
                     .object_contents_match(&temporary_path, &temporary, &final_path, &final_object)
                     .await?
                 {
-                    return Err(ObjectStoreError::AlreadyExists);
+                    if !self.repair_create_copy_attributes
+                        || !self
+                            .object_bytes_match(
+                                &temporary_path,
+                                &temporary,
+                                &final_path,
+                                &final_object,
+                            )
+                            .await?
+                    {
+                        return Err(ObjectStoreError::AlreadyExists);
+                    }
+                    self.repair_conditional_copy_attributes(
+                        &temporary_path,
+                        &temporary,
+                        &final_path,
+                    )
+                    .await?;
                 }
             }
             Err(BackendError::NotFound { .. }) => match self
@@ -524,7 +636,16 @@ impl S3ObjectStore {
                 .copy_if_not_exists(&temporary_path, &final_path)
                 .await
             {
-                Ok(()) => {}
+                Ok(()) => {
+                    if self.repair_create_copy_attributes {
+                        self.repair_conditional_copy_attributes(
+                            &temporary_path,
+                            &temporary,
+                            &final_path,
+                        )
+                        .await?;
+                    }
+                }
                 Err(BackendError::AlreadyExists { .. }) => {
                     let final_object = self
                         .backend

@@ -16,6 +16,7 @@ const MAX_MULTIPART_PARTS: usize = 10_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeleteObjectIdentifier {
     pub(crate) key: String,
+    pub(crate) version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,11 +39,15 @@ pub(crate) struct CompleteMultipartUploadRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeletedObject {
     pub(crate) key: String,
+    pub(crate) version_id: Option<String>,
+    pub(crate) delete_marker: bool,
+    pub(crate) delete_marker_version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeleteObjectError {
     pub(crate) key: String,
+    pub(crate) version_id: Option<String>,
     pub(crate) code: String,
     pub(crate) message: String,
 }
@@ -106,8 +111,7 @@ pub(crate) enum S3XmlError {
     TooManyObjects,
     #[error("each object must contain a non-empty Key")]
     MissingKey,
-    #[error("VersionId is not supported")]
-    VersionIdNotSupported,
+
     #[error("each multipart part must contain a PartNumber")]
     MissingPartNumber,
     #[error("multipart PartNumber must be between 1 and 10000")]
@@ -123,7 +127,6 @@ pub(crate) enum S3XmlError {
 impl S3XmlError {
     pub(crate) const fn s3_code(self) -> &'static str {
         match self {
-            Self::VersionIdNotSupported => "InvalidRequest",
             Self::InputTooLarge => "EntityTooLarge",
             Self::MalformedXml
             | Self::TooManyObjects
@@ -171,15 +174,16 @@ pub(crate) fn parse_delete_objects_xml(input: &[u8]) -> Result<DeleteObjectsRequ
                     return Err(S3XmlError::MalformedXml);
                 }
                 let mut key = None;
+                let mut version_id = None;
                 for field in &child.children {
-                    if field.name == "VersionId" {
-                        return Err(S3XmlError::VersionIdNotSupported);
-                    }
                     if !field.children.is_empty() {
                         return Err(S3XmlError::MalformedXml);
                     }
                     match field.name.as_str() {
                         "Key" if key.is_none() => key = Some(field.text.clone()),
+                        "VersionId" if version_id.is_none() && !field.text.trim().is_empty() => {
+                            version_id = Some(field.text.clone());
+                        }
                         _ => return Err(S3XmlError::MalformedXml),
                     }
                 }
@@ -189,7 +193,7 @@ pub(crate) fn parse_delete_objects_xml(input: &[u8]) -> Result<DeleteObjectsRequ
                 if objects.len() == MAX_DELETE_OBJECTS {
                     return Err(S3XmlError::TooManyObjects);
                 }
-                objects.push(DeleteObjectIdentifier { key });
+                objects.push(DeleteObjectIdentifier { key, version_id });
             }
             "Quiet" if quiet.is_none() && child.children.is_empty() => {
                 quiet = match child.text.trim() {
@@ -273,11 +277,23 @@ pub(crate) fn delete_result_xml(result: &DeleteResult) -> Result<String, S3XmlEr
     for deleted in &result.deleted {
         output.push_str("<Deleted>");
         push_element(&mut output, "Key", &deleted.key)?;
+        if let Some(version_id) = &deleted.version_id {
+            push_element(&mut output, "VersionId", version_id)?;
+        }
+        if deleted.delete_marker {
+            push_element(&mut output, "DeleteMarker", "true")?;
+        }
+        if let Some(version_id) = &deleted.delete_marker_version_id {
+            push_element(&mut output, "DeleteMarkerVersionId", version_id)?;
+        }
         output.push_str("</Deleted>");
     }
     for error in &result.errors {
         output.push_str("<Error>");
         push_element(&mut output, "Key", &error.key)?;
+        if let Some(version_id) = &error.version_id {
+            push_element(&mut output, "VersionId", version_id)?;
+        }
         push_element(&mut output, "Code", &error.code)?;
         push_element(&mut output, "Message", &error.message)?;
         output.push_str("</Error>");
@@ -606,7 +622,7 @@ mod tests {
     #[test]
     fn parses_delete_objects_and_unescapes_keys() {
         let request = parse_delete_objects_xml(
-            br#"<?xml version="1.0"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>a&amp;b&lt;c&gt;&#x2F;d</Key></Object><Object><Key><![CDATA[raw&key]]></Key></Object><Quiet>true</Quiet></Delete>"#,
+            br#"<?xml version="1.0"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>a&amp;b&lt;c&gt;&#x2F;d</Key><VersionId>v&amp;1</VersionId></Object><Object><Key><![CDATA[raw&key]]></Key></Object><Quiet>true</Quiet></Delete>"#,
         )
         .expect("valid delete request");
         assert_eq!(
@@ -615,9 +631,11 @@ mod tests {
                 objects: vec![
                     DeleteObjectIdentifier {
                         key: "a&b<c>/d".to_owned(),
+                        version_id: Some("v&1".to_owned()),
                     },
                     DeleteObjectIdentifier {
                         key: "raw&key".to_owned(),
+                        version_id: None,
                     },
                 ],
                 quiet: true,
@@ -631,11 +649,22 @@ mod tests {
             parse_delete_objects_xml(br#"<Delete><Object /></Delete>"#),
             Err(S3XmlError::MissingKey)
         );
+        let versioned = parse_delete_objects_xml(
+            br#"<Delete><Object><Key>a</Key><VersionId>1</VersionId></Object></Delete>"#,
+        )
+        .expect("versioned delete");
+        assert_eq!(versioned.objects[0].version_id.as_deref(), Some("1"));
         assert_eq!(
             parse_delete_objects_xml(
-                br#"<Delete><Object><Key>a</Key><VersionId>1</VersionId></Object></Delete>"#,
+                br#"<Delete><Object><Key>a</Key><VersionId /></Object></Delete>"#,
             ),
-            Err(S3XmlError::VersionIdNotSupported)
+            Err(S3XmlError::MalformedXml)
+        );
+        assert_eq!(
+            parse_delete_objects_xml(
+                br#"<Delete><Object><Key>a</Key><VersionId>1</VersionId><VersionId>2</VersionId></Object></Delete>"#,
+            ),
+            Err(S3XmlError::MalformedXml)
         );
 
         let mut xml = String::from("<Delete>");
@@ -697,9 +726,13 @@ mod tests {
         let deleted = delete_result_xml(&DeleteResult {
             deleted: vec![DeletedObject {
                 key: "a<&>\"'".to_owned(),
+                version_id: None,
+                delete_marker: true,
+                delete_marker_version_id: Some("marker<&>".to_owned()),
             }],
             errors: vec![DeleteObjectError {
                 key: "failed&key".to_owned(),
+                version_id: Some("version<&>".to_owned()),
                 code: "AccessDenied".to_owned(),
                 message: "not <allowed>".to_owned(),
             }],
@@ -707,7 +740,12 @@ mod tests {
         .expect("delete result");
         parse_xml_document(deleted.as_bytes()).expect("well-formed delete result XML");
         assert!(deleted.contains("<Key>a&lt;&amp;&gt;&quot;&apos;</Key>"));
+        assert!(deleted.contains("<DeleteMarker>true</DeleteMarker>"));
+        assert!(
+            deleted.contains("<DeleteMarkerVersionId>marker&lt;&amp;&gt;</DeleteMarkerVersionId>")
+        );
         assert!(deleted.contains("<Error><Key>failed&amp;key</Key>"));
+        assert!(deleted.contains("<VersionId>version&lt;&amp;&gt;</VersionId>"));
 
         let initiated =
             initiate_multipart_upload_result_xml("b&", "k<", "u>").expect("initiate result");

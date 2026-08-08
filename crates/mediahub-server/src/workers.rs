@@ -3,6 +3,14 @@
 const WEBHOOK_DELIVERY_LEASE_SECONDS: i64 = 30;
 const WEBHOOK_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const WEBHOOK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+const S3_STORAGE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const S3_UPLOAD_INTENT_EXPIRY_BATCH_SIZE: usize = 100;
+const S3_STORAGE_GC_CLAIM_BATCH_SIZE: usize = 16;
+const S3_STORAGE_GC_MAX_ATTEMPTS: u32 = 8;
+const S3_STORAGE_GC_LEASE_SECONDS: i64 = 5 * 60;
+const S3_STORAGE_GC_RETRY_BASE_SECONDS: i64 = 5;
+const S3_STORAGE_GC_RETRY_MAX_SECONDS: i64 = 15 * 60;
+const S3_STORAGE_GC_MAX_ERROR_BYTES: usize = 4_096;
 
 pub(super) async fn validate_referenced_key_versions(
     repository: &(impl SecretKeyVersionRepository + ?Sized),
@@ -74,25 +82,7 @@ pub(super) async fn run_lifecycle_worker(repository: PostgresRepository, object_
         }
         reconcile_stale_uploads(&repository, &object_store, now).await;
         match repository.expire_multipart_uploads(now, 100).await {
-            Ok(expired) => {
-                for expired_upload in expired {
-                    if s3_multipart_storage::cleanup_multipart_storage(
-                        &object_store,
-                        &expired_upload.upload.upload_id,
-                    )
-                    .await
-                        && let Err(error) = repository
-                            .clear_multipart_parts(&expired_upload.upload.upload_id)
-                            .await
-                    {
-                        warn!(
-                            upload_id = %expired_upload.upload.upload_id,
-                            error = %error,
-                            "failed to clear expired S3 multipart metadata"
-                        );
-                    }
-                }
-            }
+            Ok(_) => {}
             Err(error) => warn!(error = %error, "S3 multipart expiry scan failed"),
         }
         match repository.list_expired_media(now, 100).await {
@@ -212,6 +202,168 @@ pub(super) async fn run_lifecycle_worker(repository: PostgresRepository, object_
             Err(error) => warn!(error = %error, "pending deletion scan failed"),
         }
     }
+}
+
+pub(super) async fn run_s3_storage_cleanup_worker(
+    repository: PostgresRepository,
+    object_store: RuntimeObjectStore,
+) {
+    let mut interval = tokio::time::interval(S3_STORAGE_CLEANUP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        run_s3_storage_cleanup_once(
+            &repository,
+            &object_store,
+            OffsetDateTime::now_utc(),
+        )
+        .await;
+    }
+}
+
+async fn run_s3_storage_cleanup_once(
+    repository: &PostgresRepository,
+    object_store: &RuntimeObjectStore,
+    now: OffsetDateTime,
+) {
+    match repository
+        .expire_upload_intents(
+            now,
+            S3_UPLOAD_INTENT_EXPIRY_BATCH_SIZE,
+            S3_STORAGE_GC_MAX_ATTEMPTS,
+        )
+        .await
+    {
+        Ok(expired) if expired > 0 => {
+            info!(expired, "expired S3 upload intents and enqueued storage cleanup");
+        }
+        Ok(_) => {}
+        Err(error) => warn!(error = %error, "S3 upload intent expiry scan failed"),
+    }
+
+    let lease_token = format!("s3-storage-gc-{}", uuid::Uuid::now_v7());
+    let lease_until = now + time::Duration::seconds(S3_STORAGE_GC_LEASE_SECONDS);
+    let tasks = match repository
+        .claim_storage_gc_tasks(
+            &lease_token,
+            lease_until,
+            now,
+            S3_STORAGE_GC_CLAIM_BATCH_SIZE,
+        )
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            warn!(error = %error, "S3 storage GC task claim failed");
+            return;
+        }
+    };
+
+    for task in tasks {
+        process_storage_gc_task(repository, object_store, &task, &lease_token).await;
+    }
+}
+
+async fn process_storage_gc_task(
+    repository: &PostgresRepository,
+    object_store: &RuntimeObjectStore,
+    task: &StorageGcTask,
+    lease_token: &str,
+) {
+    let execution = match validate_storage_gc_backend(
+        &task.task.storage_backend,
+        object_store.backend_name(),
+    ) {
+        Ok(()) => {
+            classify_storage_gc_delete_result(object_store.delete(&task.task.storage_key).await)
+        }
+        Err(error) => Err(error),
+    };
+
+    match execution {
+        Ok(()) => {
+            let completed_at = OffsetDateTime::now_utc();
+            if let Err(error) = repository
+                .complete_storage_gc_task(task.task.id, lease_token, completed_at)
+                .await
+            {
+                warn!(
+                    task_id = %task.task.id,
+                    storage_key = %task.task.storage_key,
+                    error = %error,
+                    "S3 storage GC completion acknowledgement failed"
+                );
+            }
+        }
+        Err(error) => {
+            let failed_at = OffsetDateTime::now_utc();
+            let retry_at = failed_at + storage_gc_retry_delay(task.attempts);
+            let error = truncate_utf8_bytes(&error, S3_STORAGE_GC_MAX_ERROR_BYTES);
+            match repository
+                .fail_storage_gc_task(
+                    task.task.id,
+                    lease_token,
+                    &error,
+                    retry_at,
+                    failed_at,
+                )
+                .await
+            {
+                Ok(failed) => warn!(
+                    task_id = %task.task.id,
+                    storage_key = %task.task.storage_key,
+                    attempts = failed.attempts,
+                    state = ?failed.state,
+                    retry_at = %retry_at,
+                    error = %error,
+                    "S3 storage GC task failed"
+                ),
+                Err(repository_error) => warn!(
+                    task_id = %task.task.id,
+                    storage_key = %task.task.storage_key,
+                    error = %repository_error,
+                    "S3 storage GC failure acknowledgement failed"
+                ),
+            }
+        }
+    }
+}
+
+fn validate_storage_gc_backend(task_backend: &str, runtime_backend: &str) -> Result<(), String> {
+    if task_backend == runtime_backend {
+        Ok(())
+    } else {
+        Err(format!(
+            "storage backend mismatch: task requires {task_backend}, runtime provides {runtime_backend}"
+        ))
+    }
+}
+
+fn classify_storage_gc_delete_result(result: Result<(), ObjectStoreError>) -> Result<(), String> {
+    match result {
+        Ok(()) | Err(ObjectStoreError::NotFound) => Ok(()),
+        Err(error) => Err(format!("object storage delete failed: {error}")),
+    }
+}
+
+fn storage_gc_retry_delay(attempts: u32) -> time::Duration {
+    let exponent = attempts.saturating_sub(1).min(30);
+    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+    let seconds = S3_STORAGE_GC_RETRY_BASE_SECONDS
+        .saturating_mul(multiplier)
+        .min(S3_STORAGE_GC_RETRY_MAX_SECONDS);
+    time::Duration::seconds(seconds)
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 async fn reconcile_stale_uploads(
@@ -856,6 +1008,47 @@ async fn webhook_client_for_url(value: &str) -> Result<(reqwest::Client, Url), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn storage_gc_retry_delay_is_exponential_and_capped() {
+        assert_eq!(storage_gc_retry_delay(1), time::Duration::seconds(5));
+        assert_eq!(storage_gc_retry_delay(2), time::Duration::seconds(10));
+        assert_eq!(storage_gc_retry_delay(8), time::Duration::seconds(640));
+        assert_eq!(
+            storage_gc_retry_delay(u32::MAX),
+            time::Duration::seconds(S3_STORAGE_GC_RETRY_MAX_SECONDS)
+        );
+    }
+
+    #[test]
+    fn storage_gc_error_truncation_preserves_utf8_and_byte_limit() {
+        let value = format!("{}end", "象".repeat(1_400));
+        let truncated = truncate_utf8_bytes(&value, S3_STORAGE_GC_MAX_ERROR_BYTES);
+        assert!(truncated.len() <= S3_STORAGE_GC_MAX_ERROR_BYTES);
+        assert!(truncated.chars().all(|character| character == '象'));
+        assert_eq!(truncate_utf8_bytes("short", 4_096), "short");
+    }
+
+    #[test]
+    fn storage_gc_backend_mismatch_is_rejected_before_delete() {
+        assert_eq!(validate_storage_gc_backend("local", "local"), Ok(()));
+        let error = validate_storage_gc_backend("s3", "local").expect_err("mismatch");
+        assert!(error.contains("task requires s3"));
+        assert!(error.contains("runtime provides local"));
+    }
+
+    #[test]
+    fn storage_gc_delete_success_and_not_found_are_idempotent_successes() {
+        assert_eq!(classify_storage_gc_delete_result(Ok(())), Ok(()));
+        assert_eq!(
+            classify_storage_gc_delete_result(Err(ObjectStoreError::NotFound)),
+            Ok(())
+        );
+        let error = classify_storage_gc_delete_result(Err(ObjectStoreError::Unavailable(
+            "temporary outage".to_owned(),
+        )))
+        .expect_err("transient deletion failure");
+        assert!(error.contains("temporary outage"));
+    }
 
     #[tokio::test]
     async fn webhook_attempt_timeout_is_strictly_shorter_than_its_lease() {

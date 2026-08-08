@@ -149,11 +149,13 @@ COPY --from=web-builder --chown=mediahub:mediahub /app/web/dist /app/web
 RUN ldconfig
 USER mediahub
 ENV MEDIAHUB_BIND_ADDR=0.0.0.0:3000
+ENV MEDIAHUB_S3_BIND_ADDR=0.0.0.0:9000
+ENV PRISMARK_GC_GRACE_HOURS=24
 ENV MEDIAHUB_DATABASE_URL=postgres://mediahub:mediahub-local-only@postgres:5432/mediahub
 ENV MEDIAHUB_STORAGE_ROOT=/data/storage
 ENV MEDIAHUB_WEB_ROOT=/app/web
 VOLUME ["/data"]
-EXPOSE 3000
+EXPOSE 3000 9000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:3000/health/live"]
 ENTRYPOINT ["/usr/local/bin/mediahub-server"]

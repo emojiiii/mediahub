@@ -18,6 +18,8 @@ pub(super) struct CookieConfig {
 #[derive(Clone)]
 pub(super) struct ServerConfig {
     pub(super) bind_addr: SocketAddr,
+    pub(super) s3_bind_addr: SocketAddr,
+    pub(super) s3_gc_grace_hours: i64,
     pub(super) database_url: String,
     pub(super) storage_root: String,
     pub(super) storage_backend: StorageBackend,
@@ -187,6 +189,29 @@ fn boolean_env(name: &str, default: bool) -> Result<bool, String> {
     }
 }
 
+fn parse_gc_grace_hours(value: Option<&str>) -> Result<i64, String> {
+    let hours = value
+        .unwrap_or("24")
+        .parse::<i64>()
+        .map_err(|_| "PRISMARK_GC_GRACE_HOURS must be an integer".to_owned())?;
+    if (0..=8_760).contains(&hours) {
+        Ok(hours)
+    } else {
+        Err("PRISMARK_GC_GRACE_HOURS must be between 0 and 8760".to_owned())
+    }
+}
+
+fn parse_bind_addr_config(
+    name: &str,
+    value: Option<&str>,
+    default: &str,
+) -> Result<SocketAddr, String> {
+    value
+        .unwrap_or(default)
+        .parse()
+        .map_err(|error| format!("{name} is invalid: {error}"))
+}
+
 fn decode_media_signing_key(value: &str) -> Result<Vec<u8>, String> {
     let key = URL_SAFE_NO_PAD
         .decode(value)
@@ -200,10 +225,18 @@ fn decode_media_signing_key(value: &str) -> Result<Vec<u8>, String> {
 
 impl ServerConfig {
     pub(super) fn from_env() -> Result<Self, String> {
-        let bind_addr = env::var("MEDIAHUB_BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:3000".into())
-            .parse()
-            .map_err(|error| format!("MEDIAHUB_BIND_ADDR is invalid: {error}"))?;
+        let bind_addr = parse_bind_addr_config(
+            "MEDIAHUB_BIND_ADDR",
+            env::var("MEDIAHUB_BIND_ADDR").ok().as_deref(),
+            "127.0.0.1:3000",
+        )?;
+        let s3_bind_addr = parse_bind_addr_config(
+            "MEDIAHUB_S3_BIND_ADDR",
+            env::var("MEDIAHUB_S3_BIND_ADDR").ok().as_deref(),
+            "0.0.0.0:9000",
+        )?;
+        let s3_gc_grace_hours =
+            parse_gc_grace_hours(env::var("PRISMARK_GC_GRACE_HOURS").ok().as_deref())?;
         let database_url = env::var("MEDIAHUB_DATABASE_URL")
             .map_err(|_| "MEDIAHUB_DATABASE_URL is required".to_owned())?;
         validate_database_url(&database_url)?;
@@ -359,6 +392,8 @@ impl ServerConfig {
         };
         Ok(Self {
             bind_addr,
+            s3_bind_addr,
+            s3_gc_grace_hours,
             database_url,
             storage_root: env::var("MEDIAHUB_STORAGE_ROOT")
                 .unwrap_or_else(|_| "data/storage".into()),
@@ -389,8 +424,9 @@ mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     use super::{
-        StorageBackend, decode_media_signing_key, parse_boolean_config, parse_web_root,
-        parse_web_url, storage_backend, validate_database_url,
+        StorageBackend, decode_media_signing_key, parse_bind_addr_config, parse_boolean_config,
+        parse_gc_grace_hours, parse_web_root, parse_web_url, storage_backend,
+        validate_database_url,
     };
 
     #[test]
@@ -411,6 +447,43 @@ mod tests {
             parse_boolean_config("MEDIAHUB_REGISTRATION_ENABLED", Some("disabled"), true),
             Err("MEDIAHUB_REGISTRATION_ENABLED must be true or false".into())
         );
+    }
+
+    #[test]
+    fn gc_grace_defaults_to_one_day_and_rejects_unsafe_values() {
+        assert_eq!(parse_gc_grace_hours(None), Ok(24));
+        assert_eq!(parse_gc_grace_hours(Some("0")), Ok(0));
+        assert_eq!(parse_gc_grace_hours(Some("8760")), Ok(8_760));
+        assert!(parse_gc_grace_hours(Some("-1")).is_err());
+        assert!(parse_gc_grace_hours(Some("8761")).is_err());
+        assert!(parse_gc_grace_hours(Some("one-day")).is_err());
+    }
+
+    #[test]
+    fn bind_address_config_uses_independent_defaults_and_validates_values() {
+        assert_eq!(
+            parse_bind_addr_config("MEDIAHUB_BIND_ADDR", None, "127.0.0.1:3000"),
+            Ok("127.0.0.1:3000".parse().expect("control-plane address"))
+        );
+        assert_eq!(
+            parse_bind_addr_config("MEDIAHUB_S3_BIND_ADDR", None, "0.0.0.0:9000"),
+            Ok("0.0.0.0:9000".parse().expect("S3 address"))
+        );
+        assert_eq!(
+            parse_bind_addr_config(
+                "MEDIAHUB_S3_BIND_ADDR",
+                Some("127.0.0.1:19000"),
+                "0.0.0.0:9000",
+            ),
+            Ok("127.0.0.1:19000".parse().expect("custom S3 address"))
+        );
+        let error = parse_bind_addr_config(
+            "MEDIAHUB_S3_BIND_ADDR",
+            Some("not-an-address"),
+            "0.0.0.0:9000",
+        )
+        .expect_err("invalid S3 address must fail");
+        assert!(error.starts_with("MEDIAHUB_S3_BIND_ADDR is invalid:"));
     }
 
     #[test]

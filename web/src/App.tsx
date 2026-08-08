@@ -30,12 +30,14 @@ import {
   Database,
   FileImage,
   FolderOpen,
+  Grid2X2,
   HardDrive,
   Eye,
   KeyRound,
   LayoutDashboard,
   Link,
   Link2,
+  List,
   LoaderCircle,
   LogOut,
   Mail,
@@ -83,8 +85,15 @@ import {
   type WebhookEndpoint,
   type WebhookInput,
 } from './api'
+import { PRODUCT_NAME } from './brand'
 import { ApplicationSwitcher } from './components/ApplicationSwitcher'
+import { GovernanceFeaturePage, PreviewCenterPage, VariantCenterPage } from './components/ConsoleCapabilityPages'
+import FileExplorer from './components/FileExplorer'
 import { SelectControl } from './components/SelectControl'
+import { ThemeToggle } from './components/ThemeToggle'
+import PrismArkLandingPage, { PRISMARK_PAGE_META } from './marketing/PrismArkLandingPage'
+import { consoleNavGroups, settingsNavItem } from './console-navigation'
+import { useTheme } from './theme'
 import {
   DEFAULT_UPLOAD_CONCURRENCY,
   UploadScheduler,
@@ -92,7 +101,7 @@ import {
   type UploadSchedulerSnapshot,
 } from './upload-scheduler'
 
-const EnhancedObjectFileViewer = lazy(() => import('./components/ObjectFileViewer'))
+const EnhancedPreviewSurface = lazy(() => import('./components/PreviewSurface').then((module) => ({ default: module.PreviewSurface })))
 
 const loginSchema = z.object({
   email: z.string().email('请输入有效的邮箱地址'),
@@ -427,7 +436,7 @@ const formatBytes = (bytes: number) => {
 }
 const appPath = (appId: string, path: string) => `/app/${appId}/${path}`
 export const bucketObjectPath = (appId: string, bucket: string) => `/${encodeURIComponent(appId)}/${encodeURIComponent(bucket)}/`
-const uploadSessionStorageKey = (appId: string) => `mediahub.upload-sessions.${appId}`
+const uploadSessionStorageKey = (appId: string) => `prismark.upload-sessions.${appId}`
 function readUploadSessionIds(appId: string): string[] {
   try {
     const value: unknown = JSON.parse(sessionStorage.getItem(uploadSessionStorageKey(appId)) ?? '[]')
@@ -449,8 +458,8 @@ function useCurrentUser() {
 function Logo() {
   return (
     <div className="flex items-center gap-2.5 text-foreground">
-      <span className="grid h-8 w-8 place-items-center bg-accent text-sm font-black shadow-sm" style={{ borderRadius: 5 }}>M</span>
-      <span className="text-base font-semibold tracking-tight">MediaHub</span>
+      <img src="/brand/prismark-mark-64.png" alt="" aria-hidden="true" width="32" height="32" className="size-8 shrink-0" />
+      <span className="text-base font-semibold tracking-tight">{PRODUCT_NAME}</span>
     </div>
   )
 }
@@ -471,7 +480,7 @@ function RequireAdmin({ children }: { children: React.ReactNode }) {
   const user = useCurrentUser()
   if (user.isLoading) return <LoadingScreen />
   if (!user.data) return <Navigate to="/login" replace state={{ from: '/admin' }} />
-  if (user.data.systemRole !== 'admin') return <Navigate to="/" replace />
+  if (user.data.systemRole !== 'admin') return <Navigate to="/console" replace />
   return <>{children}</>
 }
 
@@ -492,13 +501,13 @@ function LoginPage() {
     onSuccess: ({ user, applications }) => {
       queryClient.setQueryData(['auth', 'me'], user)
       queryClient.setQueryData(['applications'], applications)
-      const target = (location.state as { from?: string } | null)?.from ?? (applications[0] ? appPath(applications[0].appId, 'dashboard') : '/')
+      const target = (location.state as { from?: string } | null)?.from ?? (applications[0] ? appPath(applications[0].appId, 'dashboard') : '/console')
       navigate(target, { replace: true })
     },
   })
   const submit = form.handleSubmit((values) => login.mutate(values))
   return (
-    <AuthFormShell eyebrow="MediaHub Console" title="登录控制台" description="使用账号邮箱继续管理媒体资源。">
+    <AuthFormShell eyebrow={`${PRODUCT_NAME} Console`} title="登录控制台" description="使用账号邮箱继续管理对象、预览与 Variant。">
       <form className="mt-7 space-y-4" onSubmit={submit} noValidate>
         <AuthField label="邮箱" error={form.formState.errors.email?.message}>
           <Input fullWidth type="email" autoComplete="email" {...form.register('email')} />
@@ -520,7 +529,7 @@ function LoginPage() {
 }
 
 function LogoInverse() {
-  return <div className="flex items-center gap-2.5"><span className="grid h-8 w-8 place-items-center bg-accent text-sm font-black text-foreground" style={{ borderRadius: 5 }}>M</span><span className="text-base font-semibold">MediaHub</span></div>
+  return <div className="flex items-center gap-2.5"><img src="/brand/prismark-mark-64.png" alt="" aria-hidden="true" width="32" height="32" className="size-8 shrink-0" /><span className="text-base font-semibold">{PRODUCT_NAME}</span></div>
 }
 
 function AuthFormShell({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children: React.ReactNode }) {
@@ -560,7 +569,7 @@ function RegisterPage() {
       <div className="mt-3 grid grid-cols-2 gap-2"><LinkButton variant="ghost" to="/login">返回登录</LinkButton><LinkButton to="/verify-email">输入 Token</LinkButton></div>
     </AuthFormShell>
   }
-  return <AuthFormShell eyebrow="创建账号" title="开始使用 MediaHub" description="创建账号并验证邮箱后，即可进入控制台。"><form className="mt-7 space-y-4" noValidate onSubmit={form.handleSubmit((values) => registration.mutate(values))}><AuthField label="邮箱" error={form.formState.errors.email?.message}><Input fullWidth type="email" autoComplete="email" {...form.register('email')} /></AuthField><AuthField label="密码" error={form.formState.errors.password?.message}><Input fullWidth type="password" autoComplete="new-password" {...form.register('password')} /></AuthField><AuthField label="确认密码" error={form.formState.errors.confirmation?.message}><Input fullWidth type="password" autoComplete="new-password" {...form.register('confirmation')} /></AuthField><MutationError error={registration.error} /><Button type="submit" variant="primary" className="h-11 w-full" isDisabled={registration.isPending}>{registration.isPending && <LoaderCircle className="h-4 w-4 animate-spin" />}创建账号</Button></form><p className="mt-6 border-t border-separator pt-5 text-center text-sm text-muted">已有账号？ <NavLink className="font-medium text-accent hover:underline" to="/login">返回登录</NavLink></p></AuthFormShell>
+  return <AuthFormShell eyebrow="创建账号" title={`开始使用 ${PRODUCT_NAME}`} description="创建账号并验证邮箱后，即可进入控制台。"><form className="mt-7 space-y-4" noValidate onSubmit={form.handleSubmit((values) => registration.mutate(values))}><AuthField label="邮箱" error={form.formState.errors.email?.message}><Input fullWidth type="email" autoComplete="email" {...form.register('email')} /></AuthField><AuthField label="密码" error={form.formState.errors.password?.message}><Input fullWidth type="password" autoComplete="new-password" {...form.register('password')} /></AuthField><AuthField label="确认密码" error={form.formState.errors.confirmation?.message}><Input fullWidth type="password" autoComplete="new-password" {...form.register('confirmation')} /></AuthField><MutationError error={registration.error} /><Button type="submit" variant="primary" className="h-11 w-full" isDisabled={registration.isPending}>{registration.isPending && <LoaderCircle className="h-4 w-4 animate-spin" />}创建账号</Button></form><p className="mt-6 border-t border-separator pt-5 text-center text-sm text-muted">已有账号？ <NavLink className="font-medium text-accent hover:underline" to="/login">返回登录</NavLink></p></AuthFormShell>
 }
 
 function VerifyEmailPage() {
@@ -597,14 +606,6 @@ function DevTokenPanel({ label, token, onUse }: { label: string; token: string; 
   const copy = async () => { await navigator.clipboard.writeText(token); setCopied(true) }
   return <section className="mt-5 border border-[#e0c78f] bg-[#fff8e8] p-4" style={{ borderRadius: 6 }}><div className="flex items-center justify-between gap-3"><p className="text-xs font-semibold text-[#815d18]">开发环境 {label}</p><Button variant="ghost" className="h-8 w-8 p-0" aria-label="复制 Token" onClick={() => void copy()}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}</Button></div><code className="mt-2 block break-all text-xs leading-5 text-[#604818]">{token}</code><Button variant="primary" className="mt-4 w-full" onClick={onUse}>使用此 Token<ArrowRight className="h-4 w-4" /></Button></section>
 }
-
-const primaryNav = [
-  { label: '总览', path: 'dashboard', icon: LayoutDashboard },
-  { label: '对象', path: 'objects', icon: Boxes },
-  { label: 'Buckets', path: 'buckets', icon: Database },
-  { label: '访问密钥', path: 'access-keys', icon: KeyRound },
-  { label: 'Webhook', path: 'webhooks', icon: Webhook },
-]
 
 function ConsoleShellV3() {
   const { appId = '' } = useParams()
@@ -650,11 +651,13 @@ function ConsoleShellV3() {
       <ApplicationSwitcher applications={applications.data ?? []} currentAppId={appId} isLoading={applications.isLoading} onSelect={(nextAppId) => { navigate(appPath(nextAppId, 'dashboard')); setNavOpen(false) }} onCreate={() => setCreatingApplication(true)} />
       {applications.error && <p className="mt-2 px-1 text-xs leading-5 text-danger-soft-foreground">{errorMessage(applications.error)}</p>}
     </div>
-    <nav className="flex-1 px-3" aria-label="应用导航">
-      <p className="mb-2 px-3 text-[10px] font-semibold uppercase text-white/35">工作区</p>
-      <div className="space-y-1">{primaryNav.map((item) => <NavItemV3 key={item.path} {...item} appId={appId} onNavigate={() => setNavOpen(false)} />)}</div>
-      <p className="mb-2 mt-6 px-3 text-[10px] font-semibold uppercase text-white/35">配置</p>
-      <NavItemV3 appId={appId} icon={Settings} label="设置" path="settings" onNavigate={() => setNavOpen(false)} />
+    <nav className="min-h-0 flex-1 overflow-y-auto px-3 pb-4" aria-label="应用导航">
+      {consoleNavGroups.map((group, index) => <section className={index ? 'mt-5' : ''} key={group.label} aria-label={group.label}>
+        <p className="mb-2 px-3 text-[10px] font-semibold uppercase text-white/35">{group.label}</p>
+        <div className="space-y-1">{group.items.map((item) => <NavItemV3 key={item.path} {...item} appId={appId} onNavigate={() => setNavOpen(false)} />)}</div>
+      </section>)}
+      <p className="mb-2 mt-5 px-3 text-[10px] font-semibold uppercase text-white/35">配置</p>
+      <NavItemV3 {...settingsNavItem} appId={appId} onNavigate={() => setNavOpen(false)} />
       {user.data?.systemRole === 'admin' && <NavLink to="/admin" onClick={() => setNavOpen(false)} className="mt-1 flex h-10 items-center gap-3 rounded-md px-3 text-sm font-medium text-white/60 transition hover:bg-white/[.06] hover:text-white"><ShieldCheck className="size-4" />系统管理</NavLink>}
     </nav>
     <div className="border-t border-white/10 p-3">
@@ -669,10 +672,11 @@ function ConsoleShellV3() {
     <main className="min-w-0 lg:col-start-2">
       <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-separator bg-surface/95 px-4 backdrop-blur sm:px-6 lg:px-8">
         <Button isIconOnly size="sm" variant="ghost" className="lg:hidden" aria-label="打开导航" aria-controls="mobile-navigation" aria-expanded={navOpen} onClick={() => setNavOpen(true)}><PanelLeft className="size-4" /></Button>
-        <div className="min-w-0 flex-1"><div className="flex items-center gap-2 text-xs text-muted"><span>MediaHub</span><span>/</span><span className="truncate text-foreground">{selected?.name ?? '应用'}</span></div><p className="mt-0.5 truncate font-mono text-[10px] text-muted">{selected?.appId ?? appId}</p></div>
+        <div className="min-w-0 flex-1"><div className="flex items-center gap-2 text-xs text-muted"><span>{PRODUCT_NAME}</span><span>/</span><span className="truncate text-foreground">{selected?.name ?? '应用'}</span></div><p className="mt-0.5 truncate font-mono text-[10px] text-muted">{selected?.appId ?? appId}</p></div>
+        <ThemeToggle showLabels={false} />
         <Chip size="sm" variant="soft" color="success"><span className="mr-1 size-1.5 rounded-full bg-success" /><Chip.Label>{capabilities.data?.storageBackend === 'local' ? '本地存储' : capabilities.data?.storageBackend ?? '连接中'}</Chip.Label></Chip>
       </header>
-      <UploadQueueProvider key={appId} appId={appId}><div className="mx-auto w-full max-w-[1760px] p-4 sm:p-6 lg:p-8"><Routes><Route path="dashboard" element={<DashboardPage />} /><Route path="objects" element={<ObjectsPage />} /><Route path="objects/:mediaId" element={<ObjectDetailPage />} /><Route path="buckets" element={<BucketsPage />} /><Route path="access-keys" element={<AccessKeysPage />} /><Route path="webhooks" element={<WebhooksPage />} /><Route path="settings" element={<SettingsPage />} /><Route path="*" element={<Navigate to="dashboard" replace />} /></Routes></div></UploadQueueProvider>
+      <UploadQueueProvider key={appId} appId={appId}><div className="mx-auto w-full max-w-[1760px] p-4 sm:p-6 lg:p-8"><Routes><Route path="dashboard" element={<DashboardPage />} /><Route path="objects" element={<ObjectsPage />} /><Route path="objects/:mediaId" element={<ObjectDetailPage />} /><Route path="buckets" element={<BucketsPage />} /><Route path="policies" element={<GovernanceFeaturePage kind="policies" />} /><Route path="versioning" element={<GovernanceFeaturePage kind="versioning" />} /><Route path="lifecycle" element={<GovernanceFeaturePage kind="lifecycle" />} /><Route path="object-lock" element={<GovernanceFeaturePage kind="object-lock" />} /><Route path="previews" element={<PreviewCenterPage />} /><Route path="variants" element={<VariantCenterPage />} /><Route path="access-keys" element={<AccessKeysPage />} /><Route path="webhooks" element={<WebhooksPage />} /><Route path="settings" element={<SettingsPage />} /><Route path="*" element={<Navigate to="dashboard" replace />} /></Routes></div></UploadQueueProvider>
     </main>
     {creatingApplication && <CreateApplicationModal name={applicationName} pending={createApplication.isPending} error={createApplication.error} onChange={setApplicationName} onClose={() => { createApplication.reset(); setApplicationName(''); setCreatingApplication(false) }} onSubmit={() => createApplication.mutate()} />}
   </div>
@@ -697,8 +701,8 @@ function CreateApplicationModal({ name, pending, error, onChange, onClose, onSub
     </form>
   </Modal>
 }
-function NavItemV3({ appId, path, label, icon: Icon, onNavigate }: { appId: string; path: string; label: string; icon: typeof LayoutDashboard; onNavigate: () => void }) {
-  return <NavLink to={appPath(appId, path)} onClick={onNavigate} className={({ isActive }) => cn('group relative flex h-10 items-center gap-3 rounded-md px-3 text-sm font-medium transition', isActive ? 'bg-white/10 text-white shadow-[inset_0_0_0_1px_rgb(255_255_255/0.05)]' : 'text-white/60 hover:bg-white/[.06] hover:text-white')}><span className={cn('grid h-6 w-6 place-items-center rounded', 'group-hover:text-white')}><Icon className="size-4" /></span>{label}</NavLink>
+function NavItemV3({ appId, path, label, icon: Icon, state, onNavigate }: { appId: string; path: string; label: string; icon: typeof LayoutDashboard; state?: 'planned'; onNavigate: () => void }) {
+  return <NavLink to={appPath(appId, path)} onClick={onNavigate} className={({ isActive }) => cn('group relative flex h-10 items-center gap-3 rounded-md px-3 text-sm font-medium transition', isActive ? 'bg-white/10 text-white shadow-[inset_0_0_0_1px_rgb(255_255_255/0.05)]' : 'text-white/60 hover:bg-white/[.06] hover:text-white')}><span className={cn('grid h-6 w-6 place-items-center rounded', 'group-hover:text-white')}><Icon className="size-4" /></span><span className="min-w-0 flex-1 truncate">{label}</span>{state === 'planned' && <span className="rounded bg-white/[.07] px-1.5 py-0.5 text-[9px] font-semibold text-white/40">规划</span>}</NavLink>
 }
 
 function DashboardPage() {
@@ -770,6 +774,12 @@ export function objectListRefetchInterval(data: { pages: Array<{ items: Array<Pi
 }
 
 export const DEFAULT_OBJECT_FILTERS: MediaFilters = { limit: 25, status: 'active' }
+type ObjectViewMode = 'table' | 'explorer'
+const OBJECT_VIEW_STORAGE_KEY = 'prismark:object-view'
+
+function readObjectViewMode(): ObjectViewMode {
+  try { return window.localStorage.getItem(OBJECT_VIEW_STORAGE_KEY) === 'table' ? 'table' : 'explorer' } catch { return 'explorer' }
+}
 
 export function normalizeDirectoryPrefix(value: string | undefined): string {
   const segments = (value ?? '').trim().replace(/\\/g, '/').split('/').filter(Boolean)
@@ -827,6 +837,7 @@ export function removeObjectIdsFromPages(
 function ObjectsPage() {
   const { appId = '' } = useParams()
   const location = useLocation()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { openUploadCenter } = useUploadQueue()
   const navigationState = getObjectListNavigationState(location.state)
@@ -834,6 +845,8 @@ function ObjectsPage() {
   const [filterDraft, setFilterDraft] = useState<MediaFilters>(() => restoredObjectList?.filterDraft ?? { ...DEFAULT_OBJECT_FILTERS })
   const [filters, setFilters] = useState<MediaFilters>(() => restoredObjectList?.filters ?? { ...DEFAULT_OBJECT_FILTERS })
   const [pageIndex, setPageIndex] = useState(0)
+  const [viewMode, setViewMode] = useState<ObjectViewMode>(readObjectViewMode)
+  useEffect(() => { try { window.localStorage.setItem(OBJECT_VIEW_STORAGE_KEY, viewMode) } catch { /* Ignore restricted browser storage. */ } }, [viewMode])
   const autoSelectedBucketAppRef = useRef<string | null>(null)
   const directoryMode = Boolean(filters.bucket)
   const objectQueryFilters: MediaFilters = { ...filters, delimiter: directoryMode ? '/' : undefined }
@@ -909,6 +922,7 @@ function ObjectsPage() {
   const visibleItems = pages[safePageIndex]?.items ?? []
   const visiblePrefixes = pages[safePageIndex]?.commonPrefixes ?? []
   const currentPrefix = directoryMode ? filters.prefix ?? '' : ''
+  const listNavigationState: ObjectListNavigationState = { from: location.pathname + location.search, objectList: { filters, filterDraft } }
   const hasCustomObjectFilters = Object.entries(filters).some(([key, value]) => key !== 'limit' && key !== 'status' && Boolean(value))
   const applyFilters = () => {
     const dateValue = (value: string | undefined) => value ? new Date(`${value}T00:00:00`).toISOString() : undefined
@@ -950,8 +964,9 @@ function ObjectsPage() {
     <MutationError error={items.error ?? buckets.error} />
     <section data-testid="object-workspace" className="overflow-hidden rounded-lg border border-separator bg-surface shadow-sm md:flex md:h-[calc(100dvh-7rem)] md:min-h-[560px] md:flex-col lg:h-[calc(100dvh-8rem)]">
       <MediaFilterBar value={filterDraft} buckets={buckets.data ?? []} fetching={items.isFetching} uploadDisabled={buckets.isLoading || !buckets.data?.length} selectedCount={selectedIds.length} batchPending={batch.isPending} onChange={setFilterDraft} onApply={applyFilters} onReset={resetFilters} onRefresh={() => items.refetch()} onUpload={openUploadCenter} onClearSelection={() => setSelectedIds([])} onBatchEdit={() => { batch.reset(); setBatchEditorOpen(true) }} onBatchDelete={() => { batch.reset(); setBatchDeleteOpen(true) }} />
+      <ObjectViewToolbar value={viewMode} onChange={setViewMode} />
       {directoryMode && filters.bucket && <DirectoryBreadcrumbs bucket={filters.bucket} prefix={currentPrefix} onNavigate={openDirectory} />}
-      <div data-testid="object-scroll-region" className="md:min-h-0 md:flex-1 md:overflow-hidden">{items.isLoading ? <PageLoading /> : visibleItems.length || visiblePrefixes.length ? <ObjectTable items={visibleItems} prefixes={visiblePrefixes} currentPrefix={currentPrefix} directoryMode={directoryMode} bucket={filters.bucket ?? ''} appId={appId} selectedIds={selectedIds} deletingId={remove.isPending ? deleteItem?.id : undefined} navigationState={{ from: location.pathname + location.search, objectList: { filters, filterDraft } }} onOpenFolder={openDirectory} onSelectionChange={setSelectedIds} onPreview={setPreviewItem} onEdit={setEditorItem} onDelete={(item) => { remove.reset(); setDeleteItem(item) }} /> : <EmptyState icon={directoryMode ? FolderOpen : Search} title={directoryMode ? '目录为空' : '没有对象'} description={directoryMode ? '当前目录还没有文件或子目录。' : '当前过滤条件没有匹配结果。'} action={Boolean(buckets.data?.length) && (!hasCustomObjectFilters || directoryMode) ? <Button variant="primary" onClick={openUploadCenter}><UploadCloud className="h-4 w-4" />上传对象</Button> : undefined} />}</div>
+      <div data-testid="object-scroll-region" className="md:min-h-0 md:flex-1 md:overflow-hidden">{items.isLoading ? <PageLoading /> : visibleItems.length || visiblePrefixes.length ? viewMode === 'explorer' ? <div data-testid="object-explorer-scroll" className="h-full overflow-auto overscroll-contain bg-background-secondary/45 p-3 sm:p-4"><FileExplorer items={visibleItems} prefixes={visiblePrefixes} currentPrefix={currentPrefix} selectedIds={selectedIds} deletingId={remove.isPending ? deleteItem?.id : undefined} onOpenFolder={openDirectory} onSelectionChange={setSelectedIds} onPreview={setPreviewItem} onOpenDetails={(item) => navigate(appPath(appId, `objects/${item.id}`), { state: listNavigationState })} onEdit={setEditorItem} onDelete={(item) => { remove.reset(); setDeleteItem(item) }} /></div> : <ObjectTable items={visibleItems} prefixes={visiblePrefixes} currentPrefix={currentPrefix} directoryMode={directoryMode} bucket={filters.bucket ?? ''} appId={appId} selectedIds={selectedIds} deletingId={remove.isPending ? deleteItem?.id : undefined} navigationState={listNavigationState} onOpenFolder={openDirectory} onSelectionChange={setSelectedIds} onPreview={setPreviewItem} onEdit={setEditorItem} onDelete={(item) => { remove.reset(); setDeleteItem(item) }} /> : <EmptyState icon={directoryMode ? FolderOpen : Search} title={directoryMode ? '目录为空' : '没有对象'} description={directoryMode ? '当前目录还没有文件或子目录。' : '当前过滤条件没有匹配结果。'} action={Boolean(buckets.data?.length) && (!hasCustomObjectFilters || directoryMode) ? <Button variant="primary" onClick={openUploadCenter}><UploadCloud className="h-4 w-4" />上传对象</Button> : undefined} />}</div>
       {!items.isLoading && <ObjectPagination currentPage={safePageIndex + 1} fetching={items.isFetchingNextPage} hasNext={safePageIndex < pages.length - 1 || Boolean(items.hasNextPage)} hasPrevious={safePageIndex > 0} itemCount={visibleItems.length + visiblePrefixes.length} pageSize={filters.limit ?? 25} onNext={() => void goToNextPage()} onPageSizeChange={changePageSize} onPrevious={goToPreviousPage} />}
     </section>
     {batchEditorOpen && <BatchEditModal selectedCount={selectedIds.length} pending={batch.isPending} error={batch.error} onClose={() => setBatchEditorOpen(false)} onExecute={(action) => batch.mutate(action)} />}
@@ -987,6 +1002,11 @@ function MediaFilterBar({ value, buckets, fetching, uploadDisabled, selectedCoun
       </div>
     </div>
   </div>
+}
+
+function ObjectViewToolbar({ value, onChange }: { value: ObjectViewMode; onChange: (value: ObjectViewMode) => void }) {
+  const update = (next: ObjectViewMode) => { try { window.localStorage.setItem(OBJECT_VIEW_STORAGE_KEY, next) } catch { /* Ignore restricted browser storage. */ }; onChange(next) }
+  return <div className="flex min-h-11 shrink-0 items-center justify-between gap-3 border-b border-separator bg-default-soft px-4 py-2"><div><p className="text-xs font-medium text-foreground">浏览方式</p><p className="hidden text-[10px] text-muted sm:block">表格适合批量核对，文件浏览器适合浏览与预览。</p></div><div className="inline-flex rounded-md border border-separator bg-surface p-0.5" role="group" aria-label="对象浏览方式"><Button isIconOnly size="sm" variant={value === 'explorer' ? 'primary' : 'ghost'} aria-label="文件浏览器视图" aria-pressed={value === 'explorer'} onClick={() => update('explorer')}><Grid2X2 className="size-4" /></Button><Button isIconOnly size="sm" variant={value === 'table' ? 'primary' : 'ghost'} aria-label="表格视图" aria-pressed={value === 'table'} onClick={() => update('table')}><List className="size-4" /></Button></div></div>
 }
 
 function DirectoryBreadcrumbs({ bucket, prefix, onNavigate }: { bucket: string; prefix: string; onNavigate: (prefix: string) => void }) {
@@ -1157,6 +1177,7 @@ function ImageVariantToolbar({ mode, params, pending, valid, failed, onModeChang
 }
 
 export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: ObjectItem; variant?: VariantParams; onClose: () => void; onEdit?: () => void }) {
+  const { resolvedTheme } = useTheme()
   const rasterImage = isRasterImageMimeType(item.type)
   const publicObject = item.visibility === '公开'
   const [imageMode, setImageMode] = useState<ImagePreviewMode>(variant ? 'variant' : 'original')
@@ -1235,7 +1256,7 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
 
   const loading = <div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载对象预览" color="accent" /><span>正在加载预览</span></div>
   const originalError = <div className="max-w-md px-6 text-center"><AlertCircle className="mx-auto size-8 text-danger" /><p className="mt-3 text-sm font-medium text-white">预览加载失败</p><p className="mt-1 text-xs leading-5 text-white/50">{errorMessage(originalPreview.error)}</p><Button variant="secondary" className="mt-4" onClick={() => originalPreview.refetch()}><RefreshCw className="size-4" />重试</Button></div>
-  const genericMedia = originalPreview.isLoading ? loading : originalPreview.error ? originalError : currentUrl ? <Suspense fallback={<div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载多格式查看器" color="accent" /><span>正在加载查看器</span></div>}><EnhancedObjectFileViewer fileName={item.name} mimeType={item.type} size={item.size} url={currentUrl} /></Suspense> : null
+  const genericMedia = originalPreview.isLoading ? loading : originalPreview.error ? originalError : currentUrl ? <Suspense fallback={<div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载多格式查看器" color="accent" /><span>正在加载查看器</span></div>}><EnhancedPreviewSurface fileName={item.name} mimeType={item.type} size={item.size} url={currentUrl} theme={resolvedTheme} /></Suspense> : null
   const rasterMedia = <>
     <ImageVariantToolbar mode={imageMode} params={variantParams} pending={variantPending} valid={variantValid} failed={Boolean(variantError)} onModeChange={setImageMode} onParamsChange={handleVariantParamsChange} />
     <div data-testid="raster-preview-viewport" className="relative grid min-h-0 min-w-0 flex-1 place-items-center overflow-hidden p-3 sm:p-5">
@@ -1606,7 +1627,7 @@ function SettingsPage() {
   const [name, setName] = useState('')
   useEffect(() => { if (app) setName(app.name) }, [app])
   const update = useMutation({ mutationFn: () => api.updateApplication(appId, name.trim()), onSuccess: () => queryClient.invalidateQueries({ queryKey: ['applications'] }) })
-  const remove = useMutation({ mutationFn: () => api.deleteApplication(appId), onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ['applications'] }); navigate('/') } })
+  const remove = useMutation({ mutationFn: () => api.deleteApplication(appId), onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ['applications'] }); navigate('/console') } })
   if (applications.isLoading) return <PageLoading />
   return <>
     <MutationError error={applications.error ?? update.error ?? remove.error} />
@@ -1956,7 +1977,7 @@ export function AdminSystemVersionPanel({ version, loading, refreshing, error, u
           {sourceUrl ? <a className="block truncate font-medium text-accent hover:underline" href={sourceUrl} target="_blank" rel="noreferrer noopener">查看构建来源</a> : <span>构建来源暂不可用</span>}
           {operation?.startedAt && <p className="mt-1">开始时间：{formatDateTime(operation.startedAt)}</p>}
         </div>
-        <Button variant="primary" className="shrink-0" isDisabled={!canUpdate || updating} onClick={() => { if (window.confirm(`确认更新 MediaHub？\n\n将拉取 ${version.channel}-latest 镜像并替换当前容器，API 可能短暂不可用。`)) onUpdate() }}>{(running || updating) && <LoaderCircle className="size-4 animate-spin" />}{updateLabel}</Button>
+        <Button variant="primary" className="shrink-0" isDisabled={!canUpdate || updating} onClick={() => { if (window.confirm(`确认更新 ${PRODUCT_NAME}？\n\n将拉取 ${version.channel}-latest 镜像并替换当前容器，API 可能短暂不可用。`)) onUpdate() }}>{(running || updating) && <LoaderCircle className="size-4 animate-spin" />}{updateLabel}</Button>
       </div>
     </div> : <div className="px-5 py-5"><MutationError error={error} /><Button variant="secondary" isDisabled={refreshing} onClick={onRefresh}>{refreshing && <LoaderCircle className="size-4 animate-spin" />}重试版本检查</Button></div>}
   </section>
@@ -1981,6 +2002,58 @@ function ApplicationQuotaEditor({ application, pending, error, onClose, onSave }
 
 function AdminMetric({ label, value, caution = false, formatter, className }: { label: string; value: number | null | undefined; caution?: boolean; formatter?: (value: number) => string; className?: string }) { const available = typeof value === 'number'; const hasCaution = caution && available && value > 0; return <article className={cn('min-w-0 bg-surface px-5 py-4', className)}><div className="flex items-center justify-between gap-3"><p className="text-xs font-medium text-muted">{label}</p><span className={cn('h-2 w-2 rounded-full', !available ? 'bg-default' : hasCaution ? 'bg-danger' : 'bg-success')} /></div><p className={cn('mt-2 text-2xl font-semibold tabular-nums text-foreground', hasCaution && 'text-danger')}>{available ? (formatter ? formatter(value) : value.toLocaleString()) : '--'}</p><p className="mt-0.5 text-[11px] text-muted">{available ? '实时数据' : '暂不可用'}</p></article> }
 
+const CONSOLE_PAGE_DESCRIPTION = `${PRODUCT_NAME} 控制台用于管理对象、Bucket、全格式预览和图片 Variant。`
+const MARKETING_ROBOTS = 'index,follow,max-image-preview:large'
+const PRIVATE_ROBOTS = 'noindex,nofollow,noarchive'
+const SOCIAL_IMAGE_PATH = '/brand/prismark-mark-512.png'
+
+function upsertMeta(attribute: 'name' | 'property', key: string, content: string) {
+  let element = document.head.querySelector<HTMLMetaElement>(`meta[${attribute}="${key}"]`)
+  if (!element) {
+    element = document.createElement('meta')
+    element.setAttribute(attribute, key)
+    document.head.append(element)
+  }
+  element.content = content
+}
+
+function upsertCanonical(href: string) {
+  const canonicalLinks = Array.from(document.head.querySelectorAll<HTMLLinkElement>('link[rel="canonical"]'))
+  const canonical = canonicalLinks.shift() ?? document.createElement('link')
+  canonical.rel = 'canonical'
+  canonical.href = href
+  if (!canonical.isConnected) document.head.append(canonical)
+  canonicalLinks.forEach((duplicate) => duplicate.remove())
+}
+
+export function applyPageMetadata(pathname: string) {
+  const marketingPage = pathname === '/'
+  const normalizedPath = marketingPage ? '/' : `/${pathname.replace(/^\/+|\/+$/g, '')}`
+  const canonicalUrl = new URL(normalizedPath, `${window.location.origin}/`).href
+  const socialImageUrl = new URL(SOCIAL_IMAGE_PATH, `${window.location.origin}/`).href
+  const title = marketingPage ? PRISMARK_PAGE_META.title : `${PRODUCT_NAME} Console`
+  const description = marketingPage ? PRISMARK_PAGE_META.description : CONSOLE_PAGE_DESCRIPTION
+
+  document.title = title
+  upsertCanonical(canonicalUrl)
+  upsertMeta('name', 'description', description)
+  upsertMeta('name', 'robots', marketingPage ? MARKETING_ROBOTS : PRIVATE_ROBOTS)
+  upsertMeta('property', 'og:title', title)
+  upsertMeta('property', 'og:description', description)
+  upsertMeta('property', 'og:url', canonicalUrl)
+  upsertMeta('property', 'og:image', socialImageUrl)
+  upsertMeta('name', 'twitter:title', title)
+  upsertMeta('name', 'twitter:description', description)
+  upsertMeta('name', 'twitter:image', socialImageUrl)
+}
+
+export function PageMetadata() {
+  const location = useLocation()
+  useEffect(() => {
+    applyPageMetadata(location.pathname)
+  }, [location.pathname])
+  return null
+}
 export function App() {
-  return <Routes><Route path="/login" element={<LoginPage />} /><Route path="/register" element={<RegisterPage />} /><Route path="/verify-email" element={<VerifyEmailPage />} /><Route path="/forgot-password" element={<ForgotPasswordPage />} /><Route path="/reset-password" element={<ResetPasswordPage />} /><Route path="/app/:appId/*" element={<RequireAuth><ConsoleShellV3 /></RequireAuth>} /><Route path="/admin/*" element={<RequireAdmin><AdminPage /></RequireAdmin>} /><Route path="/" element={<RequireAuth><HomePage /></RequireAuth>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes>
+  return <><PageMetadata /><Routes><Route path="/login" element={<LoginPage />} /><Route path="/register" element={<RegisterPage />} /><Route path="/verify-email" element={<VerifyEmailPage />} /><Route path="/forgot-password" element={<ForgotPasswordPage />} /><Route path="/reset-password" element={<ResetPasswordPage />} /><Route path="/app/:appId/*" element={<RequireAuth><ConsoleShellV3 /></RequireAuth>} /><Route path="/admin/*" element={<RequireAdmin><AdminPage /></RequireAdmin>} /><Route path="/console" element={<RequireAuth><HomePage /></RequireAuth>} /><Route path="/" element={<PrismArkLandingPage consoleHref="/console" />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></>
 }

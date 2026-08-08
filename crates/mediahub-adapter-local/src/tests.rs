@@ -255,6 +255,7 @@
             .expect("streamed upload succeeds");
         assert_eq!(streamed.size, 7);
         assert_eq!(streamed.sha256, hex::encode(Sha256::digest(b"abcdefg")));
+        assert_eq!(streamed.md5, hex::encode(Md5::digest(b"abcdefg")));
         assert_eq!(store.read(key), Ok(b"abcdefg".to_vec()));
         assert_eq!(
             store.content_type_for(key),
@@ -300,6 +301,27 @@
             Err(LocalUploadError::Stream(_))
         ));
         assert!(!store.exists(failed_key).await.expect("check failed object"));
+        fs::remove_dir_all(root).expect("test root cleanup");
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_hashes_empty_object() {
+        let root = test_root();
+        let store = LocalObjectStore::new(&root).expect("store initializes");
+        let key = "objects/empty";
+        let streamed = store
+            .put_temporary_stream(
+                key,
+                futures_util::stream::empty::<Result<Bytes, &str>>(),
+                0,
+                "application/octet-stream",
+            )
+            .await
+            .expect("empty upload succeeds");
+        assert_eq!(streamed.size, 0);
+        assert_eq!(streamed.sha256, hex::encode(Sha256::digest([])));
+        assert_eq!(streamed.md5, hex::encode(Md5::digest([])));
+        assert_eq!(store.read(key), Ok(Vec::new()));
         fs::remove_dir_all(root).expect("test root cleanup");
     }
 

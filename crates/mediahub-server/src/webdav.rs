@@ -41,7 +41,7 @@ use tracing::warn;
 
 use crate::{AppState, MAX_REQUEST_BYTES, RequestId, runtime_storage::RuntimeObjectStore};
 
-const AUTH_CHALLENGE: &str = "Basic realm=\"MediaHub WebDAV\", charset=\"UTF-8\"";
+const AUTH_CHALLENGE: &str = "Basic realm=\"PrismArk WebDAV\", charset=\"UTF-8\"";
 const PAGE_SIZE: usize = 100;
 
 #[derive(Clone)]

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { DEFAULT_VARIANT_PARAMS, ObjectPreviewModal, isRasterImageMimeType, isValidVariantParams } from './App'
 import { api, type ObjectItem } from './api'
+import { ThemeProvider } from './theme'
 
 const IMAGE: ObjectItem = {
   id: 'media_image',
@@ -22,7 +23,7 @@ const IMAGE: ObjectItem = {
 
 function renderPreview(item: ObjectItem = IMAGE) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={queryClient}><ObjectPreviewModal item={item} onClose={vi.fn()} /></QueryClientProvider>)
+  return render(<ThemeProvider defaultTheme="light"><QueryClientProvider client={queryClient}><ObjectPreviewModal item={item} onClose={vi.fn()} /></QueryClientProvider></ThemeProvider>)
 }
 
 async function advanceTimers(milliseconds: number) {

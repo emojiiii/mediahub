@@ -1,0 +1,13 @@
+User-agent: *
+Allow: /
+Disallow: /login
+Disallow: /register
+Disallow: /verify-email
+Disallow: /forgot-password
+Disallow: /reset-password
+Disallow: /console
+Disallow: /app/
+Disallow: /admin/
+Disallow: /api/
+Disallow: /s3
+Disallow: /dav

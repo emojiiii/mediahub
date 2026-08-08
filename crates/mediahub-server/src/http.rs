@@ -1,7 +1,11 @@
 // Router construction, request middleware, and HMAC authentication.
 
+#[cfg(test)]
 fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
-    let state = Arc::new(state);
+    control_plane_router(Arc::new(state), web_root)
+}
+
+fn control_plane_router(state: Arc<AppState>, web_root: Option<PathBuf>) -> Router {
     let cors = cors_layer(&state.cors_allowed_origins);
     let mut app = Router::new()
         .route("/health/live", get(liveness))
@@ -20,14 +24,8 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
         )
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
         .route("/api/v1/admin/storage", get(admin_storage))
-        .route(
-            "/api/v1/admin/system/version",
-            get(admin_system_version),
-        )
-        .route(
-            "/api/v1/admin/system/update",
-            post(admin_system_update),
-        )
+        .route("/api/v1/admin/system/version", get(admin_system_version))
+        .route("/api/v1/admin/system/update", post(admin_system_update))
         .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
@@ -110,22 +108,6 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
             "/api/v1/uploads/{upload_session_id}/complete",
             post(complete_upload_session),
         )
-        .route(
-            "/s3/{bucket}/{*object_key}",
-            get(s3_http::s3_get_object)
-                .head(s3_http::s3_get_object)
-                .put(s3_http::s3_put_object)
-                .post(s3_http::s3_post_object)
-                .delete(s3_http::s3_delete_object)
-                .layer(DefaultBodyLimit::max(MAX_S3_CONTROL_REQUEST_BYTES)),
-        )
-        .route(
-            "/s3/{bucket}",
-            get(s3_http::s3_list_objects)
-                .head(s3_http::s3_head_bucket)
-                .post(s3_http::s3_bucket_post)
-                .layer(DefaultBodyLimit::max(MAX_S3_CONTROL_REQUEST_BYTES)),
-        )
         .route("/s/{code}", get(redirect_short_link))
         .route("/{app_id}", get(list_path_buckets))
         .route(
@@ -164,8 +146,7 @@ fn router(state: AppState, web_root: Option<PathBuf>) -> Router {
             .nest_service("/assets", ServeDir::new(web_root.join("assets")))
             .nest_service("/pdfjs", ServeDir::new(web_root.join("pdfjs")));
     }
-    app
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+    app.layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             authenticate_hmac_request,
@@ -621,4 +602,3 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
     use subtle::ConstantTimeEq;
     left.as_bytes().ct_eq(right.as_bytes()).into()
 }
-

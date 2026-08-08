@@ -25,8 +25,19 @@ docker compose up -d postgres
 cargo run -p mediahub-server
 ```
 
-The default URL is `http://127.0.0.1:3000`. Metadata is stored in PostgreSQL 17;
-object files are stored under `data/storage`.
+The server binds two independent listeners by default:
+
+- `http://127.0.0.1:3000` is the control plane for the Web console, JSON API,
+  WebDAV, health checks, metrics, and administration.
+- `http://127.0.0.1:9000` is the S3 data-plane endpoint. Configure AWS SDKs and
+  command-line clients with this origin as the endpoint and use path-style
+  addressing when the client requires an explicit addressing mode.
+
+Liveness and readiness probes belong to the control plane at
+`http://127.0.0.1:3000/health/live` and
+`http://127.0.0.1:3000/health/ready`. Port 9000 serves the S3 protocol and is
+not an HTTP health endpoint. Metadata is stored in PostgreSQL 17; object files
+are stored under `data/storage`.
 
 For a container deployment, copy `.env.example` to `.env`, fill every required
 secret/provider value, and pull the published Web/API/worker image:
@@ -41,14 +52,16 @@ docker compose ps
 The default image is `ghcr.io/emojiiii/mediahub:latest`. The release workflow
 publishes only `latest` and `master`; pin `MEDIAHUB_IMAGE` to an image digest
 when deployment reproducibility is required. The image contains the Web console,
-API, and workers. Open the public MediaHub origin to use the console.
+API, workers, and S3 listener. Compose publishes control-plane port 3000 and S3
+data-plane port 9000. Open the public PrismArk control-plane origin to use the
+console; point S3 clients at the separately exposed port 9000 endpoint.
 
 ### Automatic image updates
 
 The production Compose profile includes a `containrrr/watchtower:1.7.1`
 `mediahub-updater` service. Set `MEDIAHUB_UPDATER_TOKEN` in `.env` to a random
 value of at least 32 characters. The updater exposes port 8080 only to the
-Compose network and accepts authenticated requests from MediaHub at
+Compose network and accepts authenticated requests from PrismArk at
 `http://mediahub-updater:8080/v1/update`; it is never published on the host.
 
 Watchtower is restricted to the `mediahub-prod` scope and label-enabled
@@ -85,7 +98,7 @@ pnpm dev
 
 ```powershell
 $env:MEDIAHUB_RESEND_API_KEY = 're_<server-side-api-key>'
-$env:MEDIAHUB_EMAIL_FROM = 'MediaHub <noreply@example.com>'
+$env:MEDIAHUB_EMAIL_FROM = 'PrismArk <noreply@example.com>'
 $env:MEDIAHUB_WEB_URL = 'https://mediahub.example.com'
 $env:MEDIAHUB_CORS_ALLOWED_ORIGINS = ''
 docker compose up --build
@@ -172,7 +185,7 @@ and cannot use this header to switch context.
 Production startup requires `MEDIAHUB_RESEND_API_KEY`, `MEDIAHUB_EMAIL_FROM`,
 and `MEDIAHUB_WEB_URL`. The sender must belong to a domain verified in Resend.
 The Web URL must be a clean HTTPS origin such as `https://console.example.com`;
-MediaHub appends `/verify-email?token=...` or `/reset-password?token=...` and
+PrismArk appends `/verify-email?token=...` or `/reset-password?token=...` and
 sends rendered HTML and text through `https://api.resend.com/emails`. Requests
 use a token-derived hashed idempotency key, while raw tokens remain absent from
 the database. If Resend is not configured, startup is allowed only with the
@@ -261,7 +274,7 @@ prevent duplicate publication. Private access and cache lifetime inherit the
 original Media. Range is ignored for transformed reads, which always return a
 full `200` response and `Accept-Ranges: none`.
 
-Bucket object URLs are stable relative paths and do not require MediaHub to
+Bucket object URLs are stable relative paths and do not require PrismArk to
 manage a deployment domain. For example, an object with key
 `campaigns/2026/logo.png` is available at:
 
@@ -382,7 +395,7 @@ listener start. Unknown schemes are rejected, and a failed connection stops
 startup.
 
 Compose supplies the PostgreSQL service hostname to the API and waits for the
-database health check before starting MediaHub:
+database health check before starting PrismArk:
 
 ```powershell
 docker compose up -d --build
@@ -410,6 +423,14 @@ run in every workspace test:
 ```powershell
 cargo test -p mediahub-adapter-s3 --test object_store_contract
 ```
+
+Immutable promotion on generic S3 uses `object_store`'s create-only multipart
+copy so a pre-existing final key is never overwritten. That portable operation
+does not preserve source attributes, so PrismArk immediately performs a
+same-source server-side copy to restore Content-Type and custom checksum
+metadata, then verifies the result. Final keys contain the UploadIntent's random
+proposed version ID; a failed metadata repair remains safely retryable by byte
+comparison against the staged object.
 
 The Server selects storage independently from its PostgreSQL database
 profile. To run the Compose API against an external S3-compatible service,
@@ -439,7 +460,7 @@ bucket in the hostname rather than the request path.
 Readiness verifies the selected object store. Admin storage and Prometheus
 continue to report database object/Variant usage for S3, but
 `disk_total_bytes` and `disk_available_bytes` are both `0`: remote bucket
-capacity is not a local filesystem fact and MediaHub does not invent one.
+capacity is not a local filesystem fact and PrismArk does not invent one.
 
 Run the same contract against an isolated real bucket explicitly. The test
 creates a unique prefix but must never target a bucket containing unrelated
@@ -471,35 +492,45 @@ Variant paths as Local storage. `MEDIAHUB_STORAGE_ROOT` and the Compose data
 volume remain relevant to the default Local profile; S3 object bytes are not
 written into that directory.
 
-## Inbound S3 Gateway For sub2api
+## Inbound S3 Data Plane
 
-The outbound ObjectStore profile above controls where MediaHub stores bytes.
-The inbound gateway at `/s3/{bucket}/{object_key}` instead lets a bounded AWS
-SDK client store normal MediaHub objects. It supports the `PutObject`,
-presigned/header-signed `GetObject`, and `HeadObject` operations required by
-`sub2api` asynchronous image storage. It does not claim general S3 API
-compatibility.
+The outbound ObjectStore profile above controls where PrismArk stores bytes.
+The inbound S3 data plane is a separate listener that exposes S3 Bucket and
+Object operations to AWS-compatible SDKs and command-line clients. Its default
+endpoint is `http://127.0.0.1:9000`; Bucket and Object resources start directly
+at `/{bucket}` and `/{bucket}/{object_key}`.
 
-Use an Application AccessKey with `media:upload` and `media:read` as the S3
-credential pair. The AccessKey identifies the Application; Bucket is the
-path-style S3 Bucket. Configure clients with the public MediaHub origin plus
-`/s3`, `force_path_style=true`, an arbitrary consistent Region such as
-`us-east-1`, and no `public_base_url` for private Buckets. The complete
-configuration and proxy requirements are in
-[`sub2api-async-image-storage.md`](sub2api-async-image-storage.md).
+Use an Application AccessKey as the S3 access-key ID and its one-time secret as
+the S3 secret-access key. The AccessKey identifies the Application, while the
+request path identifies the Bucket and Object Key. A typical local client uses:
 
-The gateway authenticates a signed PUT before streaming it into a durable
-UploadSession. Local storage writes directly to a staging file; an external
-S3/R2 backend uses bounded, backpressured internal multipart writes. PutObject
-and UploadPart therefore do not aggregate complete payloads in MediaHub memory.
-The result is a Media record with quota, Bucket policy, lifecycle, audit,
-outbox, and storage rollback behavior. The effective object limit is the
-smallest of the 2 GiB technical limit, Bucket policy, and Application quota.
-Reads use the standard MediaHub Range/ETag/throttling path. A reverse proxy,
-including Cloudflare's ordinary proxied hostname, can impose a lower request
-body limit and must be configured or bypassed separately from the R2 API.
-AWS XML errors are intentionally outside the JSON control-plane OpenAPI; use
-`GET /api/v1/capabilities` and require `s3_gateway=true` for discovery.
+```text
+endpoint = http://127.0.0.1:9000
+region = us-east-1
+force_path_style = true
+```
+
+Preserve the original HTTP method, Host, path, query string, and signed headers
+when placing a reverse proxy or TLS terminator in front of port 9000; SigV4
+verification depends on those canonical request components. Publish the S3
+listener through a dedicated origin or port and forward it directly to 9000.
+Do not use the S3 endpoint for liveness or readiness probes: those remain on
+the control-plane listener at port 3000.
+
+The data plane authenticates signed uploads before streaming content into
+durable staging storage. Local storage writes to a staging file; an external
+S3/R2 backend uses bounded, backpressured internal writes. Request bodies are
+therefore not aggregated in full in server memory. The effective object limit
+is the smallest of the technical limit, Bucket policy, Application quota, and
+any reverse-proxy request-body limit. AWS XML errors intentionally remain
+outside the JSON control-plane OpenAPI.
+
+Object-byte deletion is handled by the persistent GC queue rather than inline
+with metadata changes. `PRISMARK_GC_GRACE_HOURS` controls the grace period used
+before superseded `null`-version payloads are eligible for deletion; it defaults
+to `24`, accepts `0..8760`, and may be set to `0` only when immediate cleanup is
+explicitly desired. Workers lease and retry GC tasks, so restarting the server
+does not lose pending cleanup work.
 
 Every response includes `X-Request-Id`. A syntactically valid caller-provided
 value (up to 128 letters, digits, `_`, or `-`) is echoed; otherwise the service
@@ -529,7 +560,7 @@ Before a coordinated offline snapshot, stop the API and workers while leaving
 PostgreSQL running, record the database and storage snapshot identifiers, and
 retain every master-key version referenced by encrypted rows. Restore into an
 isolated environment first, apply WAL to the chosen recovery point, restore the
-matching object snapshot, and only then start MediaHub.
+matching object snapshot, and only then start PrismArk.
 
 After restore, require PostgreSQL readiness and application readiness, compare
 database and object inventory totals, sample object hashes, and verify Session,
@@ -549,7 +580,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Set-Location web; pnpm build
 ```
 
-The current Server supports runtime Local/S3 selection, but intentionally does
-not claim resumable multipart uploads. Rust DTOs and the contract table generate
+The current Server supports runtime Local/S3 selection and S3 multipart uploads.
+Multipart completion is resumable at the server state-machine level: a takeover
+reuses the attached UploadIntent and does not compose the same parts again. This
+does not yet imply broad client interoperability; validate the exact SDK and
+storage backend used in production. Rust DTOs and the contract table generate
 `openapi/openapi.json`; TypeScript declarations are generated from that document,
 consumed through the typed runtime client, and checked for drift by CI.
