@@ -165,6 +165,13 @@ mod object_subresource_http_contract {
         let bucket_url = format!("http://{address}/{bucket_name}");
         let object_url = format!("{bucket_url}/{object_key}");
 
+        super::http_contract::install_identity_policy(
+            &state,
+            owner_application_id,
+            owner_key,
+            r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:CreateBucket","s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"*"}}"#,
+        )
+        .await;
         let mut create_bucket = unsigned_request(
             Method::PUT,
             &bucket_url,

@@ -252,3 +252,12 @@
 - `PutObjectRetention` 在请求声称绕过 Governance 时，必须在 `s3:PutObjectRetention` 之外再允许 `s3:BypassGovernanceRetention`。`DeleteObject`/`DeleteObjects` 删除受 Governance 保护的版本时也需要额外 bypass action；普通删除与显式版本删除分别是 `s3:DeleteObject` 和 `s3:DeleteObjectVersion`。
 - `ListMultipartUploads` 与 `ListParts` 分别是 `s3:ListBucketMultipartUploads` 与 `s3:ListMultipartUploadParts`；不能用 `ListBucket` 或 `GetObject` 泛化替代。
 - 参考：AWS 官方权限映射 https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-with-s3-policy-actions.html ，PutObject https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html ，CopyObject https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html ，CreateMultipartUpload https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html 。
+
+## S3 Policy 控制面收口（2026-08-08）
+
+- AWS 官方 CreateBucket 说明：基础请求要求 `s3:CreateBucket`；当 `x-amz-bucket-object-lock-enabled=true` 时，还必须具备 `s3:PutBucketObjectLockConfiguration` 与 `s3:PutBucketVersioning`。PrismArk 已按未来 Bucket ARN 对两项附加动作逐项求值。
+- CreateBucket 不带 ACL 或使用 private ACL 时不附加 `s3:PutBucketAcl`；public/custom ACL 与尚未实现的 ownership/namespace headers 明确拒绝，不能静默忽略。
+- ListBuckets/CreateBucket 使用 account 级 Identity Policy；ListObjectVersions、HeadBucket、GetBucketLocation、DeleteBucket、Versioning、Lifecycle 与 Bucket Object Lock 使用各自精确 Bucket action。允许匿名的读取类操作可由 Bucket Policy 授权，坏签名绝不降级匿名。
+- Bucket Policy GET/PUT/DELETE 与 PolicyStatus 只接受 Bucket owner 的相应 Identity Policy action；目标 Bucket Policy 不能为自己的管理请求授权。PUT 仍先完成长度、摘要、SigV4 与严格 JSON 解析，再执行 owner 授权。
+- 当前生产 `s3*.rs` handler 已无 `ApplicationAuth::authorize` 旧 permissions 授权调用；旧 permissions 仅继续服务 JSON/WebDAV 等非 S3 产品接口。
+- 参考：AWS CreateBucket https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html 。

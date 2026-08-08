@@ -392,22 +392,33 @@ pub(super) async fn s3_list_buckets(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request: (
+        HeaderMap,
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
 ) -> Result<Response, S3ApiError> {
+    let (headers, connect_info, request_id) = request;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_signed_account_request(
+        &state,
+        &auth,
+        S3PolicyAction::ListAllMyBuckets,
+        &uri,
+        s3_data_source_ip(connect_info.as_ref()),
+        &request_id.0.0,
+    )
+    .await?;
     let buckets = state
         .repository
-        .list_buckets(auth.application.id)
+        .list_buckets(authorization.application_id)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 ListBuckets lookup failed");
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?;
-    let body = s3_list_buckets_xml(&auth.application.app_id, &auth.application.name, &buckets)
+    let body = s3_list_buckets_xml(&authorization.account_id, "PrismArk Account", &buckets)
         .map_err(|error| {
             warn!(error = %error, "S3 ListBuckets XML encoding failed");
             S3ApiError::internal_error(uri.path(), &request_id.0.0)
@@ -420,19 +431,38 @@ pub(super) async fn s3_create_bucket(
     Path(bucket_name): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request: (
+        HeaderMap,
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
     content: Bytes,
 ) -> Result<Response, S3ApiError> {
+    let (headers, connect_info, request_id) = request;
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
             .await?;
-    auth.authorize("bucket:manage")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
     let object_lock_enabled =
         parse_s3_create_bucket_object_lock_header(&headers, &uri, &request_id.0.0)?;
+    if s3_canned_acl(&headers, uri.path(), &request_id.0.0)?
+        .is_some_and(|visibility| visibility != Visibility::Private)
+    {
+        return Err(S3ApiError::acl_not_supported(
+            uri.path(),
+            &request_id.0.0,
+        ));
+    }
+    if headers.contains_key("x-amz-object-ownership")
+        || headers.contains_key("x-amz-bucket-namespace")
+    {
+        return Err(S3ApiError::not_implemented(
+            "CreateBucket Object Ownership and account-regional namespaces are not supported.",
+            uri.path(),
+            &request_id.0.0,
+        ));
+    }
     validate_s3_create_bucket_configuration(&content).map_err(|error| match error {
         S3CreateBucketConfigurationError::MalformedXml => {
             S3ApiError::malformed_xml(uri.path(), &request_id.0.0)
@@ -441,6 +471,45 @@ pub(super) async fn s3_create_bucket(
             S3ApiError::invalid_location_constraint(uri.path(), &request_id.0.0)
         }
     })?;
+    let authorization = authorize_s3_signed_account_request(
+        &state,
+        &auth,
+        S3PolicyAction::CreateBucket,
+        &uri,
+        s3_data_source_ip(connect_info.as_ref()),
+        &request_id.0.0,
+    )
+    .await?;
+    if object_lock_enabled {
+        for action in [
+            S3PolicyAction::PutBucketObjectLockConfiguration,
+            S3PolicyAction::PutBucketVersioning,
+        ] {
+            let supplemental = authorize_s3_signed_identity_bucket_request(
+                &state,
+                &auth,
+                action,
+                &bucket_name,
+                &uri,
+                s3_data_source_ip(connect_info.as_ref()),
+                &request_id.0.0,
+            )
+            .await?;
+            if supplemental.application_id != authorization.application_id
+                || supplemental.account_id != authorization.account_id
+            {
+                warn!(
+                    bucket_name,
+                    action = action.as_str(),
+                    "CreateBucket supplemental authorization returned another caller"
+                );
+                return Err(S3ApiError::service_unavailable(
+                    uri.path(),
+                    &request_id.0.0,
+                ));
+            }
+        }
+    }
 
     if let Some(existing) = state
         .repository
@@ -453,7 +522,7 @@ pub(super) async fn s3_create_bucket(
     {
         return Err(s3_create_bucket_name_conflict(
             &existing,
-            auth.application.id,
+            authorization.application_id,
             uri.path(),
             &request_id.0.0,
         ));
@@ -462,7 +531,7 @@ pub(super) async fn s3_create_bucket(
     let now = OffsetDateTime::now_utc();
     let bucket = S3Bucket::new(
         BucketId::new(),
-        auth.application.id,
+        authorization.application_id,
         bucket_name.clone(),
         DEFAULT_S3_REGION,
         object_lock_enabled,
@@ -492,7 +561,7 @@ pub(super) async fn s3_create_bucket(
                 |existing| {
                     s3_create_bucket_name_conflict(
                         &existing,
-                        auth.application.id,
+                        authorization.application_id,
                         uri.path(),
                         &request_id.0.0,
                     )
@@ -673,30 +742,39 @@ pub(super) async fn s3_list_object_versions(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("media:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
-    let bucket = state
-        .repository
-        .find_s3_bucket(auth.application.id, &bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 ListObjectVersions bucket lookup failed");
-            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
     let query = parse_list_object_versions_query(&uri, &request_id.0.0)?;
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::ListBucketVersions,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: Some(&query.prefix),
+            delimiter: query.delimiter.as_deref(),
+            max_keys: u64::try_from(query.max_keys).ok(),
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
+    let application_id = authorization.application_id();
+    let bucket_id = authorization.bucket.bucket_id;
     let page = state
         .repository
         .list_s3_object_versions_page(
-            auth.application.id,
+            application_id,
             &S3ObjectVersionListQuery {
-                bucket_id: bucket.id(),
+                bucket_id,
                 prefix: query.prefix.clone(),
                 key_marker: query.key_marker.clone(),
                 version_id_marker: query.version_id_marker.clone(),
@@ -717,11 +795,11 @@ pub(super) async fn s3_list_object_versions(
             }
         })?;
     let result = s3_object_versions_result_from_page(
-        auth.application.id,
-        bucket.id(),
+        application_id,
+        bucket_id,
         bucket_name,
-        auth.application.app_id.clone(),
-        auth.application.name.clone(),
+        authorization.bucket.owner_account_id.as_str().to_owned(),
+        "PrismArk Account".to_owned(),
         query,
         page,
     )
@@ -909,17 +987,33 @@ pub(super) async fn s3_get_bucket_location(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::GetBucketLocation,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
     state
         .repository
-        .get_s3_bucket_location(auth.application.id, &bucket_name)
+        .get_s3_bucket_location(authorization.application_id(), &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 GetBucketLocation lookup failed");
@@ -938,22 +1032,39 @@ pub(super) async fn s3_head_bucket(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::ListBucket,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
     state
         .repository
-        .find_bucket_by_name(auth.application.id, &bucket_name)
+        .find_s3_bucket(authorization.application_id(), &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 HeadBucket lookup failed");
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?
+        .filter(|bucket| bucket.id() == authorization.bucket.bucket_id)
         .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
     Ok(s3_bucket_region_response(StatusCode::OK, &request_id.0.0))
 }
@@ -964,27 +1075,46 @@ pub(super) async fn s3_delete_bucket(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:manage")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_signed_data_request(
+        &state,
+        &auth,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::DeleteBucket,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        uri.path(),
+        &request_id.0.0,
+    )
+    .await?;
+    let application_id = authorization.application_id();
     let bucket = state
         .repository
-        .find_bucket_by_name(auth.application.id, &bucket_name)
+        .find_s3_bucket(application_id, &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 DeleteBucket lookup failed");
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?
+        .filter(|bucket| bucket.id() == authorization.bucket.bucket_id)
         .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
 
     match state
         .repository
-        .delete_empty_bucket(auth.application.id, &bucket_name)
+        .delete_s3_bucket(application_id, &bucket_name)
         .await
     {
         Ok(true) => {}
@@ -1000,13 +1130,13 @@ pub(super) async fn s3_delete_bucket(
         }
     }
 
-    record_audit(
+    record_s3_resource_audit(
         &state,
         &auth,
+        application_id,
         &request_id.0.0,
         "bucket.deleted",
-        "bucket",
-        bucket.id().to_string(),
+        ("bucket", bucket.id().to_string()),
         serde_json::json!({
             "name": bucket.name(),
             "protocol": "s3",
@@ -1015,6 +1145,9 @@ pub(super) async fn s3_delete_bucket(
     .await;
     Ok(s3_empty_response(StatusCode::NO_CONTENT, &request_id.0.0))
 }
+
+#[cfg(test)]
+include!("s3_bucket_basic_policy_tests.rs");
 
 fn s3_list_token_codec(state: &AppState) -> ContinuationTokenCodec {
     let mut digest = Sha256::new();

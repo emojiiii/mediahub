@@ -34,6 +34,12 @@ impl S3AuthorizedDataRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct S3AuthorizedAccountRequest {
+    application_id: ApplicationId,
+    account_id: String,
+}
+
 #[derive(Clone, Debug)]
 enum S3SignedPrincipalResolution {
     Principal(S3SignedPrincipal),
@@ -182,6 +188,167 @@ async fn authorize_s3_signed_data_request(
     authorize_s3_policy_principal_request(state, input, principal, resource, request_id).await
 }
 
+/// Authorizes an identity-only account action such as ListAllMyBuckets or
+/// CreateBucket. Account actions have no target bucket and therefore can
+/// never be granted by a Bucket Policy.
+async fn authorize_s3_signed_account_request(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    action: S3PolicyAction,
+    uri: &Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &str,
+) -> Result<S3AuthorizedAccountRequest, S3ApiError> {
+    if action.scope() != S3PolicyResourceScope::Account {
+        warn!(action = action.as_str(), "non-account action passed to account authorization");
+        return Err(S3ApiError::service_unavailable(uri.path(), request_id));
+    }
+    let input = S3DataAuthorizationInput {
+        action,
+        bucket_name: "",
+        object_key: None,
+        version_id: None,
+        prefix: None,
+        delimiter: None,
+        max_keys: None,
+        secure_transport: s3_data_secure_transport(uri),
+        source_ip,
+    };
+    let principal = match load_s3_signed_policy_principal(
+        state,
+        auth,
+        input,
+        uri.path(),
+        request_id,
+    )
+    .await?
+    {
+        S3SignedPrincipalResolution::Principal(principal) => principal,
+        S3SignedPrincipalResolution::FailClosed => {
+            return Err(S3ApiError::access_denied(
+                "Access Denied.",
+                uri.path(),
+                request_id,
+            ));
+        }
+    };
+    if principal.identity_decision() != S3PolicyDecision::Allow {
+        return Err(S3ApiError::access_denied(
+            "Access Denied.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    Ok(S3AuthorizedAccountRequest {
+        application_id: auth.application.id,
+        account_id: principal.account_id().as_str().to_owned(),
+    })
+}
+
+/// Authorizes Bucket Policy management with the AWS owner-only rule.
+///
+/// Unlike ordinary same-account bucket operations, these actions require an
+/// explicit Identity Policy Allow. The policy attached to the target bucket
+/// cannot authorize its own read, replacement, status query, or deletion.
+async fn authorize_s3_signed_owner_bucket_request(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    action: S3PolicyAction,
+    bucket_name: &str,
+    uri: &Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &str,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    let authorization = authorize_s3_signed_identity_bucket_request(
+        state,
+        auth,
+        action,
+        bucket_name,
+        uri,
+        source_ip,
+        request_id,
+    )
+    .await?;
+    let identity = state
+        .repository
+        .resolve_s3_bucket_identity(bucket_name)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 owner-only bucket lookup failed");
+            S3ApiError::service_unavailable(uri.path(), request_id)
+        })?
+        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), request_id))?;
+    if identity.application_id != authorization.application_id
+        || identity.owner_account_id.as_str() != authorization.account_id
+    {
+        return Err(S3ApiError::method_not_allowed(
+            "The specified method is not allowed against this resource.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    Ok(S3AuthorizedDataRequest { bucket: identity })
+}
+
+/// Evaluates a Bucket-scoped action against the caller's Identity Policy
+/// without loading or consulting a Bucket Policy. This is required for
+/// owner-only management operations and for conditional CreateBucket
+/// permissions on a bucket that does not exist yet.
+async fn authorize_s3_signed_identity_bucket_request(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    action: S3PolicyAction,
+    bucket_name: &str,
+    uri: &Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &str,
+) -> Result<S3AuthorizedAccountRequest, S3ApiError> {
+    if action.scope() != S3PolicyResourceScope::Bucket {
+        warn!(action = action.as_str(), "non-bucket action passed to owner authorization");
+        return Err(S3ApiError::service_unavailable(uri.path(), request_id));
+    }
+    let input = S3DataAuthorizationInput {
+        action,
+        bucket_name,
+        object_key: None,
+        version_id: None,
+        prefix: None,
+        delimiter: None,
+        max_keys: None,
+        secure_transport: s3_data_secure_transport(uri),
+        source_ip,
+    };
+    let principal = match load_s3_signed_policy_principal(
+        state,
+        auth,
+        input,
+        uri.path(),
+        request_id,
+    )
+    .await?
+    {
+        S3SignedPrincipalResolution::Principal(principal) => principal,
+        S3SignedPrincipalResolution::FailClosed => {
+            return Err(S3ApiError::access_denied(
+                "Access Denied.",
+                uri.path(),
+                request_id,
+            ));
+        }
+    };
+    if principal.identity_decision() != S3PolicyDecision::Allow {
+        return Err(S3ApiError::access_denied(
+            "Access Denied.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    Ok(S3AuthorizedAccountRequest {
+        application_id: auth.application.id,
+        account_id: principal.account_id().as_str().to_owned(),
+    })
+}
+
 async fn authorize_s3_policy_principal_request(
     state: &AppState,
     input: S3DataAuthorizationInput<'_>,
@@ -305,6 +472,9 @@ fn s3_identity_policy_request<'a>(
     userid: &'a str,
 ) -> Option<S3IdentityPolicyRequest<'a>> {
     let mut request = match input.action.scope() {
+        S3PolicyResourceScope::Account if input.object_key.is_none() => {
+            S3IdentityPolicyRequest::account(input.action)
+        }
         S3PolicyResourceScope::Bucket if input.object_key.is_none() => {
             S3IdentityPolicyRequest::bucket(input.action, input.bucket_name)
         }

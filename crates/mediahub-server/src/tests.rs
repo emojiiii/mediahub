@@ -450,6 +450,28 @@ async fn create_s3_policy_test_access_key(
         .expect("persist access key");
 }
 
+async fn put_s3_test_identity_policy(
+    state: &AppState,
+    application_id: ApplicationId,
+    access_key_id: &str,
+    policy: &[u8],
+) {
+    let policy = mediahub_app::S3IdentityPolicyDocument::parse(policy)
+        .expect("parse S3 test identity policy");
+    mediahub_app::S3IdentityPolicyRepository::put_s3_identity_policy(
+        &state.repository,
+        &mediahub_app::PutS3IdentityPolicy {
+            application_id,
+            access_key_id: access_key_id.to_owned(),
+            policy,
+            updated_at: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .expect("persist S3 test identity policy")
+    .expect("S3 test access key");
+}
+
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
 async fn s3_bucket_policy_http_round_trip_enforces_wire_and_owner_semantics(pool: sqlx::PgPool) {
     let state = auth_test_state(pool, true).await;
@@ -475,6 +497,21 @@ async fn s3_bucket_policy_http_round_trip_enforces_wire_and_owner_semantics(pool
     let other_secret = "policy-other-secret";
     create_s3_policy_test_access_key(&state, owner_application.id, owner_key, owner_secret).await;
     create_s3_policy_test_access_key(&state, other_application.id, other_key, other_secret).await;
+    let policy_control_plane = br#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:CreateBucket","s3:GetBucketPolicy","s3:GetBucketPolicyStatus","s3:PutBucketPolicy","s3:DeleteBucketPolicy"],"Resource":"*"}}"#;
+    put_s3_test_identity_policy(
+        &state,
+        owner_application.id,
+        owner_key,
+        policy_control_plane,
+    )
+    .await;
+    put_s3_test_identity_policy(
+        &state,
+        other_application.id,
+        other_key,
+        policy_control_plane,
+    )
+    .await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -677,11 +714,17 @@ async fn s3_bucket_policy_http_round_trip_enforces_wire_and_owner_semantics(pool
     );
 
     for method in [Method::GET, Method::PUT, Method::DELETE] {
+        let cross_owner_body = if method == Method::PUT {
+            policy.clone()
+        } else {
+            Vec::new()
+        };
         let mut cross_owner = http::Request::builder()
             .method(method.clone())
             .uri(format!("{bucket_url}?policy"))
             .header("host", address.to_string())
-            .body(Vec::new())
+            .header(CONTENT_LENGTH, cross_owner_body.len())
+            .body(cross_owner_body)
             .expect("cross-owner policy request");
         sign_s3_test_request(&mut cross_owner, other_key, other_secret, None);
         let cross_owner = send_s3_test_request(&client, cross_owner).await;
@@ -838,6 +881,13 @@ async fn s3_bucket_object_lock_http_round_trip_is_signed_strict_and_persistent(p
         })
         .await
         .expect("persist access key");
+    put_s3_test_identity_policy(
+        &state,
+        application.id,
+        access_key_id,
+        br#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}"#,
+    )
+    .await;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
@@ -1412,6 +1462,17 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         })
         .await
         .expect("persist backup access key");
+    put_s3_test_identity_policy(
+        &state,
+        application.id,
+        backup_access_key_id,
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::{}"}}}}"#,
+            bucket.name()
+        )
+        .as_bytes(),
+    )
+    .await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");

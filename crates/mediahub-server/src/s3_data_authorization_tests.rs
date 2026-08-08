@@ -431,6 +431,13 @@ mod http_contract {
         let access_key_id = "mh_ak_data_policy_test";
         let secret = "data-policy-test-secret";
         create_data_policy_identity(&state, application_id, access_key_id, secret).await;
+        install_identity_policy(
+            &state,
+            application_id,
+            access_key_id,
+            r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}}"#,
+        )
+        .await;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -761,3 +768,4 @@ mod http_contract {
 }
 
 include!("s3_put_copy_policy_tests.rs");
+include!("s3_account_policy_tests.rs");

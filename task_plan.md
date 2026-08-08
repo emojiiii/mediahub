@@ -315,7 +315,7 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 - [completed] 7. Access Key Identity Policy persistence、管理 API 与控制台编辑器
 - [completed] 8. anonymous GetObject/HeadObject/ListObjectsV2 与 signed Identity + Bucket Policy 数据面决策
 - [completed] 9. 扩展统一授权到写入、Copy、Multipart、Tagging、ACL、Object Lock 与删除路径
-- [in_progress] 10. 扩展统一授权到 account、Bucket 配置、版本列表与 Lifecycle 控制面
+- [completed] 10. 扩展统一授权到 account、Bucket 配置、版本列表与 Lifecycle 控制面
 
 ## 不变量
 
@@ -347,3 +347,12 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 | 跨账户审计检索沿用不存在的 `auth.rs`，并再次向 Windows `rg` 传入未展开的 `s3_http*` 路径 glob | 1 | 已由前段输出确认真实定义位于 `http.rs`；后续使用真实文件和目录参数配合 `-g 's3_http*.rs'`，不重复错误路径 |
 | 修复签名 helper 的首个补丁误把 `task_plan.md` 表格上下文放在 `tests.rs` 文件段内 | 1 | 拆分为带显式文件切换的补丁后成功应用，未产生部分源码改动 |
 | 复查剩余 legacy 授权时再次把 `s3_http*.rs` 作为 Windows 路径参数传给 `rg`，第二段检索失败 | 1 | 第一段结果已完整取得；后续只传源码目录，并用 `-g 's3_http*.rs'` 过滤，不再复用路径 glob |
+| account 授权 helper 审计又把 `s3_http*.rs` 当作 Windows 路径参数，检索在返回部分输出后失败 | 1 | 立即改为 `crates/mediahub-server/src -g 's3_http*.rs'` 并取得完整结果；不再复制旧命令形态 |
+| account helper Server check 与三个并发控制面切片的中间态重叠：先有 8 个 `ConnectInfo` 缺参，第二次仅剩 PutBucketPolicy tuple 尚未打包 | 2 | 编译错误均为明确 dispatcher 签名同步问题；完整调用清单已发给负责 `s3_http_configuration.rs` 的代理，待并发文件稳定后统一复验 |
+| 第一轮控制面 strict Server Clippy 报告 4 个新增 `ConnectInfo` 后的 8/7 参数 handler | 1 | 已要求配置切片以 tuple extractor/request context 收敛并同步 callsite，明确禁止 lint allow；主线不降低 Clippy 门禁 |
+| 四组控制面合同首次使用 `--exact` 但过滤器未包含模块全名，实际执行为 0 tests | 1 | 立即去掉 `--exact` 重跑，并以输出中的 `running 1 test` 与完整模块名确认真实执行 |
+| Bucket 配置合同创建 Object Lock Bucket 时只给了 `s3:CreateBucket`，与新实现的 AWS 附加权限要求冲突 | 1 | 只补测试 owner 的 `s3:PutBucketObjectLockConfiguration` 与 `s3:PutBucketVersioning`，不回退生产鉴权 |
+| 全工作区回归只设置 `DATABASE_URL`，PostgreSQL destructive contract 因缺少 `MEDIAHUB_TEST_POSTGRES_URL` 在执行前终止 | 1 | 专用 PG17 容器无卷且使用 tmpfs；补齐同一容器的 destructive-test URL 后从头重跑全量 |
+| 统一移除 legacy S3 权限回退后，全量 Server 回归发现 6 个旧 HTTP 夹具仍依赖 access-key permissions 创建 Bucket/探测 Bucket | 1 | 为每个夹具补精确 Identity Policy（Object Lock 创建另含两项 AWS 附加动作），保留“无 Policy 默认拒绝”的生产语义 |
+| 修复旧夹具后，跨账户 `PutBucketPolicy` 仍以空 body 请求 owner 语义，先命中协议 `411 LengthRequired` 而非预期 `405` | 1 | 改为发送合法、带 Content-Length 的 Policy body，使测试跨过线协议校验后再验证 owner-only 语义 |
+| 最终文档陈旧标记检索使用了过宽的“尚未迁移”，误命中非 S3 Policy 的旧 Media 消费者说明 | 1 | 缩小为本轮已删除的具体 Policy 待接线句式，不修改仍然真实的 Media 迁移说明 |

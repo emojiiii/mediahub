@@ -173,6 +173,21 @@ async fn s3_delete_policy_http_contract_enforces_actions_batch_bypass_and_target
     let client = reqwest::Client::new();
     let bucket_name = "delete-policy-assets";
     let bucket_url = format!("http://{address}/{bucket_name}");
+    put_delete_identity_policy(
+        &state,
+        owner_application.id,
+        owner_key,
+        serde_json::json!({
+            "Effect": "Allow",
+            "Action": [
+                "s3:CreateBucket",
+                "s3:PutBucketObjectLockConfiguration",
+                "s3:PutBucketVersioning"
+            ],
+            "Resource": "*"
+        }),
+    )
+    .await;
     let mut create_bucket = http::Request::builder()
         .method(Method::PUT)
         .uri(&bucket_url)

@@ -29,17 +29,33 @@ async fn s3_get_bucket_object_lock(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::GetBucketObjectLockConfiguration,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
     let configuration = state
         .repository
-        .get_s3_bucket_configuration(auth.application.id, &bucket_name)
+        .get_s3_bucket_configuration(authorization.application_id(), &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 GetObjectLockConfiguration lookup failed");
@@ -64,17 +80,31 @@ async fn s3_put_bucket_object_lock(
     Path(bucket_name): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request_context: (
+        HeaderMap,
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
     content: Bytes,
 ) -> Result<Response, S3ApiError> {
+    let (headers, connect_info, request_id) = request_context;
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
             .await?;
-    auth.authorize("bucket:manage")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_signed_bucket_configuration(
+        &state,
+        &auth,
+        S3BucketConfigurationAuthorization {
+            action: S3PolicyAction::PutBucketObjectLockConfiguration,
+            bucket_name: &bucket_name,
+            uri: &uri,
+            connect_info: connect_info.as_ref(),
+            request_id: &request_id.0.0,
+        },
+    )
+    .await?;
     validate_s3_configuration_content_md5(&headers, &content, &uri, &request_id.0.0)?;
     let default_retention = parse_s3_bucket_object_lock_xml(&content).map_err(|error| match error {
         S3BucketConfigurationXmlError::MalformedXml => {
@@ -90,7 +120,7 @@ async fn s3_put_bucket_object_lock(
     state
         .repository
         .replace_s3_bucket_object_lock(
-            auth.application.id,
+            authorization.application_id(),
             &bucket_name,
             default_retention,
             OffsetDateTime::now_utc(),
@@ -99,6 +129,16 @@ async fn s3_put_bucket_object_lock(
         .map_err(|error| {
             map_s3_configuration_repository_error(error, uri.path(), &request_id.0.0)
         })?;
+    record_s3_resource_audit(
+        &state,
+        &auth,
+        authorization.application_id(),
+        &request_id.0.0,
+        "s3.bucket.object_lock_updated",
+        ("bucket", bucket_name),
+        serde_json::json!({ "default_retention_configured": default_retention.is_some() }),
+    )
+    .await;
     Ok(s3_empty_response(StatusCode::OK, &request_id.0.0))
 }
 

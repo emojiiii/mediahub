@@ -218,6 +218,15 @@ mod put_copy_http_contract {
             .expect("S3 Put/Copy HTTP client");
         let target_bucket = "put-copy-target";
         let external_bucket = "put-copy-external";
+        for account in [&owner, &external] {
+            install_identity_policy(
+                &state,
+                account.application_id,
+                account.access_key_id,
+                r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}}"#,
+            )
+            .await;
+        }
         create_bucket(&client, address, &owner, target_bucket).await;
         create_bucket(&client, address, &external, external_bucket).await;
 

@@ -123,6 +123,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -146,6 +147,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -157,6 +159,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -168,6 +171,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -179,6 +183,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -190,6 +195,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -201,6 +207,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -213,10 +220,14 @@ pub(super) async fn s3_bucket_put(
     Path(bucket_name): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request_context: (
+        HeaderMap,
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
     content: Body,
 ) -> Result<Response, S3ApiError> {
+    let (headers, connect_info, request_id) = request_context;
     let operation = classify_s3_bucket_put(&uri, &request_id.0.0)?;
     if operation == S3BucketPutOperation::PutPolicy {
         return s3_put_bucket_policy(
@@ -224,7 +235,7 @@ pub(super) async fn s3_bucket_put(
             Path(bucket_name),
             OriginalUri(uri),
             method,
-            headers,
+            (headers, connect_info),
             request_id,
             content,
         )
@@ -240,8 +251,7 @@ pub(super) async fn s3_bucket_put(
                 Path(bucket_name),
                 OriginalUri(uri),
                 method,
-                headers,
-                request_id,
+                (headers, connect_info, request_id),
                 content,
             )
             .await
@@ -253,8 +263,7 @@ pub(super) async fn s3_bucket_put(
                 Path(bucket_name),
                 OriginalUri(uri),
                 method,
-                headers,
-                request_id,
+                (headers, connect_info, request_id),
                 content,
             )
             .await
@@ -265,8 +274,7 @@ pub(super) async fn s3_bucket_put(
                 Path(bucket_name),
                 OriginalUri(uri),
                 method,
-                headers,
-                request_id,
+                (headers, connect_info, request_id),
                 content,
             )
             .await
@@ -277,8 +285,7 @@ pub(super) async fn s3_bucket_put(
                 Path(bucket_name),
                 OriginalUri(uri),
                 method,
-                headers,
-                request_id,
+                (headers, connect_info, request_id),
                 content,
             )
             .await
@@ -292,6 +299,7 @@ pub(super) async fn s3_bucket_delete(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     let operation = classify_s3_bucket_delete(&uri, &request_id.0.0)?;
@@ -303,6 +311,7 @@ pub(super) async fn s3_bucket_delete(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -314,6 +323,7 @@ pub(super) async fn s3_bucket_delete(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -325,6 +335,7 @@ pub(super) async fn s3_bucket_delete(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -338,17 +349,33 @@ async fn s3_get_bucket_versioning(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::GetBucketVersioning,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
     let status = state
         .repository
-        .get_s3_bucket_versioning(auth.application.id, &bucket_name)
+        .get_s3_bucket_versioning(authorization.application_id(), &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 GetBucketVersioning lookup failed");
@@ -367,17 +394,31 @@ async fn s3_put_bucket_versioning(
     Path(bucket_name): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request_context: (
+        HeaderMap,
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
     content: Bytes,
 ) -> Result<Response, S3ApiError> {
+    let (headers, connect_info, request_id) = request_context;
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
             .await?;
-    auth.authorize("bucket:manage")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_signed_bucket_configuration(
+        &state,
+        &auth,
+        S3BucketConfigurationAuthorization {
+            action: S3PolicyAction::PutBucketVersioning,
+            bucket_name: &bucket_name,
+            uri: &uri,
+            connect_info: connect_info.as_ref(),
+            request_id: &request_id.0.0,
+        },
+    )
+    .await?;
     validate_s3_configuration_content_md5(&headers, &content, &uri, &request_id.0.0)?;
     let status = parse_s3_bucket_versioning_xml(&content).map_err(|error| match error {
         S3BucketConfigurationXmlError::MalformedXml => {
@@ -393,7 +434,7 @@ async fn s3_put_bucket_versioning(
     state
         .repository
         .set_s3_bucket_versioning(
-            auth.application.id,
+            authorization.application_id(),
             &bucket_name,
             status,
             OffsetDateTime::now_utc(),
@@ -402,6 +443,22 @@ async fn s3_put_bucket_versioning(
         .map_err(|error| {
             map_s3_configuration_repository_error(error, uri.path(), &request_id.0.0)
         })?;
+    record_s3_resource_audit(
+        &state,
+        &auth,
+        authorization.application_id(),
+        &request_id.0.0,
+        "s3.bucket.versioning_updated",
+        ("bucket", bucket_name),
+        serde_json::json!({
+            "status": match status {
+                VersioningStatus::Unversioned => "Unversioned",
+                VersioningStatus::Enabled => "Enabled",
+                VersioningStatus::Suspended => "Suspended",
+            }
+        }),
+    )
+    .await;
     Ok(s3_empty_response(StatusCode::OK, &request_id.0.0))
 }
 
@@ -411,17 +468,33 @@ async fn s3_get_bucket_lifecycle_configuration(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::GetLifecycleConfiguration,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
     let configuration = state
         .repository
-        .get_s3_bucket_configuration(auth.application.id, &bucket_name)
+        .get_s3_bucket_configuration(authorization.application_id(), &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 GetBucketLifecycleConfiguration lookup failed");
@@ -451,17 +524,31 @@ async fn s3_put_bucket_lifecycle_configuration(
     Path(bucket_name): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
-    headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request_context: (
+        HeaderMap,
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
     content: Bytes,
 ) -> Result<Response, S3ApiError> {
+    let (headers, connect_info, request_id) = request_context;
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
             .await?;
-    auth.authorize("bucket:manage")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_signed_bucket_configuration(
+        &state,
+        &auth,
+        S3BucketConfigurationAuthorization {
+            action: S3PolicyAction::PutLifecycleConfiguration,
+            bucket_name: &bucket_name,
+            uri: &uri,
+            connect_info: connect_info.as_ref(),
+            request_id: &request_id.0.0,
+        },
+    )
+    .await?;
     validate_s3_configuration_content_md5(&headers, &content, &uri, &request_id.0.0)?;
     let lifecycle = parse_s3_bucket_lifecycle_xml(&content).map_err(|error| match error {
         S3BucketConfigurationXmlError::MalformedXml => {
@@ -488,7 +575,7 @@ async fn s3_put_bucket_lifecycle_configuration(
     state
         .repository
         .replace_s3_bucket_lifecycle(
-            auth.application.id,
+            authorization.application_id(),
             &bucket_name,
             Some(document),
             OffsetDateTime::now_utc(),
@@ -497,6 +584,16 @@ async fn s3_put_bucket_lifecycle_configuration(
         .map_err(|error| {
             map_s3_configuration_repository_error(error, uri.path(), &request_id.0.0)
         })?;
+    record_s3_resource_audit(
+        &state,
+        &auth,
+        authorization.application_id(),
+        &request_id.0.0,
+        "s3.bucket.lifecycle_updated",
+        ("bucket", bucket_name),
+        serde_json::json!({ "configured": true }),
+    )
+    .await;
     Ok(s3_empty_response(StatusCode::OK, &request_id.0.0))
 }
 
@@ -506,18 +603,29 @@ async fn s3_delete_bucket_lifecycle_configuration(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|()| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("bucket:manage")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let authorization = authorize_s3_signed_bucket_configuration(
+        &state,
+        &auth,
+        S3BucketConfigurationAuthorization {
+            action: S3PolicyAction::DeleteLifecycleConfiguration,
+            bucket_name: &bucket_name,
+            uri: &uri,
+            connect_info: connect_info.as_ref(),
+            request_id: &request_id.0.0,
+        },
+    )
+    .await?;
     state
         .repository
         .replace_s3_bucket_lifecycle(
-            auth.application.id,
+            authorization.application_id(),
             &bucket_name,
             None,
             OffsetDateTime::now_utc(),
@@ -526,7 +634,50 @@ async fn s3_delete_bucket_lifecycle_configuration(
         .map_err(|error| {
             map_s3_configuration_repository_error(error, uri.path(), &request_id.0.0)
         })?;
+    record_s3_resource_audit(
+        &state,
+        &auth,
+        authorization.application_id(),
+        &request_id.0.0,
+        "s3.bucket.lifecycle_deleted",
+        ("bucket", bucket_name),
+        serde_json::json!({ "configured": false }),
+    )
+    .await;
     Ok(s3_empty_response(StatusCode::NO_CONTENT, &request_id.0.0))
+}
+
+struct S3BucketConfigurationAuthorization<'a> {
+    action: S3PolicyAction,
+    bucket_name: &'a str,
+    uri: &'a Uri,
+    connect_info: Option<&'a Extension<ConnectInfo<SocketAddr>>>,
+    request_id: &'a str,
+}
+
+async fn authorize_s3_signed_bucket_configuration(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    request: S3BucketConfigurationAuthorization<'_>,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    authorize_s3_signed_data_request(
+        state,
+        auth,
+        S3DataAuthorizationInput {
+            action: request.action,
+            bucket_name: request.bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(request.uri),
+            source_ip: s3_data_source_ip(request.connect_info),
+        },
+        request.uri.path(),
+        request.request_id,
+    )
+    .await
 }
 
 fn validate_s3_configuration_content_md5(
@@ -1139,6 +1290,9 @@ fn s3_bucket_lifecycle_xml(document: &S3LifecycleDocument) -> String {
     xml.push_str("</LifecycleConfiguration>");
     xml
 }
+
+#[cfg(test)]
+include!("s3_bucket_configuration_policy_tests.rs");
 
 #[derive(Debug)]
 struct S3ConfigurationXmlElement {

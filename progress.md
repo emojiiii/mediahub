@@ -219,3 +219,8 @@
 - 主线补齐 AWS 标准 `GetObjectVersionAcl` / `PutObjectVersionAcl` Core action 与 versionId 映射，并依据 AWS 官方权限表补齐 Put/Copy/CreateMultipart 的条件附加 action。
 - Docker Desktop 上新建 tmpfs、无 volume 的 PostgreSQL 17 容器完成 fresh 0001→0015 全工作区 all-targets 回归：PG adapter 30/30、App 64/64、Core 80/80、Server 184/184，全部 PostgreSQL contracts 通过；仅外部真实 S3 contract 按环境约定 ignored。
 - Workspace strict Clippy `-D warnings`、fmt、git diff check 与 Raw SigV4 offline golden 全部通过。下一步先创建本地 checkpoint commit（不 push），再并发推进 account、ListObjectVersions 与 Bucket 配置控制面授权。
+- 已创建本地 checkpoint `c4ed4a9 feat: enforce S3 policies across object operations`，未 push；随后并发完成 Bucket 基础、Bucket 配置与 owner-only Bucket Policy 三个控制面切片。
+- ListBuckets/CreateBucket、ListObjectVersions、Head/GetLocation/DeleteBucket、Versioning/Lifecycle/Object Lock 配置与 Bucket Policy 管理均已接入精确 action；CreateBucket Object Lock 同时要求 `PutBucketObjectLockConfiguration` 和 `PutBucketVersioning`。
+- 新增四组真实 PG17 HTTP 合同，覆盖 account action、匿名 Bucket 读取、跨账户目标租户/审计、配置请求体 SigV4、Bucket Policy 不可自授权和 auth-before-resource；所有旧 S3 permissions fallback 已从生产 handler 移除。
+- 最终全 workspace all-targets 回归通过：PG adapter 30/30、App 64/64、Core 80/80、Server 189/189，全部 PostgreSQL contracts 通过；仅外部真实 S3 contract 按环境约定 ignored。
+- Workspace strict Clippy（all features/targets）、fmt check、git diff check 与 Raw SigV4 golden 全部通过；临时 PG17 容器确认 mounts=[] 后已按精确名称删除。
