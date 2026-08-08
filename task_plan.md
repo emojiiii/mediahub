@@ -356,3 +356,47 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 | 统一移除 legacy S3 权限回退后，全量 Server 回归发现 6 个旧 HTTP 夹具仍依赖 access-key permissions 创建 Bucket/探测 Bucket | 1 | 为每个夹具补精确 Identity Policy（Object Lock 创建另含两项 AWS 附加动作），保留“无 Policy 默认拒绝”的生产语义 |
 | 修复旧夹具后，跨账户 `PutBucketPolicy` 仍以空 body 请求 owner 语义，先命中协议 `411 LengthRequired` 而非预期 `405` | 1 | 改为发送合法、带 Content-Length 的 Policy body，使测试跨过线协议校验后再验证 owner-only 语义 |
 | 最终文档陈旧标记检索使用了过宽的“尚未迁移”，误命中非 S3 Policy 的旧 Media 消费者说明 | 1 | 缩小为本轮已删除的具体 Policy 待接线句式，不修改仍然真实的 Media 迁移说明 |
+| 下一切片首次迁移检索误把 workspace 根 `migrations` 当作存在路径，实际迁移位于 PostgreSQL adapter crate | 1 | 改用已确认的 `crates/mediahub-adapter-postgres/migrations` 精确目录，不重复虚构根路径 |
+| 使用只匹配 `/` 的 migration 文件正则未命中 Windows `rg --files` 返回的反斜杠路径 | 1 | 直接对精确 migrations 目录运行 `rg --files`，避免依赖平台路径分隔符 |
+| 下一切片 classifier 检索再次把 `s3_http*.rs` 作为 Windows 路径参数传给 `rg` | 1 | 改用源码目录参数配合 `-g 's3_http*.rs'`；此后本切片禁止路径 glob |
+
+---
+
+# S3 CORS、Bucket Tagging、SSE-S3 与 Notification 纵向切片（2026-08-08）
+
+## 目标
+
+在本地提交 `73a2ebf` 之后继续补齐 PrismArk 尚未实现的 S3 能力。第一批并发完成 CORS 与 Bucket Tagging 的严格协议/领域基础，并对 SSE-S3 和 Notification 做安全、事务与模块边界审计；随后由主线接入迁移、Repository、精确 Policy action、handler 与真实 PG17 合同。SSE 不允许只回显 `AES256` 而底层明文存储，Notification 不允许绕过现有事务 outbox 或目标 SSRF 验证。
+
+## 阶段
+
+- [completed] 1. 并发完成 CORS/Bucket Tagging 协议基础与 SSE-S3/Notification 文件级审计
+- [completed] 2. 建立 Bucket 配置持久化、revision、Repository 与精确 Policy action
+- [completed] 3. 接入 GET/PUT/DELETE handlers、错误顺序、匿名/跨账户授权与审计
+- [completed] 4. 实现能安全闭环的 SSE/Notification 最小切片，无法闭环的部分保持明确拒绝
+- [completed] 5. 执行 fresh PG17、workspace、strict Clippy、SigV4/native-client 回归并更新文档
+- [completed] 6. 创建下一本地提交，不 push
+
+## 不变量
+
+- CORS：最多 100 条规则，PUT 必须校验精确 body SigV4 与 Content-MD5；GET/PUT/DELETE 使用标准 `GetBucketCORS` / `PutBucketCORS` action，缺配置返回标准错误。
+- Bucket Tagging：GET 使用 `GetBucketTagging`，PUT/DELETE 使用 `PutBucketTagging`；复用严格 TagSet 约束但与 ObjectVersion 标签独立持久化。
+- SSE-S3：必须真实 AES-GCM 加密 at rest，持久化 key version/nonce/tag，且不破坏 ETag/checksum、Range、Copy、Multipart 与 GC；未完成这些条件前继续明确拒绝。
+- Notification：配置替换原子化，事件与 ObjectVersion mutation 同事务写 outbox；投递有幂等、lease、重试、目标验证和 SSRF 防护，不把现有产品 Webhook 冒充 SNS/SQS/Lambda。
+- 所有新增 S3 operation 必须同时接入标准 Policy action，不回退旧 permissions；不 commit/push 的约束延续到本切片最终门禁。
+
+## 错误记录
+
+| 错误 | 尝试 | 处理 |
+|---|---:|---|
+| 并发文件检查误将多个文件名以数组传给 PowerShell `Get-ChildItem -Filter`，该参数只接受单个字符串 | 1 | 改用 `rg --files` 或 `Get-ChildItem` 后通过 `Where-Object` 精确筛选；不再向 `-Filter` 传数组 |
+| 用锚定正则检索 CORS 文件公开项时未考虑其内容封装在子模块并带缩进，`rg` 预期无匹配返回 1 | 1 | 改用 `Get-Content` 和非锚定 `Select-String` 读取真实模块结构，不把可选检索与主命令混合 |
+| 首次接入实际请求 CORS 中间件时借用了 request URI 中的 `&str` Bucket 名，并在 `next.run(request)` 后继续使用，触发 Rust move/borrow 冲突 | 1 | 在移动 request 前将 Bucket 名复制为受控小字符串；Server binary 随后编译通过 |
+| 首轮 Core/App/Server 联合测试未设置 `DATABASE_URL`，纯单元测试全部通过但 30 个 SQLx HTTP 合同按设计在启动时失败 | 1 | 不修改或跳过数据库合同；启动无卷 PostgreSQL 17，后续同时设置 `DATABASE_URL` 与 `MEDIAHUB_TEST_POSTGRES_URL` 从头复验 |
+| 临时 PostgreSQL 首选宿主端口 55439 未出现在 Listen 查询中，但落入 Windows 动态排除范围，Docker 创建后绑定失败 | 1 | 核对失败容器 `Mounts=[]` 后按精确名称删除；读取系统排除范围并改用未排除的 56017，容器成功就绪且仍为无卷 tmpfs |
+| 首轮 workspace strict Clippy 报告 CORS 响应装饰中的嵌套 `if let` 可折叠 | 1 | 按 Rust let-chain 收敛控制流，不添加 lint 豁免；随后重跑完整门禁 |
+| 完整 workspace 回归首次用过短的命令超时，Cargo 进程在 5 秒后被终止 | 1 | 改用 240 秒上限重跑，不将长回归当作短诊断命令 |
+| fail-closed Bucket 子资源分类使旧测试中 `?policystatus` 回落 `ListObjects` 的断言失效 | 1 | 更新为 `Unsupported("policystatus")`；保留 query 名大小写敏感，同时防止错拼子资源触发数据操作 |
+| 最终 strict Clippy 首次仍误用 1 秒命令上限，被工具的 5 秒最小等待终止 | 1 | 改用 240 秒上限重跑并通过；后续所有 workspace 级 Cargo 门禁不再使用短超时 |
+| 最后 Server 回归首次未将 `DATABASE_URL` 传入新 PowerShell 进程，33 条 SQLx 测试在初始化阶段失败 | 1 | 确认无业务断言失败后，同时设置 `DATABASE_URL` 与 `MEDIAHUB_TEST_POSTGRES_URL` 重跑，Server 226/226 通过 |
+| 搜索 checksum helper 时又将 `s3_http_*` 作为 Windows 路径 glob 传给 `rg` | 1 | 结果已从精确文件取得；后续只传目录并使用 `-g` 过滤 |

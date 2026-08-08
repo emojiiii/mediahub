@@ -8,6 +8,7 @@ mod data_plane;
 mod idempotency;
 mod media;
 mod outbox;
+mod s3_bucket_configuration;
 mod s3_bucket_policy;
 mod s3_identity_policy;
 mod s3_lifecycle;

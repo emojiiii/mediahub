@@ -12,6 +12,7 @@ mod media;
 mod metadata;
 mod object_version;
 mod s3_bucket;
+mod s3_cors;
 mod s3_lifecycle;
 mod s3_policy;
 mod s3_storage;
@@ -47,6 +48,11 @@ pub use s3_bucket::{
     PersistedBucketS3Configuration, PersistedS3Bucket, RetentionMode, S3Bucket, S3ModelError,
     VersioningStatus,
 };
+pub use s3_cors::{
+    MAX_S3_CORS_HEADER_BYTES, MAX_S3_CORS_HEADERS_PER_RULE, MAX_S3_CORS_ID_CHARACTERS,
+    MAX_S3_CORS_ORIGIN_BYTES, MAX_S3_CORS_ORIGINS_PER_RULE, MAX_S3_CORS_RULES, S3CorsConfiguration,
+    S3CorsError, S3CorsMethod, S3CorsRule,
+};
 pub use s3_lifecycle::{
     MAX_S3_LIFECYCLE_RULES, S3AbortIncompleteMultipartUpload, S3Expiration,
     S3LifecycleConfiguration, S3LifecycleFilter, S3LifecycleRule, S3LifecycleRuleStatus,
@@ -70,8 +76,8 @@ pub use s3_storage::{
     UploadIntentId, UploadIntentState,
 };
 pub use s3_tagging::{
-    MAX_S3_OBJECT_TAG_KEY_CHARS, MAX_S3_OBJECT_TAG_VALUE_CHARS, MAX_S3_OBJECT_TAGS, S3ObjectTag,
-    S3ObjectTagSet, S3TaggingError,
+    MAX_S3_BUCKET_TAGS, MAX_S3_OBJECT_TAG_KEY_CHARS, MAX_S3_OBJECT_TAG_VALUE_CHARS,
+    MAX_S3_OBJECT_TAGS, S3BucketTagSet, S3ObjectTag, S3ObjectTagSet, S3TaggingError,
 };
 pub use upload_session::{
     NewUploadSession, PersistedUploadSession, UploadSession, UploadSessionState,

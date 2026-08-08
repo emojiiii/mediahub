@@ -172,6 +172,10 @@ pub enum S3PolicyAction {
     DeleteLifecycleConfiguration,
     GetBucketObjectLockConfiguration,
     PutBucketObjectLockConfiguration,
+    GetBucketCors,
+    PutBucketCors,
+    GetBucketTagging,
+    PutBucketTagging,
     GetBucketPolicy,
     GetBucketPolicyStatus,
     PutBucketPolicy,
@@ -204,7 +208,7 @@ pub enum S3PolicyAction {
 }
 
 impl S3PolicyAction {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 44] = [
         Self::ListAllMyBuckets,
         Self::CreateBucket,
         Self::ListBucket,
@@ -218,6 +222,10 @@ impl S3PolicyAction {
         Self::DeleteLifecycleConfiguration,
         Self::GetBucketObjectLockConfiguration,
         Self::PutBucketObjectLockConfiguration,
+        Self::GetBucketCors,
+        Self::PutBucketCors,
+        Self::GetBucketTagging,
+        Self::PutBucketTagging,
         Self::GetBucketPolicy,
         Self::GetBucketPolicyStatus,
         Self::PutBucketPolicy,
@@ -262,6 +270,10 @@ impl S3PolicyAction {
             Self::DeleteLifecycleConfiguration => "s3:DeleteLifecycleConfiguration",
             Self::GetBucketObjectLockConfiguration => "s3:GetBucketObjectLockConfiguration",
             Self::PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
+            Self::GetBucketCors => "s3:GetBucketCORS",
+            Self::PutBucketCors => "s3:PutBucketCORS",
+            Self::GetBucketTagging => "s3:GetBucketTagging",
+            Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::GetBucketPolicy => "s3:GetBucketPolicy",
             Self::GetBucketPolicyStatus => "s3:GetBucketPolicyStatus",
             Self::PutBucketPolicy => "s3:PutBucketPolicy",
@@ -306,6 +318,10 @@ impl S3PolicyAction {
             | Self::DeleteLifecycleConfiguration
             | Self::GetBucketObjectLockConfiguration
             | Self::PutBucketObjectLockConfiguration
+            | Self::GetBucketCors
+            | Self::PutBucketCors
+            | Self::GetBucketTagging
+            | Self::PutBucketTagging
             | Self::GetBucketPolicy
             | Self::GetBucketPolicyStatus
             | Self::PutBucketPolicy
@@ -322,7 +338,7 @@ impl S3PolicyAction {
     }
 }
 
-const S3_BUCKET_POLICY_ACTIONS: [S3PolicyAction; 38] = [
+const S3_BUCKET_POLICY_ACTIONS: [S3PolicyAction; 42] = [
     S3PolicyAction::ListBucket,
     S3PolicyAction::ListBucketVersions,
     S3PolicyAction::ListBucketMultipartUploads,
@@ -334,6 +350,10 @@ const S3_BUCKET_POLICY_ACTIONS: [S3PolicyAction; 38] = [
     S3PolicyAction::DeleteLifecycleConfiguration,
     S3PolicyAction::GetBucketObjectLockConfiguration,
     S3PolicyAction::PutBucketObjectLockConfiguration,
+    S3PolicyAction::GetBucketCors,
+    S3PolicyAction::PutBucketCors,
+    S3PolicyAction::GetBucketTagging,
+    S3PolicyAction::PutBucketTagging,
     S3PolicyAction::GetBucketPolicy,
     S3PolicyAction::GetBucketPolicyStatus,
     S3PolicyAction::PutBucketPolicy,

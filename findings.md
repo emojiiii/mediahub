@@ -261,3 +261,13 @@
 - Bucket Policy GET/PUT/DELETE 与 PolicyStatus 只接受 Bucket owner 的相应 Identity Policy action；目标 Bucket Policy 不能为自己的管理请求授权。PUT 仍先完成长度、摘要、SigV4 与严格 JSON 解析，再执行 owner 授权。
 - 当前生产 `s3*.rs` handler 已无 `ApplicationAuth::authorize` 旧 permissions 授权调用；旧 permissions 仅继续服务 JSON/WebDAV 等非 S3 产品接口。
 - 参考：AWS CreateBucket https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html 。
+
+## S3 CORS、Bucket Tagging、SSE 与 Notification 审计（2026-08-08）
+
+- Bucket CORS 与 Bucket Tagging 必须是彼此独立的 Bucket 文档和 revision，不能复用 Lifecycle revision。PUT 均先验证精确 body SigV4，再校验强制 Content-MD5、严格 XML 和精确 Policy action；DELETE CORS/Tagging 分别复用 `PutBucketCORS` / `PutBucketTagging` action。
+- Bucket Tagging 的 AWS 上限是 50，Object Tagging 才是 10；两者可以复用单标签 key/value 规则，但不能复用集合类型。GET 未配置分别返回 `NoSuchCORSConfiguration` 与 `NoSuchTagSet`。
+- CORS 运行时按配置顺序选择第一条同时匹配 Origin、method 和全部 requested headers 的规则。CORS 只控制浏览器响应头，不替代 Identity/Bucket Policy 授权；S3 listener 不能继续复用控制台全局 CORS 白名单。
+- 当前 Local/外部 S3 ObjectStore 都保存请求原始字节，UploadIntent/ObjectVersion/Multipart 也没有 nonce、wrapped DEK 或 key version。只回显 `AES256` 会形成假加密；在分块 AES-256-GCM 信封加密、Range/Copy/Multipart/预览/DAV/GC 全链路完成前，所有 SSE-S3/KMS/C 相关头必须 fail-closed。
+- 真正 SSE-S3 应位于逻辑 payload 与 raw ObjectStore 之间，明文 ETag/checksum/size 与密文 provider metadata 分离；每对象随机 DEK、版本化 KEK 包裹、每块独立认证，Copy 生成新 DEK，所有读取入口先认证再释放明文。
+- Notification 不能在 HTTP 成功后直接发送。对象 mutation 与目标 delivery 必须同事务写 outbox；现有 worker 的自定义 payload、低吞吐和 endpoint 硬删除不满足 AWS S3 event/at-least-once，需要 payload format、稳定 sequencer、targeted outbox、endpoint 软删除和共享 SSRF-safe transport 的独立切片。
+- 参考：AWS Put/Get/DeleteBucketCors、Put/Get/DeleteBucketTagging、REST OPTIONS、SSE-S3 与 PutBucketNotificationConfiguration 官方 API 文档。

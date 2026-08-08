@@ -224,3 +224,16 @@
 - 新增四组真实 PG17 HTTP 合同，覆盖 account action、匿名 Bucket 读取、跨账户目标租户/审计、配置请求体 SigV4、Bucket Policy 不可自授权和 auth-before-resource；所有旧 S3 permissions fallback 已从生产 handler 移除。
 - 最终全 workspace all-targets 回归通过：PG adapter 30/30、App 64/64、Core 80/80、Server 189/189，全部 PostgreSQL contracts 通过；仅外部真实 S3 contract 按环境约定 ignored。
 - Workspace strict Clippy（all features/targets）、fmt check、git diff check 与 Raw SigV4 golden 全部通过；临时 PG17 容器确认 mounts=[] 后已按精确名称删除。
+- 已创建本地 checkpoint `73a2ebf feat: complete S3 policy enforcement`，未 push；随后并发启动 CORS、Bucket Tagging、SSE-S3 与 Notification 切片。
+- 已完成 CORS Core 严格模型和 XML 协议、Bucket Tagging 独立 50-tag 模型与 XML 协议；`0016`、App repository 端口和 PostgreSQL adapter 为两类配置提供独立 document/revision/tenant fence。
+- CORS/Tagging GET/PUT/DELETE 已接入精确 `Get/PutBucketCORS` 与 `Get/PutBucketTagging` action、expected-owner、匿名/跨账户 Bucket Policy、目标租户 persistence/audit、标准缺配置错误和 Content-MD5。
+- S3 router 已删除控制台全局 CORS layer，新增 Bucket 配置驱动的 OPTIONS 首条规则匹配与实际响应头中间件；CORS 不绕过底层 S3 鉴权。
+- SSE-S3 审计确认当前底层仍为明文，已先完成 P0 fail-closed：Put/Get/Head/Copy/Multipart/Post/Delete 的 SSE-S3/KMS/C 与 copy-source SSE-C 请求头全部明确 NotImplemented，不回显 AES256。
+- Notification 审计已给出事务 outbox、AWS 2.5 payload、稳定 sequencer、endpoint 生命周期和 SSRF transport 的文件级实施边界；本切片不冒充 SNS/SQS/Lambda，也不在对象事务外直接发送。
+- 临时无卷 tmpfs PostgreSQL 17 上，fresh `0001`→`0016`、CORS/Tagging persistence contract 1/1、PG adapter 全量 31/31 及全部 PG contracts 通过；Server 全量 219/219、Core 88/88、App 65/65 通过。
+- Workspace strict Clippy（all features/targets）已通过；当前等待新增真实 CORS/Tagging HTTP 合同与只读协议审查收口，再执行最终全 workspace 回归和本地提交，不 push。
+- 新增 3 条真实 PG17/Axum/SigV4 CORS/Tagging HTTP 合同，覆盖 MD5、expected owner、目标租户审计、跨账户 Allow/Deny、OPTIONS 首条规则与实际响应头；并补齐 checksum 声明/响应头配对单测。
+- 只读审查指出的 Bucket Encryption/Notification/未知子资源回落、CORS `Vary`/暴露头/首条规则、SSE PutObjectAcl 路径、重复 MD5 与 Bucket Tagging namespace 问题均已收口；未支持能力保持 fail-closed。
+- 最终 fresh `0001`→`0016` 工作区 all-targets 回归通过：Server 226/226、Core 88/88、App 65/65、PostgreSQL adapter 31/31，全部 PostgreSQL contracts 通过；仅需要外部独立 S3 凭据的 adapter contract 按环境约定 ignored。
+- Raw SigV4 offline golden、workspace strict Clippy（all targets/features）、fmt check 与 diff check 全部通过。
+- 临时 PG17 容器 `prismark-s3-cors-pg17-0808` 经确认 `Mounts=[]` 后按精确名称删除，且终态查询为空；本切片准备创建本地提交，不 push。

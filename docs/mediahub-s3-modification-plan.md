@@ -20,22 +20,22 @@
 | List/Delete | 核心完成 | ListObjectsV2 与 ListObjectVersions 的分页/marker/prefix/delimiter；DeleteObject/DeleteObjects 的 marker/null/lock/GC 语义 | ListObjectsV1 与更多 golden/客户端测试 |
 | Multipart | 核心完成 | Create/UploadPart/ListParts/Complete/Abort/ListMultipartUploads/UploadPartCopy；Part MD5、标准 multipart ETag、恢复与重放、ObjectVersion 原子提交、持久 GC | 真实客户端并发与故障注入矩阵 |
 | Application Quota | 已完成当前 S3 闭环 | S3 Put/Copy/Multipart reservation/commit/abort/expiry、Unversioned/Suspended null replacement、永久删除与 Lifecycle 已统一接入 `used_bytes/reserved_bytes`；Memory + PostgreSQL 17 contract 通过 | 增加高并发死锁/竞争 soak 与真实 HTTP Copy quota 合同 |
-| Bucket 配置 | 核心完成 | List/Create/Head/Delete/GetLocation；Versioning、Lifecycle、Object Lock；Bucket Policy signed-owner GET/PUT/DELETE 与 PolicyStatus GET；全部当前 operation 已执行精确 Policy action；`0014` 提供全局 Bucket namespace、12 位 account ID 和 policy persistence | CORS、Notification、Bucket Tagging 与更广客户端矩阵 |
+| Bucket 配置 | 核心完成 | List/Create/Head/Delete/GetLocation；Versioning、Lifecycle、Object Lock；Bucket Policy signed-owner GET/PUT/DELETE 与 PolicyStatus GET；Bucket CORS/Tagging GET/PUT/DELETE、独立 revision/JSONB、标准 Policy action、OPTIONS/实际响应 CORS；`0014` 提供全局 Bucket namespace 与 policy persistence，`0016` 提供 CORS/Tagging persistence | Notification、Bucket Encryption 与更广客户端矩阵 |
 | Lifecycle | 核心完成 | 配置 schema/parser/validator；ObjectVersion Expiration、Noncurrent Expiration、Expired Marker、Multipart Abort；事务复检、Object Lock 与持久 GC | 标签/大小过滤、Transition、性能与多实例 soak 矩阵 |
 | Object Lock | 核心完成 | Bucket 配置、默认 Retention、PutObject 锁头、对象 Retention/Legal Hold GET/PUT、签名 Governance bypass、不可逆 Versioning 约束与删除事务保护 | CopyObject/Multipart 显式锁头支持与 native-client 矩阵 |
-| Object Tagging | 核心完成 | 当前/精确版本 GET/PUT/DELETE；独立版本标签表；PutObject、Copy COPY/REPLACE、Multipart 冻结与 TagCount | Bucket Tagging、标签条件 Policy/Lifecycle、真实 AWS CLI endpoint 回归 |
-| Policy/Auth | 当前 operation 闭环完成 | Bucket/Identity Policy Core、PostgreSQL persistence、管理 API/OpenAPI/控制台与 App unified authorization 已完成；对象、版本、Multipart、account、Bucket 基础/配置 operation 均执行精确 action，支持匿名与跨账户 Bucket Policy，Bucket Policy 管理不能自授权 | 为后续 CORS、Notification、Bucket Tagging、SSE 等新增 operation 建立各自 action 与合同 |
+| Object/Bucket Tagging | 核心完成 | Object 当前/精确版本 GET/PUT/DELETE、Copy COPY/REPLACE、Multipart 冻结与 TagCount；Bucket 独立 50-tag GET/PUT/DELETE 与 revision persistence | 标签条件 Policy/Lifecycle、真实 AWS CLI endpoint 回归 |
+| Policy/Auth | 当前 operation 闭环完成 | Bucket/Identity Policy Core、PostgreSQL persistence、管理 API/OpenAPI/控制台与 App unified authorization 已完成；对象、版本、Multipart、account、Bucket 基础/配置、CORS 与 Bucket Tagging operation 均执行精确 action，支持匿名与跨账户 Bucket Policy，Bucket Policy 管理不能自授权 | 为后续 Notification、Bucket Encryption 等新增 operation 建立各自 action 与合同 |
 
 本轮没有加入旧 `/s3`、旧 schema 或旧品牌兼容代码。历史 `Media` 路径仍存在只是因为非 S3 消费者尚未全部迁移，不是新旧双写；S3 普通对象与 Multipart 的新写入只提交到 Object/ObjectVersion。
 
 ### 0.1 真实后端验证记录
 
-- PostgreSQL 17 fresh migration：通过。
+- PostgreSQL 17 fresh migration（`0001`→`0016`）：通过。
 - PostgreSQL Repository Contract：1/1 通过。
-- 最新全工作区回归：Server 189/189、App 64/64、Core 80/80、PostgreSQL adapter 30/30；唯一 ignored 项是需要外部独立 S3 凭据的 adapter contract。
+- 本切片回归：Server 226/226、App 65/65、Core 88/88、PostgreSQL adapter 31/31；CORS/Tagging persistence contract 1/1，唯一环境性 ignored 项仍是需要外部独立 S3 凭据的 adapter contract。
 - PostgreSQL Repository、S3 quota、Policy、Identity Policy、列表、Lifecycle、Bucket/Object Lock 与 Object Tagging 合同全部通过。
 - S3 quota 的 Memory 测试与 PostgreSQL 17 `s3_quota_contract` 通过；覆盖 Put/Copy/Multipart 预留与结算、abort/expiry、null replacement、永久删除和 Lifecycle，delete marker 不计容量。
-- PostgreSQL 17 从 `0001` 到 `0015` fresh migration 通过；`0014` 已验证稳定且唯一的 12 位 S3 account ID、全局 Bucket 名称约束与 Bucket Policy 持久化，`0015` 已验证 Identity Policy revision 与 tenant fence。
+- PostgreSQL 17 从 `0001` 到 `0016` fresh migration 通过；`0014` 已验证稳定 12 位 S3 account ID、全局 Bucket 名称约束与 Bucket Policy 持久化，`0015` 已验证 Identity Policy revision 与 tenant fence，`0016` 已验证 CORS/Tagging 独立 document、revision 与 tenant fence。
 - Bucket/Identity Policy Core 严格解析/求值、稳定 JSON 与 PolicyStatus 单测通过；当前全部 S3 operation 的 PostgreSQL 17 HTTP 授权合同通过。
 - Silo `docker.io/pgsty/silo:latest`：真实 ObjectStore 与 Presigned PUT 合同 1/1 通过。
 - 真实测试修复了两个仅靠静态检查无法发现的问题：PostgreSQL constraint 自动命名冲突/NUL 检查，以及 generic S3 create-only copy 的能力差异。
@@ -1297,7 +1297,7 @@ PutBucketObjectLockConfiguration：
 - versionId/null version/delete marker response headers；
 - 标准 S3 XML error。
 
-CopyObject/UploadPartCopy、版本级 Object Tagging、Bucket Policy signed-owner 管理 API/PolicyStatus、Access Key Identity Policy persistence/管理面，以及全部当前对象、版本、Multipart、account 和 Bucket 配置 operation 的统一授权均已完成。Notification、Bucket Tagging、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token 仍未实现。未实现 operation 必须返回标准错误，不能假成功。
+CopyObject/UploadPartCopy、Object/Bucket Tagging、Bucket CORS、Bucket Policy signed-owner 管理 API/PolicyStatus、Access Key Identity Policy persistence/管理面，以及全部当前对象、版本、Multipart、account 和 Bucket 配置 operation 的统一授权均已完成。Notification、Bucket Encryption、POST Policy、真实 SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token 仍未实现。未实现 operation 必须返回标准错误，不能假成功。
 ## 10. Policy 实现
 
 > 当前实现状态：Bucket Policy strict Core parser/evaluator、稳定 JSON 与 PolicyStatus 已完成；迁移 `0014` 已提供稳定 12 位 account ID、全局 Bucket namespace 和 policy persistence；迁移 `0015`、Access Key Identity Policy 管理 API/OpenAPI/控制台与 App unified authorization service 已完成。对象读写、Copy、Multipart、版本列表、Tagging、ACL、Retention/LegalHold、删除、account action 与 Bucket 基础/配置均已接入 unified authorization；真实 PostgreSQL 17 HTTP contract 覆盖匿名与跨账户访问、目标 owner/audit、附加 action、Governance bypass、防枚举、请求体签名和 Bucket Policy 不可自授权。当前受支持 operation 的最终授权模型已经全面启用。
@@ -2001,7 +2001,7 @@ crates/mediahub-server/tests/s3/
 
 ### Phase 7：补齐 S3 扩展切片（进行中）
 
-CopyObject/UploadPartCopy、Object Tagging、S3 quota 闭环、Bucket/Identity Policy 管理面，以及全部当前对象、版本、Multipart、account 和 Bucket 配置 operation 的统一授权已完成。下一步实现 Notification，再处理 Bucket Tagging、CORS/SSE 与 virtual-host style；每个新增 operation 都必须同时包含 classifier、精确 action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
+CopyObject/UploadPartCopy、Object/Bucket Tagging、Bucket CORS、S3 quota 闭环、Bucket/Identity Policy 管理面，以及全部当前对象、版本、Multipart、account 和 Bucket 配置 operation 的统一授权已完成。下一批优先实现 Notification 的事务 outbox 闭环和真实 SSE-S3，随后是 Bucket Encryption、POST Policy 与 virtual-host style；每个新增 operation 都必须同时包含 classifier、精确 action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
 
 ### Phase 8：切换其余消费者
 

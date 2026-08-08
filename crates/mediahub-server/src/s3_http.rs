@@ -75,6 +75,11 @@ const S3_MULTIPART_COMPLETION_LEASE_SECONDS: i64 = 5 * 60;
 
 include!("s3_http_bucket.rs");
 include!("s3_http_configuration.rs");
+include!("s3_http_cors.rs");
+include!("s3_http_cors_runtime.rs");
+include!("s3_http_bucket_tagging.rs");
+include!("s3_http_bucket_metadata.rs");
+include!("s3_http_sse_guard.rs");
 include!("s3_http_policy.rs");
 include!("s3_data_authorization.rs");
 include!("s3_http_tagging.rs");
@@ -110,3 +115,5 @@ include!("s3_http_tagging_tests.rs");
 include!("s3_http_listing_tests.rs");
 #[cfg(test)]
 include!("s3_data_authorization_tests.rs");
+#[cfg(test)]
+include!("s3_bucket_cors_tagging_http_contract_tests.rs");

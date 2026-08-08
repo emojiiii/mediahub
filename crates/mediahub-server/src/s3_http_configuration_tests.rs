@@ -100,6 +100,43 @@ fn s3_bucket_delete_versioning_is_a_standard_method_error() {
 }
 
 #[test]
+fn unsupported_bucket_subresources_never_fall_back_to_plain_bucket_operations() {
+    let request_id = "request-id";
+    assert_eq!(
+        classify_s3_bucket_get(
+            &Uri::from_static("/s3/prismark-bucket?encryption"),
+            request_id,
+        )
+        .expect("get encryption classification"),
+        S3BucketGetOperation::GetEncryption,
+    );
+    assert_eq!(
+        classify_s3_bucket_put(
+            &Uri::from_static("/s3/prismark-bucket?notification"),
+            request_id,
+        )
+        .expect("put notification classification"),
+        S3BucketPutOperation::PutNotification,
+    );
+    assert_eq!(
+        classify_s3_bucket_delete(
+            &Uri::from_static("/s3/prismark-bucket?encryption"),
+            request_id,
+        )
+        .expect("delete encryption classification"),
+        S3BucketDeleteOperation::Encryption,
+    );
+    assert_eq!(
+        classify_s3_bucket_delete(
+            &Uri::from_static("/s3/prismark-bucket?website"),
+            request_id,
+        )
+        .expect("unknown delete classification"),
+        S3BucketDeleteOperation::Unsupported("website".to_owned()),
+    );
+}
+
+#[test]
 fn s3_bucket_versioning_parser_accepts_only_enabled_or_suspended() {
     let enabled = br#"<?xml version="1.0" encoding="UTF-8"?>
         <VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">

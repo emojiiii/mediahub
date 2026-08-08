@@ -83,6 +83,7 @@ use mediahub_server::{
 
 mod email;
 mod runtime_storage;
+mod s3_cors_runtime;
 mod s3_gateway;
 mod s3_http;
 mod s3_list;

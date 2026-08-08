@@ -4,29 +4,60 @@ const MAX_S3_BUCKET_CONFIGURATION_BYTES: usize = 1024 * 1024;
 const MAX_S3_LIFECYCLE_RULES: usize = 1_000;
 const MAX_S3_LIFECYCLE_ID_BYTES: usize = 255;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum S3BucketPutOperation {
     CreateBucket,
     PutPolicy,
     PutVersioning,
     PutLifecycle,
+    PutCors,
+    PutTagging,
+    PutEncryption,
+    PutNotification,
     PutObjectLock,
+    Unsupported(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum S3BucketDeleteOperation {
     Bucket,
     Policy,
     Lifecycle,
+    Cors,
+    Tagging,
+    Encryption,
+    Notification,
+    Unsupported(String),
 }
 
 fn classify_s3_bucket_put(uri: &Uri, request_id: &str) -> Result<S3BucketPutOperation, S3ApiError> {
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
+    let cors = s3_query_flag(uri, "cors", request_id)?;
+    let tagging = classify_s3_bucket_tagging(uri, request_id)?;
+    let encryption = s3_query_flag(uri, "encryption", request_id)?;
+    let notification = s3_query_flag(uri, "notification", request_id)?;
     let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
     let policy = s3_query_flag(uri, "policy", request_id)?;
+    let unsupported = first_unsupported_s3_query_parameter(
+        uri,
+        &[
+            "versioning",
+            "lifecycle",
+            "cors",
+            "tagging",
+            "encryption",
+            "notification",
+            "object-lock",
+            "policy",
+        ],
+    );
     if usize::from(versioning)
         + usize::from(lifecycle)
+        + usize::from(cors)
+        + usize::from(tagging)
+        + usize::from(encryption)
+        + usize::from(notification)
         + usize::from(object_lock)
         + usize::from(policy)
         > 1
@@ -37,12 +68,22 @@ fn classify_s3_bucket_put(uri: &Uri, request_id: &str) -> Result<S3BucketPutOper
             request_id,
         ));
     }
-    Ok(if policy {
+    Ok(if let Some(name) = unsupported {
+        S3BucketPutOperation::Unsupported(name)
+    } else if policy {
         S3BucketPutOperation::PutPolicy
     } else if versioning {
         S3BucketPutOperation::PutVersioning
     } else if lifecycle {
         S3BucketPutOperation::PutLifecycle
+    } else if cors {
+        S3BucketPutOperation::PutCors
+    } else if tagging {
+        S3BucketPutOperation::PutTagging
+    } else if encryption {
+        S3BucketPutOperation::PutEncryption
+    } else if notification {
+        S3BucketPutOperation::PutNotification
     } else if object_lock {
         S3BucketPutOperation::PutObjectLock
     } else {
@@ -56,10 +97,31 @@ fn classify_s3_bucket_delete(
 ) -> Result<S3BucketDeleteOperation, S3ApiError> {
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
+    let cors = s3_query_flag(uri, "cors", request_id)?;
+    let tagging = classify_s3_bucket_tagging(uri, request_id)?;
+    let encryption = s3_query_flag(uri, "encryption", request_id)?;
+    let notification = s3_query_flag(uri, "notification", request_id)?;
     let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
     let policy = s3_query_flag(uri, "policy", request_id)?;
+    let unsupported = first_unsupported_s3_query_parameter(
+        uri,
+        &[
+            "versioning",
+            "lifecycle",
+            "cors",
+            "tagging",
+            "encryption",
+            "notification",
+            "object-lock",
+            "policy",
+        ],
+    );
     if usize::from(versioning)
         + usize::from(lifecycle)
+        + usize::from(cors)
+        + usize::from(tagging)
+        + usize::from(encryption)
+        + usize::from(notification)
         + usize::from(object_lock)
         + usize::from(policy)
         > 1
@@ -84,10 +146,20 @@ fn classify_s3_bucket_delete(
             request_id,
         ));
     }
-    Ok(if policy {
+    Ok(if let Some(name) = unsupported {
+        S3BucketDeleteOperation::Unsupported(name)
+    } else if policy {
         S3BucketDeleteOperation::Policy
     } else if lifecycle {
         S3BucketDeleteOperation::Lifecycle
+    } else if cors {
+        S3BucketDeleteOperation::Cors
+    } else if tagging {
+        S3BucketDeleteOperation::Tagging
+    } else if encryption {
+        S3BucketDeleteOperation::Encryption
+    } else if notification {
+        S3BucketDeleteOperation::Notification
     } else {
         S3BucketDeleteOperation::Bucket
     })
@@ -176,6 +248,45 @@ pub(super) async fn s3_bucket_get(
             )
             .await
         }
+        S3BucketGetOperation::GetCors => {
+            s3_get_bucket_cors(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                connect_info,
+                request_id,
+            )
+            .await
+        }
+        S3BucketGetOperation::GetTagging => {
+            s3_get_bucket_tagging(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                connect_info,
+                request_id,
+            )
+            .await
+        }
+        S3BucketGetOperation::GetEncryption => Err(S3ApiError::not_implemented(
+            "Bucket Encryption is not implemented.",
+            uri.path(),
+            &request_id.0.0,
+        )),
+        S3BucketGetOperation::GetNotification => Err(S3ApiError::not_implemented(
+            "Bucket Notification is not implemented.",
+            uri.path(),
+            &request_id.0.0,
+        )),
+        S3BucketGetOperation::Unsupported(name) => Err(S3ApiError::not_implemented(
+            format!("The {name} Bucket subresource is not implemented."),
+            uri.path(),
+            &request_id.0.0,
+        )),
         S3BucketGetOperation::GetObjectLock => {
             s3_get_bucket_object_lock(
                 State(state),
@@ -279,6 +390,43 @@ pub(super) async fn s3_bucket_put(
             )
             .await
         }
+        S3BucketPutOperation::PutCors => {
+            s3_put_bucket_cors(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                (headers, connect_info, request_id),
+                content,
+            )
+            .await
+        }
+        S3BucketPutOperation::PutTagging => {
+            s3_put_bucket_tagging(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                (headers, connect_info, request_id),
+                content,
+            )
+            .await
+        }
+        S3BucketPutOperation::PutEncryption => Err(S3ApiError::not_implemented(
+            "Bucket Encryption is not implemented.",
+            uri.path(),
+            &request_id.0.0,
+        )),
+        S3BucketPutOperation::PutNotification => Err(S3ApiError::not_implemented(
+            "Bucket Notification is not implemented.",
+            uri.path(),
+            &request_id.0.0,
+        )),
+        S3BucketPutOperation::Unsupported(name) => Err(S3ApiError::not_implemented(
+            format!("The {name} Bucket subresource is not implemented."),
+            uri.path(),
+            &request_id.0.0,
+        )),
         S3BucketPutOperation::PutObjectLock => {
             s3_put_bucket_object_lock(
                 State(state),
@@ -328,6 +476,45 @@ pub(super) async fn s3_bucket_delete(
             )
             .await
         }
+        S3BucketDeleteOperation::Cors => {
+            s3_delete_bucket_cors(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                connect_info,
+                request_id,
+            )
+            .await
+        }
+        S3BucketDeleteOperation::Tagging => {
+            s3_delete_bucket_tagging(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                connect_info,
+                request_id,
+            )
+            .await
+        }
+        S3BucketDeleteOperation::Encryption => Err(S3ApiError::not_implemented(
+            "Bucket Encryption is not implemented.",
+            uri.path(),
+            &request_id.0.0,
+        )),
+        S3BucketDeleteOperation::Notification => Err(S3ApiError::not_implemented(
+            "Bucket Notification is not implemented.",
+            uri.path(),
+            &request_id.0.0,
+        )),
+        S3BucketDeleteOperation::Unsupported(name) => Err(S3ApiError::not_implemented(
+            format!("The {name} Bucket subresource is not implemented."),
+            uri.path(),
+            &request_id.0.0,
+        )),
         S3BucketDeleteOperation::Policy => {
             s3_delete_bucket_policy(
                 State(state),

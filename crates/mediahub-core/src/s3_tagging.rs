@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const MAX_S3_OBJECT_TAGS: usize = 10;
+pub const MAX_S3_BUCKET_TAGS: usize = 50;
 pub const MAX_S3_OBJECT_TAG_KEY_CHARS: usize = 128;
 pub const MAX_S3_OBJECT_TAG_VALUE_CHARS: usize = 256;
 
@@ -55,16 +56,49 @@ pub struct S3ObjectTagSet(Vec<S3ObjectTag>);
 
 impl S3ObjectTagSet {
     pub fn new(tags: Vec<S3ObjectTag>) -> Result<Self, S3TaggingError> {
-        if tags.len() > MAX_S3_OBJECT_TAGS {
-            return Err(S3TaggingError::TooManyTags);
-        }
-        let mut keys = HashSet::with_capacity(tags.len());
-        for tag in &tags {
-            tag.validate()?;
-            if !keys.insert(tag.key()) {
-                return Err(S3TaggingError::DuplicateKey);
-            }
-        }
+        validate_tag_set(&tags, MAX_S3_OBJECT_TAGS)?;
+        Ok(Self(tags))
+    }
+
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &S3ObjectTag> {
+        self.0.iter()
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<S3ObjectTag> {
+        self.0
+    }
+
+    pub fn validate(&self) -> Result<(), S3TaggingError> {
+        Self::new(self.0.clone()).map(|_| ())
+    }
+}
+
+/// Bucket tags use the same AWS key/value character rules as object tags but
+/// have a distinct 50-tag resource limit. Keeping a separate set type avoids
+/// accidentally applying the object protocol's 10-tag cap to a bucket.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct S3BucketTagSet(Vec<S3ObjectTag>);
+
+impl S3BucketTagSet {
+    pub fn new(tags: Vec<S3ObjectTag>) -> Result<Self, S3TaggingError> {
+        validate_tag_set(&tags, MAX_S3_BUCKET_TAGS)?;
         Ok(Self(tags))
     }
 
@@ -99,14 +133,28 @@ impl S3ObjectTagSet {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum S3TaggingError {
-    #[error("an object cannot have more than 10 tags")]
+    #[error("the tag set exceeds the resource limit")]
     TooManyTags,
-    #[error("an object tag key is invalid")]
+    #[error("a tag key is invalid")]
     InvalidKey,
-    #[error("an object tag value is invalid")]
+    #[error("a tag value is invalid")]
     InvalidValue,
-    #[error("object tag keys must be unique")]
+    #[error("tag keys must be unique")]
     DuplicateKey,
+}
+
+fn validate_tag_set(tags: &[S3ObjectTag], maximum_tags: usize) -> Result<(), S3TaggingError> {
+    if tags.len() > maximum_tags {
+        return Err(S3TaggingError::TooManyTags);
+    }
+    let mut keys = HashSet::with_capacity(tags.len());
+    for tag in tags {
+        tag.validate()?;
+        if !keys.insert(tag.key()) {
+            return Err(S3TaggingError::DuplicateKey);
+        }
+    }
+    Ok(())
 }
 
 fn validate_tag_text(
@@ -133,7 +181,10 @@ fn is_valid_tag_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_S3_OBJECT_TAGS, S3ObjectTag, S3ObjectTagSet, S3TaggingError};
+    use super::{
+        MAX_S3_BUCKET_TAGS, MAX_S3_OBJECT_TAGS, S3BucketTagSet, S3ObjectTag, S3ObjectTagSet,
+        S3TaggingError,
+    };
 
     #[test]
     fn accepts_standard_unicode_tag_character_set_and_preserves_order() {
@@ -191,6 +242,27 @@ mod tests {
         assert_eq!(
             S3ObjectTag::new("key", "值".repeat(257)),
             Err(S3TaggingError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn bucket_and_object_tag_sets_keep_distinct_aws_limits() {
+        let tags = (0..MAX_S3_BUCKET_TAGS)
+            .map(|index| S3ObjectTag::new(format!("key{index}"), "value").expect("valid"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            S3BucketTagSet::new(tags.clone())
+                .expect("bucket tags")
+                .len(),
+            50
+        );
+        assert_eq!(S3ObjectTagSet::new(tags), Err(S3TaggingError::TooManyTags));
+        let too_many = (0..=MAX_S3_BUCKET_TAGS)
+            .map(|index| S3ObjectTag::new(format!("key{index}"), "value").expect("valid"))
+            .collect();
+        assert_eq!(
+            S3BucketTagSet::new(too_many),
+            Err(S3TaggingError::TooManyTags)
         );
     }
 }

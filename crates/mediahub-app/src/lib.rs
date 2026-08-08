@@ -18,6 +18,7 @@ mod memory_s3;
 pub mod object_store_contract;
 mod ports;
 mod s3_authorization;
+mod s3_bucket_configuration;
 mod s3_bucket_policy;
 mod s3_identity_policy;
 mod s3_lifecycle;
@@ -69,6 +70,10 @@ pub use ports::{
 pub use s3_authorization::{
     S3AuthorizationOutcome, S3AuthorizationPrincipal, S3AuthorizationRequest,
     S3AuthorizationService, S3PrincipalValidationError, S3SignedPrincipal,
+};
+pub use s3_bucket_configuration::{
+    S3BucketCorsRepository, S3BucketCorsSnapshot, S3BucketTaggingRepository,
+    S3BucketTaggingSnapshot,
 };
 pub use s3_bucket_policy::{
     S3_ACCOUNT_ID_DIGITS, S3AccountId, S3BucketIdentity, S3BucketPolicyDocument,

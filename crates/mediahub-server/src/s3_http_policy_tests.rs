@@ -52,7 +52,7 @@ fn s3_bucket_policy_classifiers_are_exact_and_reject_mixed_subresources() {
     assert_eq!(
         classify_s3_bucket_get(&Uri::from_static("/assets?policystatus"), request_id)
             .expect("query names are case-sensitive"),
-        S3BucketGetOperation::ListObjects,
+        S3BucketGetOperation::Unsupported("policystatus".to_owned()),
     );
 }
 

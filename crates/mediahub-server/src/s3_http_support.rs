@@ -376,6 +376,12 @@ pub(super) async fn s3_post_object(
     .await?;
     reject_s3_versioning(&uri, &request_id.0.0)?;
     if s3_query_flag(&uri, "uploads", &request_id.0.0)? {
+        reject_unimplemented_s3_sse_headers(
+            &headers,
+            S3SseOperationContext::CreateMultipartUpload,
+            uri.path(),
+            &request_id.0.0,
+        )?;
         reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         return s3_create_multipart_upload(
             S3ObjectOperation {
@@ -392,6 +398,12 @@ pub(super) async fn s3_post_object(
         .await;
     }
     if let Some(upload_id) = s3_query_value(&uri, "uploadId", &request_id.0.0)? {
+        reject_unimplemented_s3_sse_headers(
+            &headers,
+            S3SseOperationContext::CompleteMultipartUpload,
+            uri.path(),
+            &request_id.0.0,
+        )?;
         reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         return s3_complete_multipart_upload(
             S3ObjectOperation {
@@ -408,6 +420,12 @@ pub(super) async fn s3_post_object(
         )
         .await;
     }
+    reject_unimplemented_s3_sse_headers(
+        &headers,
+        S3SseOperationContext::PostObject,
+        uri.path(),
+        &request_id.0.0,
+    )?;
     Err(S3ApiError::not_implemented(
         "Only CreateMultipartUpload and CompleteMultipartUpload are supported for POST.",
         uri.path(),
@@ -427,6 +445,12 @@ pub(super) async fn s3_delete_object(
     let tagging_operation = classify_s3_object_tagging(&uri, &request_id.0.0)?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    reject_unimplemented_s3_sse_headers(
+        &headers,
+        S3SseOperationContext::DeleteObject,
+        uri.path(),
+        &request_id.0.0,
+    )?;
     if tagging_operation {
         return s3_delete_object_tagging(
             S3ObjectOperation {

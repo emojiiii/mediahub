@@ -85,7 +85,7 @@ async fn load_s3_authentication(
     Ok((signature, secret, auth))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum S3BucketGetOperation {
     ListObjects,
     ListObjectVersions,
@@ -93,23 +93,65 @@ enum S3BucketGetOperation {
     GetLocation,
     GetVersioning,
     GetLifecycle,
+    GetCors,
+    GetTagging,
+    GetEncryption,
+    GetNotification,
     GetObjectLock,
     GetPolicy,
     GetPolicyStatus,
+    Unsupported(String),
 }
 
 fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOperation, S3ApiError> {
     let location = s3_query_flag(uri, "location", request_id)?;
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
+    let cors = s3_query_flag(uri, "cors", request_id)?;
+    let tagging = classify_s3_bucket_tagging(uri, request_id)?;
+    let encryption = s3_query_flag(uri, "encryption", request_id)?;
+    let notification = s3_query_flag(uri, "notification", request_id)?;
     let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
     let versions = s3_query_flag(uri, "versions", request_id)?;
     let uploads = s3_query_flag(uri, "uploads", request_id)?;
     let policy = s3_query_flag(uri, "policy", request_id)?;
     let policy_status = s3_query_flag(uri, "policyStatus", request_id)?;
+    let unsupported = first_unsupported_s3_query_parameter(
+        uri,
+        &[
+            "location",
+            "versioning",
+            "lifecycle",
+            "cors",
+            "tagging",
+            "encryption",
+            "notification",
+            "object-lock",
+            "versions",
+            "uploads",
+            "policy",
+            "policyStatus",
+            "list-type",
+            "prefix",
+            "delimiter",
+            "marker",
+            "continuation-token",
+            "start-after",
+            "encoding-type",
+            "max-keys",
+            "key-marker",
+            "version-id-marker",
+            "max-uploads",
+            "upload-id-marker",
+        ],
+    );
     if usize::from(location)
         + usize::from(versioning)
         + usize::from(lifecycle)
+        + usize::from(cors)
+        + usize::from(tagging)
+        + usize::from(encryption)
+        + usize::from(notification)
         + usize::from(object_lock)
         + usize::from(versions)
         + usize::from(uploads)
@@ -124,7 +166,9 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         ));
     }
 
-    let operation = if policy {
+    let operation = if let Some(name) = unsupported {
+        S3BucketGetOperation::Unsupported(name)
+    } else if policy {
         S3BucketGetOperation::GetPolicy
     } else if policy_status {
         S3BucketGetOperation::GetPolicyStatus
@@ -134,6 +178,14 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         S3BucketGetOperation::GetVersioning
     } else if lifecycle {
         S3BucketGetOperation::GetLifecycle
+    } else if cors {
+        S3BucketGetOperation::GetCors
+    } else if tagging {
+        S3BucketGetOperation::GetTagging
+    } else if encryption {
+        S3BucketGetOperation::GetEncryption
+    } else if notification {
+        S3BucketGetOperation::GetNotification
     } else if object_lock {
         S3BucketGetOperation::GetObjectLock
     } else if versions {
@@ -164,6 +216,10 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         S3BucketGetOperation::GetLocation
         | S3BucketGetOperation::GetVersioning
         | S3BucketGetOperation::GetLifecycle
+        | S3BucketGetOperation::GetCors
+        | S3BucketGetOperation::GetTagging
+        | S3BucketGetOperation::GetEncryption
+        | S3BucketGetOperation::GetNotification
         | S3BucketGetOperation::GetObjectLock
         | S3BucketGetOperation::GetPolicy
         | S3BucketGetOperation::GetPolicyStatus => {
@@ -217,8 +273,21 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
                 ],
             )?;
         }
+        S3BucketGetOperation::Unsupported(_) => {}
     }
     Ok(operation)
+}
+
+fn first_unsupported_s3_query_parameter(uri: &Uri, allowed: &[&str]) -> Option<String> {
+    url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).find_map(
+        |(name, _)| {
+            let name = name.as_ref();
+            (!allowed.contains(&name)
+                && name != "x-id"
+                && !name.starts_with("X-Amz-"))
+            .then(|| name.to_owned())
+        },
+    )
 }
 
 fn reject_s3_listing_parameters(
@@ -1354,6 +1423,12 @@ pub(super) async fn s3_put_object(
         let auth =
             authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
                 .await?;
+        reject_unimplemented_s3_sse_headers(
+            &headers,
+            S3SseOperationContext::PutObject,
+            uri.path(),
+            &request_id.0.0,
+        )?;
         return s3_put_object_tagging(
             S3ObjectOperation {
                 state: &state,
@@ -1376,6 +1451,12 @@ pub(super) async fn s3_put_object(
         let auth =
             authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
                 .await?;
+        reject_unimplemented_s3_sse_headers(
+            &headers,
+            S3SseOperationContext::PutObject,
+            uri.path(),
+            &request_id.0.0,
+        )?;
         return s3_put_object_version_lock(
             S3ObjectOperation {
                 state: &state,
@@ -1396,6 +1477,12 @@ pub(super) async fn s3_put_object(
         authenticate_s3_streaming_application(&state, &method, &uri, &headers, &request_id.0.0)
             .await?;
     if s3_query_flag(&uri, "acl", &request_id.0.0)? {
+        reject_unimplemented_s3_sse_headers(
+            &headers,
+            S3SseOperationContext::PutObject,
+            uri.path(),
+            &request_id.0.0,
+        )?;
         let content = to_bytes(content, MAX_ERROR_RESPONSE_BYTES)
             .await
             .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
@@ -1420,6 +1507,23 @@ pub(super) async fn s3_put_object(
     let upload_id = s3_query_value(&uri, "uploadId", &request_id.0.0)?;
     let part_number = s3_query_value(&uri, "partNumber", &request_id.0.0)?;
     let is_copy = headers.contains_key("x-amz-copy-source");
+    let sse_operation = if upload_id.is_some() || part_number.is_some() {
+        if is_copy {
+            S3SseOperationContext::UploadPartCopy
+        } else {
+            S3SseOperationContext::UploadPart
+        }
+    } else if is_copy {
+        S3SseOperationContext::CopyObject
+    } else {
+        S3SseOperationContext::PutObject
+    };
+    reject_unimplemented_s3_sse_headers(
+        &headers,
+        sse_operation,
+        uri.path(),
+        &request_id.0.0,
+    )?;
     if upload_id.is_some() || part_number.is_some() {
         reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         reject_s3_versioning(&uri, &request_id.0.0)?;
@@ -1572,6 +1676,16 @@ pub(super) async fn s3_get_object(
             &request_id.0.0,
         )
         .await?;
+        reject_unimplemented_s3_sse_headers(
+            &headers,
+            if method == Method::HEAD {
+                S3SseOperationContext::HeadObject
+            } else {
+                S3SseOperationContext::GetObject
+            },
+            uri.path(),
+            &request_id.0.0,
+        )?;
         return s3_read_regular_object(
             S3ReadObjectOperation {
                 state: &state,
@@ -1590,6 +1704,16 @@ pub(super) async fn s3_get_object(
 
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    reject_unimplemented_s3_sse_headers(
+        &headers,
+        if method == Method::HEAD {
+            S3SseOperationContext::HeadObject
+        } else {
+            S3SseOperationContext::GetObject
+        },
+        uri.path(),
+        &request_id.0.0,
+    )?;
     let source_ip = s3_data_source_ip(connect_info.as_ref());
     let signed_operation = S3ObjectOperation {
         state: &state,
