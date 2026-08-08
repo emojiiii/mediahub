@@ -181,7 +181,12 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
             reject_s3_listing_parameters(
                 uri,
                 request_id,
-                &["key-marker", "version-id-marker", "max-uploads", "upload-id-marker"],
+                &[
+                    "key-marker",
+                    "version-id-marker",
+                    "max-uploads",
+                    "upload-id-marker",
+                ],
             )?;
         }
         S3BucketGetOperation::ListObjectVersions => {
@@ -267,11 +272,7 @@ fn parse_list_object_versions_query(
         .map(S3VersionId::new)
         .transpose()
         .map_err(|_| {
-            S3ApiError::invalid_argument(
-                "version-id-marker is invalid.",
-                uri.path(),
-                request_id,
-            )
+            S3ApiError::invalid_argument("version-id-marker is invalid.", uri.path(), request_id)
         })?;
     if version_id_marker.is_some() && key_marker.is_none() {
         return Err(S3ApiError::invalid_argument(
@@ -346,10 +347,7 @@ fn parse_s3_listing_limit(
         })
 }
 
-fn parse_s3_listing_delimiter(
-    uri: &Uri,
-    request_id: &str,
-) -> Result<Option<String>, S3ApiError> {
+fn parse_s3_listing_delimiter(uri: &Uri, request_id: &str) -> Result<Option<String>, S3ApiError> {
     match s3_query_value(uri, "delimiter", request_id)? {
         None => Ok(None),
         Some(value) if value.is_empty() => Ok(None),
@@ -602,13 +600,8 @@ pub(super) async fn s3_list_objects(
             warn!(error = %error, "S3 ObjectVersion listing failed");
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?;
-    let result = s3_list_result_from_object_page(
-        application_id,
-        bucket_id,
-        bucket_name,
-        query,
-        page,
-    );
+    let result =
+        s3_list_result_from_object_page(application_id, bucket_id, bucket_name, query, page);
     let body = result
         .to_xml(&codec)
         .map_err(|error| s3_list_api_error(error, uri.path(), &request_id.0.0))?;
@@ -805,24 +798,42 @@ pub(super) async fn s3_list_multipart_uploads(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    auth.authorize("media:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let query = parse_list_multipart_uploads_query(&uri, &request_id.0.0)?;
+    let authorization = authorize_s3_signed_data_request(
+        &state,
+        &auth,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::ListBucketMultipartUploads,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: Some(&query.prefix),
+            delimiter: query.delimiter.as_deref(),
+            max_keys: u64::try_from(query.max_uploads).ok(),
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        uri.path(),
+        &request_id.0.0,
+    )
+    .await?;
     let bucket = state
         .repository
-        .find_s3_bucket(auth.application.id, &bucket_name)
+        .find_s3_bucket(authorization.application_id(), &bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 ListMultipartUploads bucket lookup failed");
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?
+        .filter(|bucket| bucket.id() == authorization.bucket.bucket_id)
         .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
-    let query = parse_list_multipart_uploads_query(&uri, &request_id.0.0)?;
     let repository_upload_id_marker = if query.key_marker.is_some() {
         query.upload_id_marker.clone()
     } else {
@@ -831,7 +842,7 @@ pub(super) async fn s3_list_multipart_uploads(
     let page = state
         .repository
         .list_s3_multipart_uploads_page(
-            auth.application.id,
+            authorization.application_id(),
             &S3MultipartUploadListQuery {
                 bucket_id: bucket.id(),
                 prefix: query.prefix.clone(),
@@ -849,8 +860,8 @@ pub(super) async fn s3_list_multipart_uploads(
         })?;
     let result = s3_multipart_uploads_result_from_page(
         bucket_name,
-        auth.application.app_id.clone(),
-        auth.application.name.clone(),
+        authorization.bucket.owner_account_id.as_str().to_owned(),
+        "PrismArk Account".to_owned(),
         query,
         page,
     );
@@ -1018,9 +1029,13 @@ pub(super) async fn s3_bucket_post(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
-    request_id: Extension<RequestId>,
+    request_context: (
+        Option<Extension<ConnectInfo<SocketAddr>>>,
+        Extension<RequestId>,
+    ),
     content: Bytes,
 ) -> Result<Response, S3ApiError> {
+    let (connect_info, request_id) = request_context;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
             .await?;
@@ -1032,8 +1047,6 @@ pub(super) async fn s3_bucket_post(
             &request_id.0.0,
         ));
     }
-    auth.authorize("media:delete")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
     validate_content_md5(
         headers.get("content-md5").map(HeaderValue::as_bytes),
         &content,
@@ -1047,20 +1060,12 @@ pub(super) async fn s3_bucket_post(
             &request_id.0.0,
         )
     })?;
-    let bypass_governance =
-        parse_s3_bypass_governance(&headers, &uri, &request_id.0.0)?;
-    state
-        .repository
-        .find_s3_bucket(auth.application.id, &bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Bucket lookup failed");
-            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
+    let bypass_governance = parse_s3_bypass_governance(&headers, &uri, &request_id.0.0)?;
     let request = parse_delete_objects_xml(&content)
         .map_err(|error| S3ApiError::from_xml(error, uri.path(), &request_id.0.0))?;
     let service = runtime_s3_object_service(&state, uri.path(), &request_id.0.0)?;
+    let secure_transport = s3_data_secure_transport(&uri);
+    let source_ip = s3_data_source_ip(connect_info.as_ref());
     let mut result = DeleteResult::default();
     for object in request.objects {
         let requested_version_id = object.version_id.clone();
@@ -1080,16 +1085,66 @@ pub(super) async fn s3_bucket_post(
                 continue;
             }
         };
+        let authorization = authorize_s3_signed_delete_request(
+            &state,
+            &auth,
+            S3DeleteAuthorizationInput {
+                bucket_name: &bucket_name,
+                object_key: &object.key,
+                version_id: version_id.as_ref().map(S3VersionId::as_str),
+                bypass_governance,
+                secure_transport,
+                source_ip,
+            },
+            uri.path(),
+            &request_id.0.0,
+        )
+        .await;
+        let authorized = match authorization {
+            Ok(authorized) => authorized,
+            Err(error) if error.code == "AccessDenied" => {
+                result.errors.push(DeleteObjectError {
+                    key: object.key,
+                    version_id: requested_version_id,
+                    code: "AccessDenied".to_owned(),
+                    message: "Access Denied.".to_owned(),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let target_application_id = authorized.application_id();
         let deletion = service
             .delete(&DeleteObjectRequest {
-                application_id: auth.application.id,
+                application_id: target_application_id,
                 bucket_name: bucket_name.clone(),
                 object_key: object.key.clone(),
-                version_id,
+                version_id: version_id.clone(),
                 bypass_governance,
                 deleted_by: auth.actor_id.clone(),
             })
             .await;
+        if let Ok(receipt) = &deletion {
+            record_s3_resource_audit(
+                &state,
+                &auth,
+                target_application_id,
+                &request_id.0.0,
+                "s3.object.deleted",
+                ("s3_object", format!("{bucket_name}/{}", object.key)),
+                serde_json::json!({
+                    "bucket": &bucket_name,
+                    "object_key": &object.key,
+                    "requested_version_id": version_id.as_ref().map(S3VersionId::as_str),
+                    "result_version_id": receipt.version_id.as_ref().map(S3VersionId::as_str),
+                    "delete_marker": receipt.delete_marker,
+                    "bypass_governance": bypass_governance,
+                    "protocol": "s3",
+                    "batch": true,
+                }),
+            )
+            .await;
+        }
         record_s3_batch_delete_result(
             &mut result,
             object.key,
@@ -1149,24 +1204,23 @@ pub(super) async fn s3_put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket_name, object_key)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
-    method: Method,
-    headers: HeaderMap,
     request_id: Extension<RequestId>,
-    content: Body,
+    request: axum::extract::Request,
 ) -> Result<Response, S3ApiError> {
+    let (parts, content) = request.into_parts();
+    let method = parts.method;
+    let headers = parts.headers;
+    let source_ip = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.ip());
     if classify_s3_object_tagging(&uri, &request_id.0.0)? {
         let content = to_bytes(content, MAX_S3_XML_BODY_BYTES)
             .await
             .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
-        let auth = authenticate_s3_application(
-            &state,
-            &method,
-            &uri,
-            &headers,
-            &content,
-            &request_id.0.0,
-        )
-        .await?;
+        let auth =
+            authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
+                .await?;
         return s3_put_object_tagging(
             S3ObjectOperation {
                 state: &state,
@@ -1178,24 +1232,17 @@ pub(super) async fn s3_put_object(
             },
             &headers,
             &content,
+            source_ip,
         )
         .await;
     }
-    if let Some(lock_operation) =
-        classify_s3_object_version_lock(&uri, &request_id.0.0)?
-    {
+    if let Some(lock_operation) = classify_s3_object_version_lock(&uri, &request_id.0.0)? {
         let content = to_bytes(content, MAX_S3_XML_BODY_BYTES)
             .await
             .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
-        let auth = authenticate_s3_application(
-            &state,
-            &method,
-            &uri,
-            &headers,
-            &content,
-            &request_id.0.0,
-        )
-        .await?;
+        let auth =
+            authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
+                .await?;
         return s3_put_object_version_lock(
             S3ObjectOperation {
                 state: &state,
@@ -1208,6 +1255,7 @@ pub(super) async fn s3_put_object(
             lock_operation,
             &headers,
             &content,
+            source_ip,
         )
         .await;
     }
@@ -1215,7 +1263,6 @@ pub(super) async fn s3_put_object(
         authenticate_s3_streaming_application(&state, &method, &uri, &headers, &request_id.0.0)
             .await?;
     if s3_query_flag(&uri, "acl", &request_id.0.0)? {
-        reject_s3_versioning(&uri, &request_id.0.0)?;
         let content = to_bytes(content, MAX_ERROR_RESPONSE_BYTES)
             .await
             .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
@@ -1233,6 +1280,7 @@ pub(super) async fn s3_put_object(
             },
             &headers,
             &content,
+            source_ip,
         )
         .await;
     }
@@ -1275,6 +1323,7 @@ pub(super) async fn s3_put_object(
                 part_number,
                 &signature,
                 &headers,
+                source_ip,
                 content,
             )
             .await
@@ -1285,6 +1334,7 @@ pub(super) async fn s3_put_object(
                 part_number,
                 signature,
                 &headers,
+                source_ip,
                 content,
             )
             .await
@@ -1303,6 +1353,7 @@ pub(super) async fn s3_put_object(
             },
             &signature,
             &headers,
+            source_ip,
             content,
         )
         .await;
@@ -1318,6 +1369,7 @@ pub(super) async fn s3_put_object(
         },
         &signature,
         &headers,
+        source_ip,
         content,
     )
     .await
@@ -1405,6 +1457,7 @@ pub(super) async fn s3_get_object(
 
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    let source_ip = s3_data_source_ip(connect_info.as_ref());
     let signed_operation = S3ObjectOperation {
         state: &state,
         auth: &auth,
@@ -1422,7 +1475,7 @@ pub(super) async fn s3_get_object(
                     &request_id.0.0,
                 ));
             }
-            s3_get_object_tagging(signed_operation).await
+            s3_get_object_tagging(signed_operation, source_ip).await
         }
         S3ObjectGetOperation::VersionLock(lock_operation) => {
             if method != Method::GET {
@@ -1432,10 +1485,9 @@ pub(super) async fn s3_get_object(
                     &request_id.0.0,
                 ));
             }
-            s3_get_object_version_lock(signed_operation, lock_operation).await
+            s3_get_object_version_lock(signed_operation, lock_operation, source_ip).await
         }
         S3ObjectGetOperation::Acl => {
-            reject_s3_versioning(&uri, &request_id.0.0)?;
             if method != Method::GET {
                 return Err(S3ApiError::invalid_argument(
                     "GetObjectAcl requires GET.",
@@ -1449,6 +1501,7 @@ pub(super) async fn s3_get_object(
                 &bucket_name,
                 &object_key,
                 &uri,
+                source_ip,
                 &request_id.0.0,
             )
             .await
@@ -1463,13 +1516,9 @@ pub(super) async fn s3_get_object(
                 ));
             }
             s3_list_parts(
-                &state,
-                &auth,
-                &bucket_name,
-                &object_key,
+                signed_operation,
                 &upload_id,
-                &uri,
-                &request_id.0.0,
+                s3_data_source_ip(connect_info.as_ref()),
             )
             .await
         }

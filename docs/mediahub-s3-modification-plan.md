@@ -1298,10 +1298,10 @@ PutBucketObjectLockConfiguration：
 - versionId/null version/delete marker response headers；
 - 标准 S3 XML error。
 
-CopyObject/UploadPartCopy、版本级 Object Tagging，以及 Bucket Policy signed-owner 管理 API/PolicyStatus 已由后续纵向切片完成。Access Key Identity Policy persistence/管理面与 GetObject、HeadObject、ListObjectsV2 的 unified/anonymous enforcement 也已完成；写入、Copy、Multipart、版本列表、Tagging、Object Lock 与 Bucket 控制面的统一授权仍待接线。Notification、Bucket Tagging、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token 也尚未实现。未实现 operation 必须返回标准错误，不能假成功。
+CopyObject/UploadPartCopy、版本级 Object Tagging，以及 Bucket Policy signed-owner 管理 API/PolicyStatus 已由后续纵向切片完成。Access Key Identity Policy persistence/管理面、GetObject/HeadObject/ListObjectsV2 的 unified/anonymous enforcement，以及 Put/Copy/Multipart/Tagging/ACL/Retention/LegalHold/Delete 的 signed unified enforcement 也已完成；版本列表、account action 与 Bucket 控制面的统一授权仍待接线。Notification、Bucket Tagging、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token 也尚未实现。未实现 operation 必须返回标准错误，不能假成功。
 ## 10. Policy 实现
 
-> 当前实现状态：Bucket Policy strict Core parser/evaluator、稳定 JSON 与 PolicyStatus 已完成；迁移 `0014` 已提供稳定 12 位 account ID、全局 Bucket namespace 和 policy persistence；signed owner 的 GET/PUT/DELETE `?policy` 与 GET `?policyStatus` 已完成，并通过 PostgreSQL 17 SQLx HTTP 7/7。迁移 `0015`、Access Key Identity Policy 管理 API/OpenAPI/控制台与 App unified authorization service 已完成；GetObject、HeadObject、ListObjectsV2 已接入并通过真实 PostgreSQL 17 HTTP contract。其他 handler 仍暂时使用旧 `permissions`，因此本章最终授权模型尚未全面启用。
+> 当前实现状态：Bucket Policy strict Core parser/evaluator、稳定 JSON 与 PolicyStatus 已完成；迁移 `0014` 已提供稳定 12 位 account ID、全局 Bucket namespace 和 policy persistence；signed owner 的 GET/PUT/DELETE `?policy` 与 GET `?policyStatus` 已完成，并通过 PostgreSQL 17 SQLx HTTP 7/7。迁移 `0015`、Access Key Identity Policy 管理 API/OpenAPI/控制台与 App unified authorization service 已完成。GetObject、HeadObject、ListObjectsV2 支持 unified/anonymous；Put/Copy/Multipart/Tagging/ACL/Retention/LegalHold/Delete 已接入 signed unified authorization，并以真实 PostgreSQL 17 HTTP contract 覆盖跨账户 owner、附加 action、Governance bypass 和防枚举。ListObjectVersions、account action 与 Bucket 控制面尚未迁移，因此本章最终授权模型仍未全面启用。
 
 ### 10.1 Core 类型
 
@@ -2002,7 +2002,7 @@ crates/mediahub-server/tests/s3/
 
 ### Phase 7：补齐 S3 扩展切片（进行中）
 
-CopyObject/UploadPartCopy、Object Tagging、S3 quota 闭环、Bucket Policy 管理面，以及 Identity Policy persistence/管理面与读取数据面统一授权已完成。Policy 下一步是把同一 authorization service 扩展到写入、Copy、Multipart、版本列表、Tagging、Object Lock 和 Bucket 控制面；完成前不得宣称标准 Policy 授权全面启用。随后实现 Notification，再处理 Bucket Tagging、CORS/SSE 与 virtual-host style。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
+CopyObject/UploadPartCopy、Object Tagging、S3 quota 闭环、Bucket Policy 管理面、Identity Policy persistence/管理面，以及读取与 signed 对象数据面的统一授权已完成。Policy 下一步是把同一 authorization service 扩展到 ListObjectVersions、account action 和 Bucket 控制面；完成前不得宣称全部标准 Policy action 已启用。随后实现 Notification，再处理 Bucket Tagging、CORS/SSE 与 virtual-host style。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
 
 ### Phase 8：切换其余消费者
 

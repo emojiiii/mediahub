@@ -31,45 +31,45 @@ async fn s3_get_object_acl(
     bucket_name: &str,
     object_key: &str,
     uri: &Uri,
+    source_ip: Option<std::net::IpAddr>,
     request_id: &str,
 ) -> Result<Response, S3ApiError> {
-    auth.authorize("media:read")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
-    let bucket = state
-        .repository
-        .find_bucket_by_name(auth.application.id, bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Bucket lookup failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), request_id))?;
-    let object = state
-        .repository
-        .find_s3_object(auth.application.id, bucket.id(), object_key)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 object ACL lookup failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
-    let current = state
-        .repository
-        .find_current_s3_object_version(object.id())
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 current object-version ACL lookup failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
-        })?
-        .filter(|version| matches!(version.payload(), ObjectVersionPayload::Object(_)))
-        .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
-    let _ = current;
+    validate_s3_object_key(object_key, uri.path(), request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: S3ObjectSubresourcePolicyOperation::GetAcl,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
+    let (bucket, _) = load_s3_object_acl_target(
+        state,
+        authorization.application_id(),
+        bucket_name,
+        object_key,
+        version_id.as_ref(),
+        uri.path(),
+        request_id,
+    )
+    .await?;
     let acl = match bucket.policy().visibility() {
         Visibility::Private => ObjectAcl::Private,
         Visibility::Public => ObjectAcl::PublicRead,
     };
-    let body = get_object_acl_xml(&auth.application.app_id, "PrismArk Application", acl)
-        .map_err(|error| S3ApiError::from_xml(error, uri.path(), request_id))?;
+    let body = get_object_acl_xml(
+        authorization.bucket.owner_account_id.as_str(),
+        "PrismArk Account",
+        acl,
+    )
+    .map_err(|error| S3ApiError::from_xml(error, uri.path(), request_id))?;
     Ok(s3_xml_response(StatusCode::OK, body, request_id))
 }
 
@@ -77,6 +77,7 @@ async fn s3_put_object_acl(
     operation: S3ObjectOperation<'_>,
     headers: &HeaderMap,
     content: &[u8],
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -86,8 +87,22 @@ async fn s3_put_object_acl(
         uri,
         request_id,
     } = operation;
-    auth.authorize("media:update")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
+    validate_s3_object_key(object_key, uri.path(), request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: S3ObjectSubresourcePolicyOperation::PutAcl,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
     if !content.is_empty() {
         return Err(S3ApiError::acl_not_supported(uri.path(), request_id));
     }
@@ -98,38 +113,76 @@ async fn s3_put_object_acl(
             request_id,
         )
     })?;
-    let bucket = state
-        .repository
-        .find_bucket_by_name(auth.application.id, bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Bucket lookup failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), request_id))?;
-    let object = state
-        .repository
-        .find_s3_object(auth.application.id, bucket.id(), object_key)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 object ACL lookup failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
-    state
-        .repository
-        .find_current_s3_object_version(object.id())
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 current object-version ACL lookup failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
-        })?
-        .filter(|version| matches!(version.payload(), ObjectVersionPayload::Object(_)))
-        .ok_or_else(|| S3ApiError::no_such_key(uri.path(), request_id))?;
+    let (bucket, _) = load_s3_object_acl_target(
+        state,
+        authorization.application_id(),
+        bucket_name,
+        object_key,
+        version_id.as_ref(),
+        uri.path(),
+        request_id,
+    )
+    .await?;
     if visibility != bucket.policy().visibility() {
         return Err(S3ApiError::acl_not_supported(uri.path(), request_id));
     }
     Ok(s3_empty_response(StatusCode::OK, request_id))
+}
+
+async fn load_s3_object_acl_target(
+    state: &AppState,
+    application_id: ApplicationId,
+    bucket_name: &str,
+    object_key: &str,
+    version_id: Option<&S3VersionId>,
+    resource: &str,
+    request_id: &str,
+) -> Result<(Bucket, ObjectVersion), S3ApiError> {
+    let bucket = state
+        .repository
+        .find_bucket_by_name(application_id, bucket_name)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 Bucket lookup failed");
+            S3ApiError::service_unavailable(resource, request_id)
+        })?
+        .ok_or_else(|| S3ApiError::no_such_bucket(resource, request_id))?;
+    let object = state
+        .repository
+        .find_s3_object(application_id, bucket.id(), object_key)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 object ACL lookup failed");
+            S3ApiError::service_unavailable(resource, request_id)
+        })?
+        .ok_or_else(|| S3ApiError::no_such_key(resource, request_id))?;
+    let version = match version_id {
+        Some(version_id) => {
+            state
+                .repository
+                .find_s3_object_version(object.id(), version_id)
+                .await
+        }
+        None => {
+            state
+                .repository
+                .find_current_s3_object_version(object.id())
+                .await
+        }
+    }
+    .map_err(|error| {
+        warn!(error = %error, "S3 object-version ACL lookup failed");
+        S3ApiError::service_unavailable(resource, request_id)
+    })?
+    .filter(|version| matches!(version.payload(), ObjectVersionPayload::Object(_)))
+    .ok_or_else(|| {
+        if version_id.is_some() {
+            S3ApiError::no_such_version(resource, request_id)
+        } else {
+            S3ApiError::no_such_key(resource, request_id)
+        }
+    })?;
+    Ok((bucket, version))
 }
 
 fn s3_canned_acl(
@@ -168,7 +221,6 @@ fn validate_s3_object_key(
         Ok(())
     }
 }
-
 
 fn s3_query_value(
     uri: &Uri,
@@ -247,9 +299,7 @@ fn s3_sigv4_declares_signed_header(headers: &HeaderMap, uri: &Uri, expected: &st
         })
     } else {
         url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
-            .find_map(|(name, value)| {
-                (name == "X-Amz-SignedHeaders").then(|| value.into_owned())
-            })
+            .find_map(|(name, value)| (name == "X-Amz-SignedHeaders").then(|| value.into_owned()))
     };
     declared.is_some_and(|headers| headers.split(';').any(|header| header == expected))
 }
@@ -310,25 +360,34 @@ pub(super) async fn s3_post_object(
     State(state): State<Arc<AppState>>,
     Path((bucket_name, object_key)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
-    method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
     content: Bytes,
 ) -> Result<Response, S3ApiError> {
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &content, &request_id.0.0)
-            .await?;
+    let auth = authenticate_s3_application(
+        &state,
+        &Method::POST,
+        &uri,
+        &headers,
+        &content,
+        &request_id.0.0,
+    )
+    .await?;
     reject_s3_versioning(&uri, &request_id.0.0)?;
     if s3_query_flag(&uri, "uploads", &request_id.0.0)? {
         reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         return s3_create_multipart_upload(
-            &state,
-            &auth,
-            &bucket_name,
-            &object_key,
+            S3ObjectOperation {
+                state: &state,
+                auth: &auth,
+                bucket_name: &bucket_name,
+                object_key: &object_key,
+                uri: &uri,
+                request_id: &request_id.0.0,
+            },
             &headers,
-            &uri,
-            &request_id.0.0,
+            s3_data_source_ip(connect_info.as_ref()),
         )
         .await;
     }
@@ -345,6 +404,7 @@ pub(super) async fn s3_post_object(
             },
             &upload_id,
             &content,
+            s3_data_source_ip(connect_info.as_ref()),
         )
         .await;
     }
@@ -361,57 +421,149 @@ pub(super) async fn s3_delete_object(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     let tagging_operation = classify_s3_object_tagging(&uri, &request_id.0.0)?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
     if tagging_operation {
-        return s3_delete_object_tagging(S3ObjectOperation {
-            state: &state,
-            auth: &auth,
-            bucket_name: &bucket_name,
-            object_key: &object_key,
-            uri: &uri,
-            request_id: &request_id.0.0,
-        })
+        return s3_delete_object_tagging(
+            S3ObjectOperation {
+                state: &state,
+                auth: &auth,
+                bucket_name: &bucket_name,
+                object_key: &object_key,
+                uri: &uri,
+                request_id: &request_id.0.0,
+            },
+            s3_data_source_ip(connect_info.as_ref()),
+        )
         .await;
     }
     if let Some(upload_id) = s3_query_value(&uri, "uploadId", &request_id.0.0)? {
         reject_s3_versioning(&uri, &request_id.0.0)?;
         return s3_abort_multipart_upload(
-            &state,
-            &auth,
-            &bucket_name,
-            &object_key,
+            S3ObjectOperation {
+                state: &state,
+                auth: &auth,
+                bucket_name: &bucket_name,
+                object_key: &object_key,
+                uri: &uri,
+                request_id: &request_id.0.0,
+            },
             &upload_id,
-            &uri,
-            &request_id.0.0,
+            s3_data_source_ip(connect_info.as_ref()),
         )
         .await;
     }
 
-    auth.authorize("media:delete")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
     validate_s3_object_key(&object_key, uri.path(), &request_id.0.0)?;
     let version_id = parse_s3_version_id(&uri, &request_id.0.0)?;
-    let bypass_governance =
-        parse_s3_bypass_governance(&headers, &uri, &request_id.0.0)?;
+    let bypass_governance = parse_s3_bypass_governance(&headers, &uri, &request_id.0.0)?;
+    let authorized = authorize_s3_signed_delete_request(
+        &state,
+        &auth,
+        S3DeleteAuthorizationInput {
+            bucket_name: &bucket_name,
+            object_key: &object_key,
+            version_id: version_id.as_ref().map(S3VersionId::as_str),
+            bypass_governance,
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        uri.path(),
+        &request_id.0.0,
+    )
+    .await?;
     let service = runtime_s3_object_service(&state, uri.path(), &request_id.0.0)?;
     let receipt = service
         .delete(&DeleteObjectRequest {
-            application_id: auth.application.id,
-            bucket_name,
-            object_key,
-            version_id,
+            application_id: authorized.application_id(),
+            bucket_name: bucket_name.clone(),
+            object_key: object_key.clone(),
+            version_id: version_id.clone(),
             bypass_governance,
             deleted_by: auth.actor_id.clone(),
         })
         .await
-        .map_err(|error| {
-            map_s3_object_service_error(error, uri.path(), &request_id.0.0)
-        })?;
+        .map_err(|error| map_s3_object_service_error(error, uri.path(), &request_id.0.0))?;
+    record_s3_resource_audit(
+        &state,
+        &auth,
+        authorized.application_id(),
+        &request_id.0.0,
+        "s3.object.deleted",
+        ("s3_object", format!("{bucket_name}/{object_key}")),
+        serde_json::json!({
+            "bucket": &bucket_name,
+            "object_key": &object_key,
+            "requested_version_id": version_id.as_ref().map(S3VersionId::as_str),
+            "result_version_id": receipt.version_id.as_ref().map(S3VersionId::as_str),
+            "delete_marker": receipt.delete_marker,
+            "bypass_governance": bypass_governance,
+            "protocol": "s3",
+        }),
+    )
+    .await;
     s3_delete_object_response(&receipt, uri.path(), &request_id.0.0)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct S3DeleteAuthorizationInput<'a> {
+    bucket_name: &'a str,
+    object_key: &'a str,
+    version_id: Option<&'a str>,
+    bypass_governance: bool,
+    secure_transport: bool,
+    source_ip: Option<std::net::IpAddr>,
+}
+
+async fn authorize_s3_signed_delete_request(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    input: S3DeleteAuthorizationInput<'_>,
+    resource: &str,
+    request_id: &str,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    let request = S3DataAuthorizationInput {
+        action: if input.version_id.is_some() {
+            S3PolicyAction::DeleteObjectVersion
+        } else {
+            S3PolicyAction::DeleteObject
+        },
+        bucket_name: input.bucket_name,
+        object_key: Some(input.object_key),
+        version_id: input.version_id,
+        prefix: None,
+        delimiter: None,
+        max_keys: None,
+        secure_transport: input.secure_transport,
+        source_ip: input.source_ip,
+    };
+    let authorized =
+        authorize_s3_signed_data_request(state, auth, request, resource, request_id).await?;
+    if input.bypass_governance {
+        let bypass_authorized = authorize_s3_signed_data_request(
+            state,
+            auth,
+            S3DataAuthorizationInput {
+                action: S3PolicyAction::BypassGovernanceRetention,
+                ..request
+            },
+            resource,
+            request_id,
+        )
+        .await?;
+        if bypass_authorized.application_id() != authorized.application_id() {
+            warn!(
+                bucket_name = input.bucket_name,
+                "S3 governance-bypass authorization resolved a different bucket owner"
+            );
+            return Err(S3ApiError::service_unavailable(resource, request_id));
+        }
+    }
+    Ok(authorized)
 }
 
 fn s3_delete_object_response(

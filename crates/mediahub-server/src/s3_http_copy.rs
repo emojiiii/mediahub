@@ -21,10 +21,43 @@ enum S3TaggingDirective {
     Replace,
 }
 
+async fn authorize_s3_copy_source(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    source: &S3CopySource,
+    uri: &Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &str,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    authorize_s3_signed_data_request(
+        state,
+        auth,
+        S3DataAuthorizationInput {
+            action: if source.version_id.is_some() {
+                S3PolicyAction::GetObjectVersion
+            } else {
+                S3PolicyAction::GetObject
+            },
+            bucket_name: &source.bucket_name,
+            object_key: Some(&source.object_key),
+            version_id: source.version_id.as_ref().map(S3VersionId::as_str),
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(uri),
+            source_ip,
+        },
+        uri.path(),
+        request_id,
+    )
+    .await
+}
+
 async fn s3_copy_object(
     operation: S3ObjectOperation<'_>,
     signature: &ParsedSigV4,
     headers: &HeaderMap,
+    source_ip: Option<std::net::IpAddr>,
     content: Body,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
@@ -37,9 +70,6 @@ async fn s3_copy_object(
     } = operation;
     let resource = uri.path();
     verify_s3_copy_body(signature, content, resource, request_id).await?;
-    auth.authorize("media:read")
-        .and_then(|_| auth.authorize("media:upload"))
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     reject_unsupported_s3_copy_headers(headers, false, resource, request_id)?;
     validate_s3_object_key(object_key, resource, request_id)?;
     if s3_query_value(uri, "versionId", request_id)?.is_some() {
@@ -53,6 +83,7 @@ async fn s3_copy_object(
     let directive = parse_s3_metadata_directive(headers, resource, request_id)?;
     let tagging_directive = parse_s3_tagging_directive(headers, resource, request_id)?;
     let replacement_tags = parse_s3_tagging_header(headers, resource, request_id)?;
+    let canned_acl = s3_canned_acl(headers, resource, request_id)?;
     if tagging_directive == S3TaggingDirective::Copy && replacement_tags.is_some() {
         return Err(S3ApiError::invalid_request(
             "x-amz-tagging requires x-amz-tagging-directive=REPLACE for CopyObject.",
@@ -60,6 +91,10 @@ async fn s3_copy_object(
             request_id,
         ));
     }
+    let replacement_writes_tags = tagging_directive == S3TaggingDirective::Replace
+        && replacement_tags
+            .as_ref()
+            .is_some_and(|tags| !tags.is_empty());
     if source.bucket_name == bucket_name
         && source.object_key == object_key
         && source.version_id.is_none()
@@ -73,10 +108,32 @@ async fn s3_copy_object(
         ));
     }
 
+    let target_policy_request = S3PutObjectPolicyRequest {
+        state,
+        auth,
+        bucket_name,
+        object_key,
+        uri,
+        source_ip,
+        request_id,
+    };
+    let target_authorization = authorize_s3_put_object_target(
+        target_policy_request,
+        S3PutObjectAuthorizationRequirements {
+            tagging: replacement_writes_tags,
+            acl: canned_acl.is_some(),
+            ..S3PutObjectAuthorizationRequirements::default()
+        },
+    )
+    .await?;
+    let source_authorization =
+        authorize_s3_copy_source(state, auth, &source, uri, source_ip, request_id).await?;
+    let target_application_id = target_authorization.application_id();
+    let source_application_id = source_authorization.application_id();
     let service = runtime_s3_object_service(state, resource, request_id)?;
     let source_head = service
         .head(&S3ObjectRequest {
-            application_id: auth.application.id,
+            application_id: source_application_id,
             bucket_name: source.bucket_name.clone(),
             object_key: source.object_key.clone(),
             version_id: source.version_id.clone(),
@@ -111,9 +168,22 @@ async fn s3_copy_object(
         S3TaggingDirective::Copy => source_head.tags.clone(),
         S3TaggingDirective::Replace => replacement_tags.unwrap_or_default(),
     };
+    if !object_tags.is_empty() && !replacement_writes_tags {
+        let tagging_authorization =
+            authorize_s3_put_object_action(target_policy_request, S3PolicyAction::PutObjectTagging)
+                .await?;
+        ensure_same_s3_put_object_target(
+            &target_authorization,
+            &tagging_authorization,
+            S3PolicyAction::PutObjectTagging,
+            bucket_name,
+            resource,
+            request_id,
+        )?;
+    }
     let receipt = service
         .begin_put(&BeginPutObjectRequest {
-            application_id: auth.application.id,
+            application_id: target_application_id,
             bucket_name: bucket_name.to_owned(),
             object_key: object_key.to_owned(),
             expected_size_bytes: source_payload.size_bytes(),
@@ -138,7 +208,7 @@ async fn s3_copy_object(
     {
         Ok(streamed) => streamed,
         Err(error) => {
-            abort_s3_staged_put(state, &service, auth.application.id, intent_id).await;
+            abort_s3_staged_put(state, &service, target_application_id, intent_id).await;
             return Err(s3_streaming_upload_error(
                 error,
                 source_payload.size_bytes(),
@@ -149,7 +219,7 @@ async fn s3_copy_object(
     };
     let completed = match service
         .complete_put(&CompletePutObjectRequest {
-            application_id: auth.application.id,
+            application_id: target_application_id,
             intent_id,
             streamed,
             created_by: auth.actor_id.clone(),
@@ -159,7 +229,7 @@ async fn s3_copy_object(
     {
         Ok(completed) => completed,
         Err(error) => {
-            abort_s3_staged_put(state, &service, auth.application.id, intent_id).await;
+            abort_s3_staged_put(state, &service, target_application_id, intent_id).await;
             return Err(map_s3_object_service_error(error, resource, request_id));
         }
     };
@@ -185,13 +255,13 @@ async fn s3_copy_object(
         resource,
         request_id,
     )?;
-    record_audit(
+    super::record_s3_resource_audit(
         state,
         auth,
+        target_application_id,
         request_id,
         "s3.object.copied",
-        "s3_object",
-        completed.object.id().to_string(),
+        ("s3_object", completed.object.id().to_string()),
         serde_json::json!({
             "protocol": "s3",
             "source_bucket": source.bucket_name,
@@ -212,6 +282,7 @@ async fn s3_upload_part_copy(
     part_number: u16,
     signature: &ParsedSigV4,
     headers: &HeaderMap,
+    source_ip: Option<std::net::IpAddr>,
     content: Body,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
@@ -224,13 +295,25 @@ async fn s3_upload_part_copy(
     } = operation;
     let resource = uri.path();
     verify_s3_copy_body(signature, content, resource, request_id).await?;
-    auth.authorize("media:read")
-        .and_then(|_| auth.authorize("media:upload"))
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     reject_unsupported_s3_copy_headers(headers, true, resource, request_id)?;
+    let target_authorization =
+        authorize_s3_multipart_upload_request(S3MultipartAuthorizationRequest {
+            state,
+            auth,
+            action: S3PolicyAction::PutObject,
+            bucket_name,
+            object_key,
+            uri,
+            source_ip,
+            request_id,
+        })
+        .await?;
+    let source = parse_s3_copy_source(headers, resource, request_id)?;
+    let source_authorization =
+        authorize_s3_copy_source(state, auth, &source, uri, source_ip, request_id).await?;
     let upload = find_s3_multipart_upload(
         state,
-        auth,
+        &target_authorization,
         bucket_name,
         object_key,
         upload_id,
@@ -243,11 +326,10 @@ async fn s3_upload_part_copy(
     {
         return Err(S3ApiError::no_such_upload(resource, request_id));
     }
-    let source = parse_s3_copy_source(headers, resource, request_id)?;
     let service = runtime_s3_object_service(state, resource, request_id)?;
     let source_head = service
         .head(&S3ObjectRequest {
-            application_id: auth.application.id,
+            application_id: source_authorization.application_id(),
             bucket_name: source.bucket_name,
             object_key: source.object_key,
             version_id: source.version_id,
@@ -269,13 +351,14 @@ async fn s3_upload_part_copy(
         .unwrap_or_else(|| source_payload.size_bytes());
     let bucket = state
         .repository
-        .find_bucket_by_name(auth.application.id, bucket_name)
+        .find_bucket_by_name(upload.application_id, bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 UploadPartCopy bucket policy lookup failed");
             S3ApiError::service_unavailable(resource, request_id)
         })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(resource, request_id))?;
+        .filter(|bucket| bucket.id() == upload.bucket_id)
+        .ok_or_else(|| S3ApiError::no_such_upload(resource, request_id))?;
     let maximum_upload_size = bucket
         .policy()
         .max_object_size()

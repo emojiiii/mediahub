@@ -348,6 +348,39 @@ async fn record_audit(
     }
 }
 
+/// Records an S3 mutation against the application that owns the authorized
+/// resource while preserving the signing access key as the actor.
+///
+/// Resource policies can authorize a caller from another application. Using
+/// `auth.application.id` for those operations would place the event in the
+/// caller's audit stream instead of the target bucket owner's stream.
+async fn record_s3_resource_audit(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    target_application_id: ApplicationId,
+    request_id: &str,
+    action: &str,
+    target: (&str, String),
+    summary: serde_json::Value,
+) {
+    let (target_type, target_id) = target;
+    let event = AuditEvent {
+        id: uuid::Uuid::now_v7().to_string(),
+        application_id: target_application_id,
+        actor_type: auth.actor_type.into(),
+        actor_id: auth.actor_id.clone(),
+        action: action.into(),
+        target_type: target_type.into(),
+        target_id,
+        request_id: request_id.into(),
+        summary,
+        created_at: OffsetDateTime::now_utc(),
+    };
+    if let Err(error) = state.repository.record_audit(&event).await {
+        warn!(error = %error, action, target_type, "S3 resource audit write failed after successful operation");
+    }
+}
+
 async fn record_session_audit(
     state: &AppState,
     user_id: UserId,
@@ -378,4 +411,3 @@ struct SessionAudit<'a> {
     target_id: String,
     summary: serde_json::Value,
 }
-

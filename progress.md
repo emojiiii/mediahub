@@ -212,3 +212,10 @@
 - 主线在全新 PostgreSQL 17 数据库从 0001 应用至 0015 后完成 workspace all-targets：PG adapter 30/30、App 64/64、Core 80/80、Server 179/179，全部 PostgreSQL contracts 通过；仅需外部独立 S3 的 contract 按环境约定 ignored。
 - Workspace strict Clippy `-D warnings` 通过；Web 36 files / 188 tests、OpenAPI verify、typecheck、production build 与 viewer chunk verification 全部通过。下一步是把同一 Policy 授权扩展到剩余 action。
 - Raw SigV4 offline golden、workspace fmt 与 git diff check 再次通过；测试容器 `prismark-s3quota-pg17-main-0808` 经确认 mounts=0 后按精确名称删除，测试数据库随容器清理。
+- 已创建本地提交 `679d2c3 feat: add S3 identity policy and anonymous reads`，未 push。主线随后抽出“已准确验签的 ApplicationAuth → unified Policy”公共 helper，供 buffered XML 与 streaming handler 复用。
+- 新一批四个并行切片已启动：Tagging/ACL/Retention/LegalHold；DeleteObject/DeleteObjects/Governance bypass；PutObject/Copy 双资源；Multipart 全链路。Bucket/account 控制面留作下一批。
+- 四个对象数据面 Policy 切片已完成并由主线收口：PutObject 按 Tagging/ACL/Retention/LegalHold 叠加 action；Copy/UploadPartCopy 对 source/target 双资源授权；Multipart 全链路按精确 action 授权并固定 Policy-before-upload 防枚举顺序；Tagging/ACL/Retention/LegalHold 与 Delete/DeleteObjects/Governance bypass 均不再回退旧 permissions。
+- 跨账户 mutation 全部使用授权目标 Bucket 的 application_id，成功审计写入目标租户而 actor 保留签名 Access Key；批量删除逐项授权，未授权项独立返回 AccessDenied。
+- 主线补齐 AWS 标准 `GetObjectVersionAcl` / `PutObjectVersionAcl` Core action 与 versionId 映射，并依据 AWS 官方权限表补齐 Put/Copy/CreateMultipart 的条件附加 action。
+- Docker Desktop 上新建 tmpfs、无 volume 的 PostgreSQL 17 容器完成 fresh 0001→0015 全工作区 all-targets 回归：PG adapter 30/30、App 64/64、Core 80/80、Server 184/184，全部 PostgreSQL contracts 通过；仅外部真实 S3 contract 按环境约定 ignored。
+- Workspace strict Clippy `-D warnings`、fmt、git diff check 与 Raw SigV4 offline golden 全部通过。下一步先创建本地 checkpoint commit（不 push），再并发推进 account、ListObjectVersions 与 Bucket 配置控制面授权。

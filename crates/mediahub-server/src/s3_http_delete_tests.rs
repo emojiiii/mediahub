@@ -192,5 +192,6 @@ fn regular_delete_http_paths_do_not_use_media_deletion_scheduling() {
         assert!(!source.contains("MediaState"));
         assert!(!source.contains("media_delete_scheduled"));
         assert!(!source.contains("schedule_delete"));
+        assert!(!source.contains("auth.authorize(\"media:delete\")"));
     }
 }

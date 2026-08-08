@@ -134,6 +134,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await
@@ -231,9 +232,7 @@ pub(super) async fn s3_bucket_put(
     }
     let content = to_bytes(content, MAX_S3_BUCKET_CONFIGURATION_BYTES + 1)
         .await
-        .map_err(|_| {
-            S3ApiError::entity_too_large(uri.path(), &request_id.0.0)
-        })?;
+        .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
     match operation {
         S3BucketPutOperation::CreateBucket => {
             s3_create_bucket(
@@ -742,8 +741,8 @@ fn s3_lifecycle_document_to_core(
                 Some(S3LifecycleExpiration::Days { days }) => {
                     Some(mediahub_core::S3Expiration::Days(days))
                 }
-                Some(S3LifecycleExpiration::Date { date }) => Some(
-                    mediahub_core::S3Expiration::Date(
+                Some(S3LifecycleExpiration::Date { date }) => {
+                    Some(mediahub_core::S3Expiration::Date(
                         OffsetDateTime::parse(
                             &date,
                             &time::format_description::well_known::Rfc3339,
@@ -753,8 +752,8 @@ fn s3_lifecycle_document_to_core(
                                 "Lifecycle Expiration Date is invalid.".to_owned(),
                             )
                         })?,
-                    ),
-                ),
+                    ))
+                }
                 Some(S3LifecycleExpiration::ExpiredObjectDeleteMarker) => {
                     Some(mediahub_core::S3Expiration::ExpiredObjectDeleteMarker)
                 }
@@ -772,11 +771,11 @@ fn s3_lifecycle_document_to_core(
                         noncurrent_days: value.noncurrent_days,
                     }
                 }),
-                abort_incomplete_multipart_upload: rule
-                    .abort_incomplete_multipart_upload
-                    .map(|value| mediahub_core::S3AbortIncompleteMultipartUpload {
+                abort_incomplete_multipart_upload: rule.abort_incomplete_multipart_upload.map(
+                    |value| mediahub_core::S3AbortIncompleteMultipartUpload {
                         days_after_initiation: value.days_after_initiation,
-                    }),
+                    },
+                ),
             })
         })
         .collect::<Result<Vec<_>, S3BucketConfigurationXmlError>>()?;
@@ -790,7 +789,9 @@ fn s3_lifecycle_document_to_core(
 fn s3_lifecycle_document_from_core(
     configuration: &mediahub_core::S3LifecycleConfiguration,
 ) -> Result<S3LifecycleDocument, String> {
-    configuration.validate().map_err(|error| error.to_string())?;
+    configuration
+        .validate()
+        .map_err(|error| error.to_string())?;
     let rules = configuration
         .rules
         .iter()
@@ -800,13 +801,13 @@ fn s3_lifecycle_document_from_core(
                 Some(mediahub_core::S3Expiration::Days(days)) => {
                     Some(S3LifecycleExpiration::Days { days: *days })
                 }
-                Some(mediahub_core::S3Expiration::Date(date)) => Some(
-                    S3LifecycleExpiration::Date {
+                Some(mediahub_core::S3Expiration::Date(date)) => {
+                    Some(S3LifecycleExpiration::Date {
                         date: date
                             .format(&time::format_description::well_known::Rfc3339)
                             .map_err(|error| error.to_string())?,
-                    },
-                ),
+                    })
+                }
                 Some(mediahub_core::S3Expiration::ExpiredObjectDeleteMarker) => {
                     Some(S3LifecycleExpiration::ExpiredObjectDeleteMarker)
                 }
@@ -819,23 +820,21 @@ fn s3_lifecycle_document_from_core(
                 },
                 filter: match &rule.filter {
                     mediahub_core::S3LifecycleFilter::Empty => S3LifecycleFilter::Empty,
-                    mediahub_core::S3LifecycleFilter::Prefix(value) => {
-                        S3LifecycleFilter::Prefix {
-                            value: value.clone(),
-                        }
-                    }
+                    mediahub_core::S3LifecycleFilter::Prefix(value) => S3LifecycleFilter::Prefix {
+                        value: value.clone(),
+                    },
                 },
                 expiration,
-                noncurrent_version_expiration: rule
-                    .noncurrent_version_expiration
-                    .map(|value| S3LifecycleNoncurrentExpiration {
+                noncurrent_version_expiration: rule.noncurrent_version_expiration.map(|value| {
+                    S3LifecycleNoncurrentExpiration {
                         noncurrent_days: value.noncurrent_days,
-                    }),
-                abort_incomplete_multipart_upload: rule
-                    .abort_incomplete_multipart_upload
-                    .map(|value| S3LifecycleAbortMultipart {
+                    }
+                }),
+                abort_incomplete_multipart_upload: rule.abort_incomplete_multipart_upload.map(
+                    |value| S3LifecycleAbortMultipart {
                         days_after_initiation: value.days_after_initiation,
-                    }),
+                    },
+                ),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

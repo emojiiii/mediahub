@@ -38,10 +38,101 @@ fn runtime_s3_object_service(
     .map_err(|error| map_s3_object_service_error(error, resource, request_id))
 }
 
+#[derive(Clone, Copy)]
+struct S3PutObjectPolicyRequest<'a> {
+    state: &'a AppState,
+    auth: &'a ApplicationAuth,
+    bucket_name: &'a str,
+    object_key: &'a str,
+    uri: &'a Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &'a str,
+}
+
+async fn authorize_s3_put_object_action(
+    request: S3PutObjectPolicyRequest<'_>,
+    action: S3PolicyAction,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    authorize_s3_signed_data_request(
+        request.state,
+        request.auth,
+        S3DataAuthorizationInput {
+            action,
+            bucket_name: request.bucket_name,
+            object_key: Some(request.object_key),
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(request.uri),
+            source_ip: request.source_ip,
+        },
+        request.uri.path(),
+        request.request_id,
+    )
+    .await
+}
+
+fn ensure_same_s3_put_object_target(
+    expected: &S3AuthorizedDataRequest,
+    actual: &S3AuthorizedDataRequest,
+    action: S3PolicyAction,
+    bucket_name: &str,
+    resource: &str,
+    request_id: &str,
+) -> Result<(), S3ApiError> {
+    if actual.bucket.application_id == expected.bucket.application_id
+        && actual.bucket.bucket_id == expected.bucket.bucket_id
+    {
+        return Ok(());
+    }
+    warn!(
+        bucket_name,
+        action = action.as_str(),
+        "S3 supplemental PutObject authorization resolved a different bucket owner"
+    );
+    Err(S3ApiError::service_unavailable(resource, request_id))
+}
+
+async fn authorize_s3_put_object_target(
+    request: S3PutObjectPolicyRequest<'_>,
+    requirements: S3PutObjectAuthorizationRequirements,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    let authorization = authorize_s3_put_object_action(request, S3PolicyAction::PutObject).await?;
+    for (required, action) in [
+        (requirements.tagging, S3PolicyAction::PutObjectTagging),
+        (requirements.acl, S3PolicyAction::PutObjectAcl),
+        (requirements.retention, S3PolicyAction::PutObjectRetention),
+        (requirements.legal_hold, S3PolicyAction::PutObjectLegalHold),
+    ] {
+        if required {
+            let supplemental = authorize_s3_put_object_action(request, action).await?;
+            ensure_same_s3_put_object_target(
+                &authorization,
+                &supplemental,
+                action,
+                request.bucket_name,
+                request.uri.path(),
+                request.request_id,
+            )?;
+        }
+    }
+    Ok(authorization)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct S3PutObjectAuthorizationRequirements {
+    tagging: bool,
+    acl: bool,
+    retention: bool,
+    legal_hold: bool,
+}
+
 async fn s3_put_regular_object(
     operation: S3ObjectOperation<'_>,
     signature: &ParsedSigV4,
     headers: &HeaderMap,
+    source_ip: Option<std::net::IpAddr>,
     content: Body,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
@@ -53,8 +144,6 @@ async fn s3_put_regular_object(
         request_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     validate_s3_object_key(object_key, resource, request_id)?;
     if s3_query_value(uri, "versionId", request_id)?.is_some() {
         return Err(S3ApiError::invalid_argument(
@@ -69,13 +158,33 @@ async fn s3_put_regular_object(
         .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     let content_type = s3_object_content_type(headers, resource, request_id)?;
     let user_metadata = s3_user_metadata(headers, resource, request_id)?;
-    let object_tags = parse_s3_tagging_header(headers, resource, request_id)?.unwrap_or_default();
+    let object_tags = parse_s3_tagging_header(headers, resource, request_id)?;
+    let canned_acl = s3_canned_acl(headers, resource, request_id)?;
     let expected_md5 = parse_content_md5(headers, resource, request_id)?;
     let object_lock =
         parse_put_object_lock_headers(headers, uri, request_id, OffsetDateTime::now_utc())?;
+    let target_authorization = authorize_s3_put_object_target(
+        S3PutObjectPolicyRequest {
+            state,
+            auth,
+            bucket_name,
+            object_key,
+            uri,
+            source_ip,
+            request_id,
+        },
+        S3PutObjectAuthorizationRequirements {
+            tagging: object_tags.is_some(),
+            acl: canned_acl.is_some(),
+            retention: object_lock.retention.is_some(),
+            legal_hold: object_lock.legal_hold.is_some(),
+        },
+    )
+    .await?;
+    let target_application_id = target_authorization.application_id();
     ensure_put_object_lock_bucket(
         state,
-        auth,
+        target_application_id,
         bucket_name,
         object_lock,
         resource,
@@ -87,13 +196,13 @@ async fn s3_put_regular_object(
     let service = runtime_s3_object_service(state, resource, request_id)?;
     let receipt = service
         .begin_put(&BeginPutObjectRequest {
-            application_id: auth.application.id,
+            application_id: target_application_id,
             bucket_name: bucket_name.to_owned(),
             object_key: object_key.to_owned(),
             expected_size_bytes: expected_size,
             content_type: Some(content_type.clone()),
             user_metadata,
-            object_tags,
+            object_tags: object_tags.unwrap_or_default(),
             expires_at: None,
         })
         .await
@@ -112,7 +221,7 @@ async fn s3_put_regular_object(
     {
         Ok(streamed) => streamed,
         Err(error) => {
-            abort_s3_staged_put(state, &service, auth.application.id, intent_id).await;
+            abort_s3_staged_put(state, &service, target_application_id, intent_id).await;
             return Err(s3_streaming_upload_error(
                 error,
                 expected_size,
@@ -123,14 +232,14 @@ async fn s3_put_regular_object(
     };
 
     if let Err(error) = signature.verify_payload_sha256(&streamed.sha256) {
-        abort_s3_staged_put(state, &service, auth.application.id, intent_id).await;
+        abort_s3_staged_put(state, &service, target_application_id, intent_id).await;
         return Err(S3ApiError::from_sigv4(error, resource, request_id));
     }
     if expected_md5
         .as_deref()
         .is_some_and(|expected| !expected.eq_ignore_ascii_case(&streamed.md5))
     {
-        abort_s3_staged_put(state, &service, auth.application.id, intent_id).await;
+        abort_s3_staged_put(state, &service, target_application_id, intent_id).await;
         return Err(S3ApiError::bad_digest(resource, request_id));
     }
 
@@ -138,7 +247,7 @@ async fn s3_put_regular_object(
     let completed = match service
         .complete_put_with_object_lock(
             &CompletePutObjectRequest {
-                application_id: auth.application.id,
+                application_id: target_application_id,
                 intent_id,
                 streamed,
                 created_by: auth.actor_id.clone(),
@@ -150,7 +259,7 @@ async fn s3_put_regular_object(
     {
         Ok(completed) => completed,
         Err(error) => {
-            abort_s3_staged_put(state, &service, auth.application.id, intent_id).await;
+            abort_s3_staged_put(state, &service, target_application_id, intent_id).await;
             return Err(map_s3_object_service_error(error, resource, request_id));
         }
     };
@@ -160,13 +269,13 @@ async fn s3_put_regular_object(
         .http_metrics
         .uploaded_bytes
         .fetch_add(streamed_size, Ordering::Relaxed);
-    record_audit(
+    super::record_s3_resource_audit(
         state,
         auth,
+        target_application_id,
         request_id,
         "s3.object.uploaded",
-        "s3_object",
-        completed.object.id().to_string(),
+        ("s3_object", completed.object.id().to_string()),
         serde_json::json!({
             "bucket": bucket_name,
             "object_key": object_key,

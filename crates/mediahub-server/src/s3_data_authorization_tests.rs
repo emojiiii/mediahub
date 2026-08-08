@@ -181,7 +181,9 @@ mod http_contract {
     };
     use mediahub_server::access_key::AccessKeyCipher;
 
-    async fn data_policy_test_state(pool: sqlx::PgPool) -> (Arc<AppState>, std::path::PathBuf) {
+    pub(super) async fn data_policy_test_state(
+        pool: sqlx::PgPool,
+    ) -> (Arc<AppState>, std::path::PathBuf) {
         let repository = PostgresRepository::new(pool);
         let storage_root = std::env::temp_dir().join(format!(
             "prismark-s3-data-policy-test-{}",
@@ -229,7 +231,7 @@ mod http_contract {
         (state, storage_root)
     }
 
-    async fn create_data_policy_identity(
+    pub(super) async fn create_data_policy_identity(
         state: &AppState,
         application_id: ApplicationId,
         access_key_id: &str,
@@ -264,7 +266,7 @@ mod http_contract {
             .expect("create access key");
     }
 
-    fn sign_data_policy_request(
+    pub(super) fn sign_data_policy_request(
         request: &mut http::Request<Vec<u8>>,
         access_key_id: &str,
         secret: &str,
@@ -321,7 +323,7 @@ mod http_contract {
             .apply_to_request_http1x(request);
     }
 
-    async fn send_data_policy_request(
+    pub(super) async fn send_data_policy_request(
         client: &reqwest::Client,
         request: http::Request<Vec<u8>>,
     ) -> reqwest::Response {
@@ -335,7 +337,7 @@ mod http_contract {
             .expect("S3 HTTP request")
     }
 
-    async fn install_identity_policy(
+    pub(super) async fn install_identity_policy(
         state: &AppState,
         application_id: ApplicationId,
         access_key_id: &str,
@@ -355,7 +357,7 @@ mod http_contract {
             .expect("access key identity");
     }
 
-    async fn install_bucket_policy(
+    pub(super) async fn install_bucket_policy(
         state: &AppState,
         application_id: ApplicationId,
         bucket_name: &str,
@@ -391,7 +393,11 @@ mod http_contract {
             .expect("bucket identity");
     }
 
-    async fn assert_s3_error(response: reqwest::Response, status: StatusCode, code: &str) {
+    pub(super) async fn assert_s3_error(
+        response: reqwest::Response,
+        status: StatusCode,
+        code: &str,
+    ) {
         assert_eq!(response.status(), status);
         let body = response.text().await.expect("S3 error XML");
         assert!(body.contains(&format!("<Code>{code}</Code>")), "{body}");
@@ -460,6 +466,15 @@ mod http_contract {
             send_data_policy_request(&client, create_bucket).await.status(),
             StatusCode::OK,
         );
+        install_identity_policy(
+            &state,
+            application_id,
+            access_key_id,
+            &format!(
+                r#"{{"Version":"2012-10-17","Statement":{{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket_name}/public/*"}}}}"#
+            ),
+        )
+        .await;
         let mut put_object = http::Request::builder()
             .method(Method::PUT)
             .uri(&object_url)
@@ -472,6 +487,16 @@ mod http_contract {
             send_data_policy_request(&client, put_object).await.status(),
             StatusCode::OK,
         );
+        state
+            .repository
+            .delete_s3_identity_policy(&DeleteS3IdentityPolicy {
+                application_id,
+                access_key_id: access_key_id.to_owned(),
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("delete PutObject fixture policy")
+            .expect("identity snapshot");
 
         let public_policy = serde_json::json!({
             "Version": "2012-10-17",
@@ -734,3 +759,5 @@ mod http_contract {
         std::fs::remove_dir_all(storage_root).expect("remove test object storage");
     }
 }
+
+include!("s3_put_copy_policy_tests.rs");

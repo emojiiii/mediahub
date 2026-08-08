@@ -180,7 +180,9 @@ pub enum S3PolicyAction {
     GetObject,
     GetObjectVersion,
     GetObjectAcl,
+    GetObjectVersionAcl,
     PutObjectAcl,
+    PutObjectVersionAcl,
     PutObject,
     DeleteObject,
     DeleteObjectVersion,
@@ -202,7 +204,7 @@ pub enum S3PolicyAction {
 }
 
 impl S3PolicyAction {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 40] = [
         Self::ListAllMyBuckets,
         Self::CreateBucket,
         Self::ListBucket,
@@ -224,7 +226,9 @@ impl S3PolicyAction {
         Self::GetObject,
         Self::GetObjectVersion,
         Self::GetObjectAcl,
+        Self::GetObjectVersionAcl,
         Self::PutObjectAcl,
+        Self::PutObjectVersionAcl,
         Self::PutObject,
         Self::DeleteObject,
         Self::DeleteObjectVersion,
@@ -266,7 +270,9 @@ impl S3PolicyAction {
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
             Self::GetObjectAcl => "s3:GetObjectAcl",
+            Self::GetObjectVersionAcl => "s3:GetObjectVersionAcl",
             Self::PutObjectAcl => "s3:PutObjectAcl",
+            Self::PutObjectVersionAcl => "s3:PutObjectVersionAcl",
             Self::PutObject => "s3:PutObject",
             Self::DeleteObject => "s3:DeleteObject",
             Self::DeleteObjectVersion => "s3:DeleteObjectVersion",
@@ -316,7 +322,7 @@ impl S3PolicyAction {
     }
 }
 
-const S3_BUCKET_POLICY_ACTIONS: [S3PolicyAction; 36] = [
+const S3_BUCKET_POLICY_ACTIONS: [S3PolicyAction; 38] = [
     S3PolicyAction::ListBucket,
     S3PolicyAction::ListBucketVersions,
     S3PolicyAction::ListBucketMultipartUploads,
@@ -336,7 +342,9 @@ const S3_BUCKET_POLICY_ACTIONS: [S3PolicyAction; 36] = [
     S3PolicyAction::GetObject,
     S3PolicyAction::GetObjectVersion,
     S3PolicyAction::GetObjectAcl,
+    S3PolicyAction::GetObjectVersionAcl,
     S3PolicyAction::PutObjectAcl,
+    S3PolicyAction::PutObjectVersionAcl,
     S3PolicyAction::PutObject,
     S3PolicyAction::DeleteObject,
     S3PolicyAction::DeleteObjectVersion,
@@ -2949,11 +2957,13 @@ mod tests {
     #[test]
     fn acl_policy_status_and_governance_bypass_actions_have_correct_scopes() {
         let object_policy = policy(&format!(
-            r#"{{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectAcl","s3:PutObjectAcl","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::{BUCKET}/*"}}"#
+            r#"{{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectAcl","s3:GetObjectVersionAcl","s3:PutObjectAcl","s3:PutObjectVersionAcl","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::{BUCKET}/*"}}"#
         ));
         for action in [
             S3PolicyAction::GetObjectAcl,
+            S3PolicyAction::GetObjectVersionAcl,
             S3PolicyAction::PutObjectAcl,
+            S3PolicyAction::PutObjectVersionAcl,
             S3PolicyAction::BypassGovernanceRetention,
         ] {
             assert_eq!(

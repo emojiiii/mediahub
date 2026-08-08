@@ -66,7 +66,7 @@ use super::s3_xml::{
 use super::{
     ApiError, AppState, ApplicationAuth, HmacIdentity, MAX_ERROR_RESPONSE_BYTES,
     MAX_UPLOAD_OBJECT_BYTES, RequestId, SystemClock, entity_tag_header_value, local_file_body,
-    normalized_mime, record_audit,
+    normalized_mime, record_audit, record_s3_resource_audit,
 };
 
 const MIN_S3_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;

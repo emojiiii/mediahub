@@ -12,8 +12,10 @@ fn classify_s3_object_version_lock(
 ) -> Result<Option<S3ObjectVersionLockOperation>, S3ApiError> {
     let retention = s3_query_value(uri, "retention", request_id)?;
     let legal_hold = s3_query_value(uri, "legal-hold", request_id)?;
-    for (name, value) in [("retention", retention.as_deref()), ("legal-hold", legal_hold.as_deref())]
-    {
+    for (name, value) in [
+        ("retention", retention.as_deref()),
+        ("legal-hold", legal_hold.as_deref()),
+    ] {
         if value.is_some_and(|value| !value.is_empty()) {
             return Err(S3ApiError::invalid_argument(
                 format!("{name} must be an empty S3 subresource parameter."),
@@ -67,18 +69,16 @@ fn parse_put_object_lock_headers(
         (None, None) => None,
         (Some(mode), Some(retain_until)) => {
             let mode = parse_s3_retention_mode(mode, uri, request_id)?;
-            let retain_until = OffsetDateTime::parse(
-                retain_until,
-                &time::format_description::well_known::Rfc3339,
-            )
-            .map_err(|_| {
-                S3ApiError::invalid_argument(
-                    "x-amz-object-lock-retain-until-date must be an RFC 3339 timestamp.",
-                    uri.path(),
-                    request_id,
-                )
-            })?
-            .to_offset(time::UtcOffset::UTC);
+            let retain_until =
+                OffsetDateTime::parse(retain_until, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| {
+                        S3ApiError::invalid_argument(
+                            "x-amz-object-lock-retain-until-date must be an RFC 3339 timestamp.",
+                            uri.path(),
+                            request_id,
+                        )
+                    })?
+                    .to_offset(time::UtcOffset::UTC);
             if retain_until <= now {
                 return Err(S3ApiError::invalid_argument(
                     "x-amz-object-lock-retain-until-date must be in the future.",
@@ -96,22 +96,18 @@ fn parse_put_object_lock_headers(
             ));
         }
     };
-    let legal_hold = single_s3_object_lock_header(
-        headers,
-        "x-amz-object-lock-legal-hold",
-        uri,
-        request_id,
-    )?
-    .map(|value| match value {
-        "ON" => Ok(true),
-        "OFF" => Ok(false),
-        _ => Err(S3ApiError::invalid_argument(
-            "x-amz-object-lock-legal-hold must be ON or OFF.",
-            uri.path(),
-            request_id,
-        )),
-    })
-    .transpose()?;
+    let legal_hold =
+        single_s3_object_lock_header(headers, "x-amz-object-lock-legal-hold", uri, request_id)?
+            .map(|value| match value {
+                "ON" => Ok(true),
+                "OFF" => Ok(false),
+                _ => Err(S3ApiError::invalid_argument(
+                    "x-amz-object-lock-legal-hold must be ON or OFF.",
+                    uri.path(),
+                    request_id,
+                )),
+            })
+            .transpose()?;
     Ok(NewS3ObjectLock {
         retention,
         legal_hold,
@@ -156,7 +152,7 @@ fn parse_s3_retention_mode(
 
 async fn ensure_put_object_lock_bucket(
     state: &AppState,
-    auth: &ApplicationAuth,
+    application_id: ApplicationId,
     bucket_name: &str,
     object_lock: NewS3ObjectLock,
     resource: &str,
@@ -167,7 +163,7 @@ async fn ensure_put_object_lock_bucket(
     }
     let bucket = state
         .repository
-        .find_s3_bucket(auth.application.id, bucket_name)
+        .find_s3_bucket(application_id, bucket_name)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 PutObject Object Lock bucket lookup failed");
@@ -227,6 +223,7 @@ fn reject_copy_object_lock_headers(
 async fn s3_get_object_version_lock(
     operation: S3ObjectOperation<'_>,
     lock_operation: S3ObjectVersionLockOperation,
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -236,14 +233,31 @@ async fn s3_get_object_version_lock(
         uri,
         request_id,
     } = operation;
-    auth.authorize("media:read")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
     validate_s3_object_key(object_key, uri.path(), request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let policy_operation = match lock_operation {
+        S3ObjectVersionLockOperation::Retention => S3ObjectSubresourcePolicyOperation::GetRetention,
+        S3ObjectVersionLockOperation::LegalHold => S3ObjectSubresourcePolicyOperation::GetLegalHold,
+    };
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: policy_operation,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
     let request = S3ObjectRequest {
-        application_id: auth.application.id,
+        application_id: authorization.application_id(),
         bucket_name: bucket_name.to_owned(),
         object_key: object_key.to_owned(),
-        version_id: parse_s3_version_id(uri, request_id)?,
+        version_id,
     };
     let service = runtime_s3_object_service(state, uri.path(), request_id)?;
     let head = service
@@ -271,6 +285,7 @@ async fn s3_put_object_version_lock(
     lock_operation: S3ObjectVersionLockOperation,
     headers: &HeaderMap,
     content: &[u8],
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -280,21 +295,68 @@ async fn s3_put_object_version_lock(
         uri,
         request_id,
     } = operation;
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
     validate_s3_object_key(object_key, uri.path(), request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let bypass_governance = match lock_operation {
+        S3ObjectVersionLockOperation::Retention => {
+            parse_s3_bypass_governance(headers, uri, request_id)?
+        }
+        S3ObjectVersionLockOperation::LegalHold => {
+            if headers.contains_key("x-amz-bypass-governance-retention") {
+                return Err(S3ApiError::invalid_request(
+                    "x-amz-bypass-governance-retention is not valid for PutObjectLegalHold.",
+                    uri.path(),
+                    request_id,
+                ));
+            }
+            false
+        }
+    };
+    let policy_operation = match lock_operation {
+        S3ObjectVersionLockOperation::Retention => S3ObjectSubresourcePolicyOperation::PutRetention,
+        S3ObjectVersionLockOperation::LegalHold => S3ObjectSubresourcePolicyOperation::PutLegalHold,
+    };
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: policy_operation,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
+    if bypass_governance {
+        authorize_s3_object_subresource(
+            state,
+            auth,
+            S3ObjectSubresourceAuthorizationRequest {
+                operation: S3ObjectSubresourcePolicyOperation::BypassGovernanceRetention,
+                bucket_name,
+                object_key,
+                version_id: version_id.as_ref(),
+                uri,
+                source_ip,
+                request_id,
+            },
+        )
+        .await?;
+    }
     validate_s3_configuration_content_md5(headers, content, uri, request_id)?;
     let request = S3ObjectRequest {
-        application_id: auth.application.id,
+        application_id: authorization.application_id(),
         bucket_name: bucket_name.to_owned(),
         object_key: object_key.to_owned(),
-        version_id: parse_s3_version_id(uri, request_id)?,
+        version_id,
     };
     let service = runtime_s3_object_service(state, uri.path(), request_id)?;
     let (version, audit_action) = match lock_operation {
         S3ObjectVersionLockOperation::Retention => {
             let retention = parse_s3_object_retention_xml(content, uri, request_id)?;
-            let bypass_governance = parse_s3_bypass_governance(headers, uri, request_id)?;
             (
                 service
                     .put_object_retention(&PutObjectRetentionRequest {
@@ -307,13 +369,6 @@ async fn s3_put_object_version_lock(
             )
         }
         S3ObjectVersionLockOperation::LegalHold => {
-            if headers.contains_key("x-amz-bypass-governance-retention") {
-                return Err(S3ApiError::invalid_request(
-                    "x-amz-bypass-governance-retention is not valid for PutObjectLegalHold.",
-                    uri.path(),
-                    request_id,
-                ));
-            }
             let legal_hold = parse_s3_object_legal_hold_xml(content, uri, request_id)?;
             (
                 service
@@ -326,15 +381,15 @@ async fn s3_put_object_version_lock(
             )
         }
     };
-    let version = version
-        .map_err(|error| map_s3_object_service_error(error, uri.path(), request_id))?;
-    record_audit(
+    let version =
+        version.map_err(|error| map_s3_object_service_error(error, uri.path(), request_id))?;
+    record_s3_resource_audit(
         state,
         auth,
+        authorization.application_id(),
         request_id,
         audit_action,
-        "object_version",
-        version.id().to_string(),
+        ("object_version", version.id().to_string()),
         serde_json::json!({
             "protocol": "s3",
             "bucket": bucket_name,

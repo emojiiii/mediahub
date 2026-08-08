@@ -838,7 +838,6 @@ async fn s3_bucket_object_lock_http_round_trip_is_signed_strict_and_persistent(p
         })
         .await
         .expect("persist access key");
-
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn({
@@ -1069,6 +1068,22 @@ async fn s3_object_version_lock_http_round_trip_enforces_retention_and_legal_hol
         })
         .await
         .expect("persist access key");
+    let version_lock_identity_policy = mediahub_app::S3IdentityPolicyDocument::parse(
+        br#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}"#,
+    )
+    .expect("ObjectVersion lock test identity policy");
+    mediahub_app::S3IdentityPolicyRepository::put_s3_identity_policy(
+        &state.repository,
+        &mediahub_app::PutS3IdentityPolicy {
+            application_id: application.id,
+            access_key_id: access_key_id.to_owned(),
+            policy: version_lock_identity_policy,
+            updated_at: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .expect("persist ObjectVersion lock test identity policy")
+    .expect("ObjectVersion lock test access key");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -1361,12 +1376,7 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         .await
         .expect("persist access key");
     let data_identity_policy = mediahub_app::S3IdentityPolicyDocument::parse(
-        format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::{}/*"}},{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::{}"}}]}}"#,
-            bucket.name(),
-            bucket.name(),
-        )
-        .as_bytes(),
+        br#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}"#,
     )
     .expect("S3 gateway test identity policy");
     mediahub_app::S3IdentityPolicyRepository::put_s3_identity_policy(
@@ -1788,7 +1798,7 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
     let get_acl = send_s3_test_request(&client, get_acl).await;
     assert_eq!(get_acl.status(), StatusCode::OK);
     let acl_xml = get_acl.text().await.expect("ACL XML");
-    assert!(acl_xml.contains("PrismArk Application"));
+    assert!(acl_xml.contains("PrismArk Account"));
     assert!(!acl_xml.contains("groups/global/AllUsers"));
     assert!(acl_xml.contains("<Permission>FULL_CONTROL</Permission>"));
 
@@ -4676,6 +4686,7 @@ async fn startup_rejects_database_key_versions_missing_from_the_keyring(pool: sq
 
 include!("handlers_object_versions_tests.rs");
 include!("access_key_policy_tests.rs");
+include!("s3_delete_policy_contract_tests.rs");
 
 #[test]
 fn signed_media_url_tokens_reject_tampering() {

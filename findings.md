@@ -243,3 +243,12 @@
 | AbortMultipartUpload / ListParts | `AbortMultipartUpload` / `ListMultipartUploadParts` | object ARN 与 upload 所属 bucket/key 一致 |
 
 认证顺序不变量：完全没有任何认证材料时才可构造 Anonymous；存在 Authorization、任一 `X-Amz-*` credential/signature query 或不完整签名时必须走认证错误，绝不能降级匿名。signed principal 的 account ID 来自调用方 access key 所属 application，不来自目标 bucket。无 Identity Policy 为 implicit deny，不回退旧 permissions。
+
+## AWS 条件权限复核（2026-08-08）
+
+- AWS 官方权限表确认：`PutObject` 始终要求 `s3:PutObject`；请求同时设置 ACL、标签、Retention 或 Legal Hold 时，还必须分别具备 `s3:PutObjectAcl`、`s3:PutObjectTagging`、`s3:PutObjectRetention`、`s3:PutObjectLegalHold`，这些是叠加权限而不是替代权限。
+- `CopyObject` 对源端要求 `s3:GetObject`，显式 `versionId` 时改为 `s3:GetObjectVersion`；目标端始终要求 `s3:PutObject`。复制请求写入目标 ACL、标签、Retention 或 Legal Hold 时，同样分别叠加相应的 Put 权限。
+- `CreateMultipartUpload` 始终要求 `s3:PutObject`；初始化请求携带 ACL、标签、Retention 或 Legal Hold 时，同样叠加相应权限。`UploadPart` 只要求目标 `s3:PutObject`；`UploadPartCopy` 另对源端要求 GetObject/GetObjectVersion。
+- `PutObjectRetention` 在请求声称绕过 Governance 时，必须在 `s3:PutObjectRetention` 之外再允许 `s3:BypassGovernanceRetention`。`DeleteObject`/`DeleteObjects` 删除受 Governance 保护的版本时也需要额外 bypass action；普通删除与显式版本删除分别是 `s3:DeleteObject` 和 `s3:DeleteObjectVersion`。
+- `ListMultipartUploads` 与 `ListParts` 分别是 `s3:ListBucketMultipartUploads` 与 `s3:ListMultipartUploadParts`；不能用 `ListBucket` 或 `GetObject` 泛化替代。
+- 参考：AWS 官方权限映射 https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-with-s3-policy-actions.html ，PutObject https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html ，CopyObject https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html ，CreateMultipartUpload https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html 。

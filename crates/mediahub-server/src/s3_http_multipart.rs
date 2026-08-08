@@ -1,39 +1,98 @@
 // S3 multipart upload operations.
 
 async fn s3_create_multipart_upload(
-    state: &AppState,
-    auth: &ApplicationAuth,
-    bucket_name: &str,
-    object_key: &str,
+    operation: S3ObjectOperation<'_>,
     headers: &HeaderMap,
-    uri: &Uri,
-    request_id: &str,
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
+    let S3ObjectOperation {
+        state,
+        auth,
+        bucket_name,
+        object_key,
+        uri,
+        request_id,
+    } = operation;
     let resource = uri.path();
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     validate_s3_object_key(object_key, resource, request_id)?;
-    let _ = s3_canned_acl(headers, resource, request_id)?;
-    let bucket = state
-        .repository
-        .find_s3_bucket(auth.application.id, bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Multipart bucket lookup failed");
-            S3ApiError::service_unavailable(resource, request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(resource, request_id))?;
+    let canned_acl = s3_canned_acl(headers, resource, request_id)?;
     let content_type = s3_object_content_type(headers, resource, request_id)?;
     let user_metadata = s3_user_metadata(headers, resource, request_id)?;
-    let object_tags = parse_s3_tagging_header(headers, resource, request_id)?.unwrap_or_default();
+    let requested_object_tags = parse_s3_tagging_header(headers, resource, request_id)?;
+    let authorization = authorize_s3_signed_data_request(
+        state,
+        auth,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::PutObject,
+            bucket_name,
+            object_key: Some(object_key),
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(uri),
+            source_ip,
+        },
+        resource,
+        request_id,
+    )
+    .await?;
+    if requested_object_tags.is_some() {
+        let tagging_authorization = authorize_s3_signed_data_request(
+            state,
+            auth,
+            S3DataAuthorizationInput {
+                action: S3PolicyAction::PutObjectTagging,
+                bucket_name,
+                object_key: Some(object_key),
+                version_id: None,
+                prefix: None,
+                delimiter: None,
+                max_keys: None,
+                secure_transport: s3_data_secure_transport(uri),
+                source_ip,
+            },
+            resource,
+            request_id,
+        )
+        .await?;
+        ensure_same_s3_multipart_bucket(
+            &authorization,
+            &tagging_authorization,
+            resource,
+            request_id,
+        )?;
+    }
+    if canned_acl.is_some() {
+        let acl_authorization = authorize_s3_signed_data_request(
+            state,
+            auth,
+            S3DataAuthorizationInput {
+                action: S3PolicyAction::PutObjectAcl,
+                bucket_name,
+                object_key: Some(object_key),
+                version_id: None,
+                prefix: None,
+                delimiter: None,
+                max_keys: None,
+                secure_transport: s3_data_secure_transport(uri),
+                source_ip,
+            },
+            resource,
+            request_id,
+        )
+        .await?;
+        ensure_same_s3_multipart_bucket(&authorization, &acl_authorization, resource, request_id)?;
+    }
+    let object_tags = requested_object_tags.unwrap_or_default();
     let now = OffsetDateTime::now_utc();
     let upload_id = format!("mh_mpu_{}", uuid::Uuid::now_v7().simple());
     let upload = state
         .repository
         .create_multipart_upload(NewS3MultipartUpload {
             upload_id: upload_id.clone(),
-            application_id: auth.application.id,
-            bucket_id: bucket.id(),
+            application_id: authorization.bucket.application_id,
+            bucket_id: authorization.bucket.bucket_id,
             object_key: object_key.to_owned(),
             content_type,
             user_metadata,
@@ -45,13 +104,13 @@ async fn s3_create_multipart_upload(
         .await
         .map_err(ApiError::from_repository)
         .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
-    record_audit(
+    super::record_s3_resource_audit(
         state,
         auth,
+        authorization.bucket.application_id,
         request_id,
         "s3.multipart_created",
-        "multipart_upload",
-        upload.upload_id.clone(),
+        ("multipart_upload", upload.upload_id.clone()),
         serde_json::json!({
             "protocol": "s3",
             "bucket": bucket_name,
@@ -62,6 +121,21 @@ async fn s3_create_multipart_upload(
     let body = initiate_multipart_upload_result_xml(bucket_name, object_key, &upload_id)
         .map_err(|error| S3ApiError::from_xml(error, resource, request_id))?;
     Ok(s3_xml_response(StatusCode::OK, body, request_id))
+}
+
+fn ensure_same_s3_multipart_bucket(
+    expected: &S3AuthorizedDataRequest,
+    actual: &S3AuthorizedDataRequest,
+    resource: &str,
+    request_id: &str,
+) -> Result<(), S3ApiError> {
+    if expected.bucket.application_id == actual.bucket.application_id
+        && expected.bucket.bucket_id == actual.bucket.bucket_id
+    {
+        Ok(())
+    } else {
+        Err(S3ApiError::service_unavailable(resource, request_id))
+    }
 }
 
 struct S3ObjectOperation<'a> {
@@ -79,6 +153,7 @@ async fn s3_upload_part(
     part_number: u16,
     signature: ParsedSigV4,
     headers: &HeaderMap,
+    source_ip: Option<std::net::IpAddr>,
     content: Body,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
@@ -90,39 +165,9 @@ async fn s3_upload_part(
         request_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
-    let upload = find_s3_multipart_upload(
-        state,
-        auth,
-        bucket_name,
-        object_key,
-        upload_id,
-        resource,
-        request_id,
-    )
-    .await?;
-    if upload.state != S3MultipartUploadState::Pending
-        || upload.expires_at <= OffsetDateTime::now_utc()
-    {
-        return Err(S3ApiError::no_such_upload(resource, request_id));
-    }
-    let bucket = state
-        .repository
-        .find_bucket_by_name(auth.application.id, bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Multipart bucket policy lookup failed");
-            S3ApiError::service_unavailable(resource, request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(resource, request_id))?;
-    let maximum_upload_size = bucket
-        .policy()
-        .max_object_size()
-        .unwrap_or(MAX_UPLOAD_OBJECT_BYTES)
-        .min(MAX_UPLOAD_OBJECT_BYTES);
+    validate_s3_multipart_upload_id(upload_id, resource, request_id)?;
     let expected_size = s3_content_length(headers, resource, request_id)?;
-    if expected_size > maximum_upload_size {
+    if expected_size > MAX_UPLOAD_OBJECT_BYTES {
         return Err(S3ApiError::entity_too_large(resource, request_id));
     }
     let expected_md5 = parse_content_md5(headers, resource, request_id)?;
@@ -139,12 +184,7 @@ async fn s3_upload_part(
     {
         Ok(streamed) => streamed,
         Err(error) => {
-            persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
-                .await
-                .map_err(|gc_error| {
-                    warn!(error = %gc_error, "failed to persist rejected multipart part cleanup");
-                    S3ApiError::service_unavailable(resource, request_id)
-                })?;
+            discard_unbound_multipart_temporary(state, &storage_key).await;
             return Err(s3_streaming_upload_error(
                 error,
                 expected_size,
@@ -154,25 +194,103 @@ async fn s3_upload_part(
         }
     };
     if let Err(error) = signature.verify_payload_sha256(&streamed.sha256) {
-        persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
-            .await
-            .map_err(|gc_error| {
-                warn!(error = %gc_error, "failed to persist bad-signature part cleanup");
-                S3ApiError::service_unavailable(resource, request_id)
-            })?;
+        discard_unbound_multipart_temporary(state, &storage_key).await;
         return Err(S3ApiError::from_sigv4(error, resource, request_id));
     }
     if expected_md5
         .as_deref()
         .is_some_and(|expected| !expected.eq_ignore_ascii_case(&streamed.md5))
     {
+        discard_unbound_multipart_temporary(state, &storage_key).await;
+        return Err(S3ApiError::bad_digest(resource, request_id));
+    }
+
+    let authorization =
+        match authorize_s3_multipart_upload_request(S3MultipartAuthorizationRequest {
+            state,
+            auth,
+            action: S3PolicyAction::PutObject,
+            bucket_name,
+            object_key,
+            uri,
+            source_ip,
+            request_id,
+        })
+        .await
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                discard_unbound_multipart_temporary(state, &storage_key).await;
+                return Err(error);
+            }
+        };
+    let upload = match find_s3_multipart_upload(
+        state,
+        &authorization,
+        bucket_name,
+        object_key,
+        upload_id,
+        resource,
+        request_id,
+    )
+    .await
+    {
+        Ok(upload) => upload,
+        Err(error) => {
+            discard_unbound_multipart_temporary(state, &storage_key).await;
+            return Err(error);
+        }
+    };
+    if upload.state != S3MultipartUploadState::Pending
+        || upload.expires_at <= OffsetDateTime::now_utc()
+    {
         persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
             .await
-            .map_err(|gc_error| {
-                warn!(error = %gc_error, "failed to persist bad-digest part cleanup");
+            .map_err(|error| {
+                warn!(error = %error, "failed to persist terminal multipart part cleanup");
                 S3ApiError::service_unavailable(resource, request_id)
             })?;
-        return Err(S3ApiError::bad_digest(resource, request_id));
+        return Err(S3ApiError::no_such_upload(resource, request_id));
+    }
+    let bucket = state
+        .repository
+        .find_bucket_by_name(authorization.application_id(), bucket_name)
+        .await;
+    let bucket = match bucket {
+        Ok(Some(bucket)) if bucket.id() == upload.bucket_id => bucket,
+        Ok(_) => {
+            persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+                .await
+                .map_err(|error| {
+                    warn!(error = %error, "failed to persist missing-bucket multipart cleanup");
+                    S3ApiError::service_unavailable(resource, request_id)
+                })?;
+            return Err(S3ApiError::no_such_upload(resource, request_id));
+        }
+        Err(error) => {
+            persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+                .await
+                .map_err(|gc_error| {
+                    warn!(error = %gc_error, "failed to persist bucket-error multipart cleanup");
+                    S3ApiError::service_unavailable(resource, request_id)
+                })?;
+            warn!(error = %error, "S3 Multipart bucket policy lookup failed");
+            return Err(S3ApiError::service_unavailable(resource, request_id));
+        }
+    };
+    let maximum_upload_size = bucket
+        .policy()
+        .max_object_size()
+        .unwrap_or(MAX_UPLOAD_OBJECT_BYTES)
+        .min(MAX_UPLOAD_OBJECT_BYTES);
+    if expected_size > maximum_upload_size {
+        persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+            .await
+            .map_err(|error| {
+                warn!(error = %error, "failed to persist oversized multipart part cleanup");
+                S3ApiError::service_unavailable(resource, request_id)
+            })?;
+        return Err(S3ApiError::entity_too_large(resource, request_id));
     }
 
     let etag = streamed.md5.clone();
@@ -230,6 +348,27 @@ async fn s3_upload_part(
     }
 }
 
+fn validate_s3_multipart_upload_id(
+    upload_id: &str,
+    resource: &str,
+    request_id: &str,
+) -> Result<(), S3ApiError> {
+    let suffix = upload_id.strip_prefix("mh_mpu_");
+    if suffix.is_some_and(|value| {
+        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        Ok(())
+    } else {
+        Err(S3ApiError::no_such_upload(resource, request_id))
+    }
+}
+
+async fn discard_unbound_multipart_temporary(state: &AppState, storage_key: &str) {
+    if let Err(error) = state.object_store.delete(storage_key).await {
+        warn!(storage_key, error = %error, "failed to delete unbound multipart temporary object");
+    }
+}
+
 async fn persist_multipart_temporary_gc(
     state: &AppState,
     upload: &S3MultipartUpload,
@@ -257,7 +396,7 @@ async fn persist_multipart_temporary_gc(
 
 async fn find_s3_multipart_upload(
     state: &AppState,
-    auth: &ApplicationAuth,
+    authorization: &S3AuthorizedDataRequest,
     bucket_name: &str,
     object_key: &str,
     upload_id: &str,
@@ -273,17 +412,9 @@ async fn find_s3_multipart_upload(
             S3ApiError::service_unavailable(resource, request_id)
         })?
         .ok_or_else(|| S3ApiError::no_such_upload(resource, request_id))?;
-    let bucket = state
-        .repository
-        .find_s3_bucket(auth.application.id, bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Multipart bucket lookup failed");
-            S3ApiError::service_unavailable(resource, request_id)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(resource, request_id))?;
-    if upload.application_id != auth.application.id
-        || upload.bucket_id != bucket.id()
+    if authorization.bucket.bucket_name != bucket_name
+        || upload.application_id != authorization.bucket.application_id
+        || upload.bucket_id != authorization.bucket.bucket_id
         || upload.object_key != object_key
     {
         return Err(S3ApiError::no_such_upload(resource, request_id));
@@ -291,20 +422,78 @@ async fn find_s3_multipart_upload(
     Ok(upload)
 }
 
-async fn s3_list_parts(
-    state: &AppState,
-    auth: &ApplicationAuth,
-    bucket_name: &str,
-    object_key: &str,
-    upload_id: &str,
-    uri: &Uri,
-    request_id: &str,
-) -> Result<Response, S3ApiError> {
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
-    let upload = find_s3_multipart_upload(
+struct S3MultipartAuthorizationRequest<'a> {
+    state: &'a AppState,
+    auth: &'a ApplicationAuth,
+    action: S3PolicyAction,
+    bucket_name: &'a str,
+    object_key: &'a str,
+    uri: &'a Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &'a str,
+}
+
+async fn authorize_s3_multipart_upload_request(
+    request: S3MultipartAuthorizationRequest<'_>,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    let S3MultipartAuthorizationRequest {
         state,
         auth,
+        action,
+        bucket_name,
+        object_key,
+        uri,
+        source_ip,
+        request_id,
+    } = request;
+    let authorized = authorize_s3_signed_data_request(
+        state,
+        auth,
+        S3DataAuthorizationInput {
+            action,
+            bucket_name,
+            object_key: Some(object_key),
+            version_id: None,
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(uri),
+            source_ip,
+        },
+        uri.path(),
+        request_id,
+    )
+    .await?;
+    Ok(authorized)
+}
+
+async fn s3_list_parts(
+    operation: S3ObjectOperation<'_>,
+    upload_id: &str,
+    source_ip: Option<std::net::IpAddr>,
+) -> Result<Response, S3ApiError> {
+    let S3ObjectOperation {
+        state,
+        auth,
+        bucket_name,
+        object_key,
+        uri,
+        request_id,
+    } = operation;
+    let authorization = authorize_s3_multipart_upload_request(S3MultipartAuthorizationRequest {
+        state,
+        auth,
+        action: S3PolicyAction::ListMultipartUploadParts,
+        bucket_name,
+        object_key,
+        uri,
+        source_ip,
+        request_id,
+    })
+    .await?;
+    let upload = find_s3_multipart_upload(
+        state,
+        &authorization,
         bucket_name,
         object_key,
         upload_id,
@@ -387,19 +576,32 @@ async fn s3_list_parts(
 }
 
 async fn s3_abort_multipart_upload(
-    state: &AppState,
-    auth: &ApplicationAuth,
-    bucket_name: &str,
-    object_key: &str,
+    operation: S3ObjectOperation<'_>,
     upload_id: &str,
-    uri: &Uri,
-    request_id: &str,
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), request_id))?;
-    find_s3_multipart_upload(
+    let S3ObjectOperation {
         state,
         auth,
+        bucket_name,
+        object_key,
+        uri,
+        request_id,
+    } = operation;
+    let authorization = authorize_s3_multipart_upload_request(S3MultipartAuthorizationRequest {
+        state,
+        auth,
+        action: S3PolicyAction::AbortMultipartUpload,
+        bucket_name,
+        object_key,
+        uri,
+        source_ip,
+        request_id,
+    })
+    .await?;
+    find_s3_multipart_upload(
+        state,
+        &authorization,
         bucket_name,
         object_key,
         upload_id,
@@ -428,13 +630,13 @@ async fn s3_abort_multipart_upload(
             return Err(S3ApiError::no_such_upload(uri.path(), request_id));
         }
     }
-    record_audit(
+    super::record_s3_resource_audit(
         state,
         auth,
+        authorization.bucket.application_id,
         request_id,
         "s3.multipart_aborted",
-        "multipart_upload",
-        upload_id.to_owned(),
+        ("multipart_upload", upload_id.to_owned()),
         serde_json::json!({
             "protocol": "s3",
             "bucket": bucket_name,
@@ -449,6 +651,7 @@ async fn s3_complete_multipart_upload(
     operation: S3ObjectOperation<'_>,
     upload_id: &str,
     content: &[u8],
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -459,12 +662,21 @@ async fn s3_complete_multipart_upload(
         request_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     validate_s3_object_key(object_key, resource, request_id)?;
-    let upload = find_s3_multipart_upload(
+    let authorization = authorize_s3_multipart_upload_request(S3MultipartAuthorizationRequest {
         state,
         auth,
+        action: S3PolicyAction::PutObject,
+        bucket_name,
+        object_key,
+        uri,
+        source_ip,
+        request_id,
+    })
+    .await?;
+    let upload = find_s3_multipart_upload(
+        state,
+        &authorization,
         bucket_name,
         object_key,
         upload_id,
@@ -579,7 +791,7 @@ async fn s3_complete_multipart_upload(
     } else {
         let intent = match service
             .begin_put(&BeginPutObjectRequest {
-                application_id: auth.application.id,
+                application_id: authorization.application_id(),
                 bucket_name: bucket_name.to_owned(),
                 object_key: object_key.to_owned(),
                 expected_size_bytes: manifest.total_size,
@@ -612,14 +824,15 @@ async fn s3_complete_multipart_upload(
         {
             Ok(composed) => composed,
             Err(error) => {
-                abort_s3_staged_put(state, &service, auth.application.id, intent.id()).await;
+                abort_s3_staged_put(state, &service, authorization.application_id(), intent.id())
+                    .await;
                 release_multipart_claim(state, upload_id, &completion_token).await;
                 warn!(error = %error, "S3 multipart composition failed");
                 return Err(S3ApiError::service_unavailable(resource, request_id));
             }
         };
         if composed.size != manifest.total_size {
-            abort_s3_staged_put(state, &service, auth.application.id, intent.id()).await;
+            abort_s3_staged_put(state, &service, authorization.application_id(), intent.id()).await;
             release_multipart_claim(state, upload_id, &completion_token).await;
             return Err(S3ApiError::service_unavailable(resource, request_id));
         }
@@ -636,7 +849,7 @@ async fn s3_complete_multipart_upload(
             )
             .await
         {
-            abort_s3_staged_put(state, &service, auth.application.id, intent.id()).await;
+            abort_s3_staged_put(state, &service, authorization.application_id(), intent.id()).await;
             release_multipart_claim(state, upload_id, &completion_token).await;
             return Err(S3ApiError::from_api(
                 ApiError::from_repository(error),
@@ -656,7 +869,8 @@ async fn s3_complete_multipart_upload(
         {
             Ok(intent) => intent,
             Err(error) => {
-                abort_s3_staged_put(state, &service, auth.application.id, intent.id()).await;
+                abort_s3_staged_put(state, &service, authorization.application_id(), intent.id())
+                    .await;
                 release_multipart_claim(state, upload_id, &completion_token).await;
                 return Err(S3ApiError::from_api(
                     ApiError::from_repository(error),
@@ -726,7 +940,7 @@ async fn s3_complete_multipart_upload(
         })?
         .filter(|version| {
             version.object_id() == object.id()
-                && version.application_id() == auth.application.id
+                && version.application_id() == authorization.application_id()
                 && version.bucket_id() == object.bucket_id()
         })
         .ok_or_else(|| S3ApiError::service_unavailable(resource, request_id))?;
@@ -734,13 +948,13 @@ async fn s3_complete_multipart_upload(
         .http_metrics
         .uploaded_bytes
         .fetch_add(composed_size, Ordering::Relaxed);
-    record_audit(
+    super::record_s3_resource_audit(
         state,
         auth,
+        authorization.bucket.application_id,
         request_id,
         "s3.object.uploaded",
-        "object_version",
-        version.id().to_string(),
+        ("object_version", version.id().to_string()),
         serde_json::json!({
             "bucket": bucket_name,
             "object_key": object_key,
@@ -898,3 +1112,6 @@ async fn completed_multipart_response(
         request_id,
     )
 }
+
+#[cfg(test)]
+include!("s3_multipart_policy_tests.rs");

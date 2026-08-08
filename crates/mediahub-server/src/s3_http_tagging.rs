@@ -1,5 +1,79 @@
 // Object-version-scoped S3 Object Tagging protocol handling.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S3ObjectSubresourcePolicyOperation {
+    GetTagging,
+    PutTagging,
+    DeleteTagging,
+    GetAcl,
+    PutAcl,
+    GetRetention,
+    PutRetention,
+    BypassGovernanceRetention,
+    GetLegalHold,
+    PutLegalHold,
+}
+
+impl S3ObjectSubresourcePolicyOperation {
+    const fn policy_action(self, versioned: bool) -> S3PolicyAction {
+        match (self, versioned) {
+            (Self::GetTagging, false) => S3PolicyAction::GetObjectTagging,
+            (Self::GetTagging, true) => S3PolicyAction::GetObjectVersionTagging,
+            (Self::PutTagging, false) => S3PolicyAction::PutObjectTagging,
+            (Self::PutTagging, true) => S3PolicyAction::PutObjectVersionTagging,
+            (Self::DeleteTagging, false) => S3PolicyAction::DeleteObjectTagging,
+            (Self::DeleteTagging, true) => S3PolicyAction::DeleteObjectVersionTagging,
+            (Self::GetAcl, false) => S3PolicyAction::GetObjectAcl,
+            (Self::GetAcl, true) => S3PolicyAction::GetObjectVersionAcl,
+            (Self::PutAcl, false) => S3PolicyAction::PutObjectAcl,
+            (Self::PutAcl, true) => S3PolicyAction::PutObjectVersionAcl,
+            (Self::GetRetention, _) => S3PolicyAction::GetObjectRetention,
+            (Self::PutRetention, _) => S3PolicyAction::PutObjectRetention,
+            (Self::BypassGovernanceRetention, _) => {
+                S3PolicyAction::BypassGovernanceRetention
+            }
+            (Self::GetLegalHold, _) => S3PolicyAction::GetObjectLegalHold,
+            (Self::PutLegalHold, _) => S3PolicyAction::PutObjectLegalHold,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct S3ObjectSubresourceAuthorizationRequest<'a> {
+    operation: S3ObjectSubresourcePolicyOperation,
+    bucket_name: &'a str,
+    object_key: &'a str,
+    version_id: Option<&'a S3VersionId>,
+    uri: &'a Uri,
+    source_ip: Option<std::net::IpAddr>,
+    request_id: &'a str,
+}
+
+async fn authorize_s3_object_subresource(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    request: S3ObjectSubresourceAuthorizationRequest<'_>,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    authorize_s3_signed_data_request(
+        state,
+        auth,
+        S3DataAuthorizationInput {
+            action: request.operation.policy_action(request.version_id.is_some()),
+            bucket_name: request.bucket_name,
+            object_key: Some(request.object_key),
+            version_id: request.version_id.map(S3VersionId::as_str),
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            secure_transport: s3_data_secure_transport(request.uri),
+            source_ip: request.source_ip,
+        },
+        request.uri.path(),
+        request.request_id,
+    )
+    .await
+}
+
 fn classify_s3_object_tagging(uri: &Uri, request_id: &str) -> Result<bool, S3ApiError> {
     let mut tagging_seen = false;
     let mut version_seen = false;
@@ -53,6 +127,7 @@ fn classify_s3_object_tagging(uri: &Uri, request_id: &str) -> Result<bool, S3Api
 
 async fn s3_get_object_tagging(
     operation: S3ObjectOperation<'_>,
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -63,16 +138,29 @@ async fn s3_get_object_tagging(
         request_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:read")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     validate_s3_object_key(object_key, resource, request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: S3ObjectSubresourcePolicyOperation::GetTagging,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
     let service = runtime_s3_object_service(state, resource, request_id)?;
     let receipt = service
         .get_object_tags(&S3ObjectRequest {
-            application_id: auth.application.id,
+            application_id: authorization.application_id(),
             bucket_name: bucket_name.to_owned(),
             object_key: object_key.to_owned(),
-            version_id: parse_s3_version_id(uri, request_id)?,
+            version_id,
         })
         .await
         .map_err(|error| map_s3_object_service_error(error, resource, request_id))?;
@@ -90,6 +178,7 @@ async fn s3_put_object_tagging(
     operation: S3ObjectOperation<'_>,
     headers: &HeaderMap,
     content: &[u8],
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -100,9 +189,22 @@ async fn s3_put_object_tagging(
         request_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:upload")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     validate_s3_object_key(object_key, resource, request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: S3ObjectSubresourcePolicyOperation::PutTagging,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
     validate_content_md5(headers.get("content-md5").map(HeaderValue::as_bytes), content)
         .map_err(|error| {
             S3ApiError::new(
@@ -119,10 +221,10 @@ async fn s3_put_object_tagging(
     let receipt = service
         .put_object_tags(&PutObjectTaggingRequest {
             object: S3ObjectRequest {
-                application_id: auth.application.id,
+                application_id: authorization.application_id(),
                 bucket_name: bucket_name.to_owned(),
                 object_key: object_key.to_owned(),
-                version_id: parse_s3_version_id(uri, request_id)?,
+                version_id,
             },
             tags,
         })
@@ -138,6 +240,7 @@ async fn s3_put_object_tagging(
 
 async fn s3_delete_object_tagging(
     operation: S3ObjectOperation<'_>,
+    source_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3ApiError> {
     let S3ObjectOperation {
         state,
@@ -148,16 +251,29 @@ async fn s3_delete_object_tagging(
         request_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:delete")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     validate_s3_object_key(object_key, resource, request_id)?;
+    let version_id = parse_s3_version_id(uri, request_id)?;
+    let authorization = authorize_s3_object_subresource(
+        state,
+        auth,
+        S3ObjectSubresourceAuthorizationRequest {
+            operation: S3ObjectSubresourcePolicyOperation::DeleteTagging,
+            bucket_name,
+            object_key,
+            version_id: version_id.as_ref(),
+            uri,
+            source_ip,
+            request_id,
+        },
+    )
+    .await?;
     let service = runtime_s3_object_service(state, resource, request_id)?;
     let receipt = service
         .delete_object_tags(&S3ObjectRequest {
-            application_id: auth.application.id,
+            application_id: authorization.application_id(),
             bucket_name: bucket_name.to_owned(),
             object_key: object_key.to_owned(),
-            version_id: parse_s3_version_id(uri, request_id)?,
+            version_id,
         })
         .await
         .map_err(|error| map_s3_object_service_error(error, resource, request_id))?;
@@ -168,6 +284,9 @@ async fn s3_delete_object_tagging(
     )?;
     Ok(response)
 }
+
+#[cfg(test)]
+include!("s3_object_subresource_policy_tests.rs");
 
 fn map_s3_tagging_xml_error(
     error: S3TaggingXmlError,

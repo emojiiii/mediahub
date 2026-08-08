@@ -135,23 +135,60 @@ async fn authorize_s3_data_request(
 ) -> Result<S3AuthorizedDataRequest, S3ApiError> {
     let principal = if s3_has_authentication_material(headers, uri) {
         let auth = authenticate_s3_application(state, method, uri, headers, &[], request_id).await?;
-        match load_s3_signed_policy_principal(state, &auth, input, uri.path(), request_id).await? {
-            S3SignedPrincipalResolution::Principal(principal) => {
-                S3AuthorizationPrincipal::Signed(principal)
-            }
-            S3SignedPrincipalResolution::FailClosed => {
-                return s3_fail_closed_for_existing_bucket(
-                    state,
-                    input.bucket_name,
-                    uri.path(),
-                    request_id,
-                )
-                .await;
-            }
-        }
+        return authorize_s3_signed_data_request(
+            state,
+            &auth,
+            input,
+            uri.path(),
+            request_id,
+        )
+        .await;
     } else {
         S3AuthorizationPrincipal::Anonymous
     };
+
+    authorize_s3_policy_principal_request(state, input, principal, uri.path(), request_id).await
+}
+
+/// Evaluates a request whose SigV4 signature has already been verified.
+///
+/// Buffered XML handlers and streaming upload handlers must authenticate the
+/// exact body shape first, then call this helper. It deliberately receives an
+/// `ApplicationAuth` instead of headers so a caller cannot accidentally
+/// verify a payload twice or replace Policy with legacy permissions.
+async fn authorize_s3_signed_data_request(
+    state: &AppState,
+    auth: &ApplicationAuth,
+    input: S3DataAuthorizationInput<'_>,
+    resource: &str,
+    request_id: &str,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
+    let principal = match load_s3_signed_policy_principal(state, auth, input, resource, request_id)
+        .await?
+    {
+        S3SignedPrincipalResolution::Principal(principal) => {
+            S3AuthorizationPrincipal::Signed(principal)
+        }
+        S3SignedPrincipalResolution::FailClosed => {
+            return s3_fail_closed_for_existing_bucket(
+                state,
+                input.bucket_name,
+                resource,
+                request_id,
+            )
+            .await;
+        }
+    };
+    authorize_s3_policy_principal_request(state, input, principal, resource, request_id).await
+}
+
+async fn authorize_s3_policy_principal_request(
+    state: &AppState,
+    input: S3DataAuthorizationInput<'_>,
+    principal: S3AuthorizationPrincipal,
+    resource: &str,
+    request_id: &str,
+) -> Result<S3AuthorizedDataRequest, S3ApiError> {
 
     let outcome = S3AuthorizationService::new(state.repository.clone())
         .authorize(&S3AuthorizationRequest {
@@ -169,18 +206,18 @@ async fn authorize_s3_data_request(
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 data policy authorization failed");
-            S3ApiError::service_unavailable(uri.path(), request_id)
+            S3ApiError::service_unavailable(resource, request_id)
         })?;
 
     match outcome {
         S3AuthorizationOutcome::BucketNotFound => {
-            Err(S3ApiError::no_such_bucket(uri.path(), request_id))
+            Err(S3ApiError::no_such_bucket(resource, request_id))
         }
         S3AuthorizationOutcome::Allowed { bucket } => Ok(S3AuthorizedDataRequest { bucket }),
         S3AuthorizationOutcome::ExplicitDeny { .. }
         | S3AuthorizationOutcome::ImplicitDeny { .. } => Err(S3ApiError::access_denied(
             "Access Denied.",
-            uri.path(),
+            resource,
             request_id,
         )),
     }
