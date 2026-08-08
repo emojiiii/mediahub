@@ -210,6 +210,23 @@ CREATE INDEX object_versions_noncurrent_idx
     ON object_versions(bucket_id, became_noncurrent_at, id)
     WHERE became_noncurrent_at IS NOT NULL
       AND superseded_at IS NULL;
+
+ALTER TABLE object_versions
+    ADD CONSTRAINT object_versions_identity_marker_key UNIQUE (id, is_delete_marker);
+
+CREATE TABLE object_version_tags (
+    object_version_id UUID NOT NULL,
+    is_delete_marker BOOLEAN NOT NULL DEFAULT FALSE CHECK (NOT is_delete_marker),
+    position SMALLINT NOT NULL CHECK (position BETWEEN 0 AND 9),
+    tag_key TEXT NOT NULL CHECK (char_length(tag_key) BETWEEN 1 AND 128),
+    tag_value TEXT NOT NULL CHECK (char_length(tag_value) <= 256),
+    PRIMARY KEY (object_version_id, position),
+    UNIQUE (object_version_id, tag_key),
+    CONSTRAINT object_version_tags_data_version_fkey
+        FOREIGN KEY (object_version_id, is_delete_marker)
+        REFERENCES object_versions (id, is_delete_marker)
+        ON DELETE CASCADE
+);
 -- Upload intents own staged bytes. They are intentionally separate from the
 -- immutable version history and never reference Media.
 CREATE TABLE s3_upload_intents (
@@ -249,6 +266,10 @@ CREATE TABLE s3_upload_intents (
     content_type TEXT,
     user_metadata JSONB NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(user_metadata) = 'object'),
+    object_tags JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (
+        jsonb_typeof(object_tags) = 'array'
+        AND jsonb_array_length(object_tags) <= 10
+    ),
     lease_token TEXT,
     lease_until TIMESTAMPTZ,
     committed_object_id UUID,
@@ -315,6 +336,10 @@ CREATE INDEX s3_upload_intents_lease_idx
 ALTER TABLE s3_multipart_uploads
     DROP CONSTRAINT s3_multipart_completion_state_check,
     ADD COLUMN upload_intent_id UUID,
+    ADD COLUMN object_tags JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (
+        jsonb_typeof(object_tags) = 'array'
+        AND jsonb_array_length(object_tags) <= 10
+    ),
     ADD COLUMN object_id UUID,
     ADD COLUMN object_version_id UUID,
     ADD COLUMN final_checksum_algorithm TEXT

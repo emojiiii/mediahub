@@ -145,3 +145,21 @@
 - 预览接口按 application_id + version_id 查询 committed data version，delete marker 与跨租户统一 404；这比从 legacy Media 反查更符合不可变预览语义。
 - 文件浏览器若直接加载原图会把产品差异化能力变成带宽风险；使用规范化 Variant 缩略图、IntersectionObserver 和并发闸门更符合 PrismArk 的定位。
 - 当前已通过 Silo 真实 ObjectStore 合同，但本机仍未安装 AWS CLI、mcli/mc 或 rclone，因此不能把 native-client 脚本存在等同于这些客户端已实测通过。
+
+## S3 Object Tagging 审计发现（2026-08-08）
+
+- 基线工作区干净，HEAD 为 `72eb4d4`。
+- Silo 路由把对象级 `GET/PUT/DELETE ?tagging` 放在普通对象 GET/PUT、CopyObject 与 Multipart 分支之前；PrismArk 必须保持同样的消歧顺序。
+- PrismArk 当前 CopyObject 对 `x-amz-tagging` 和 `x-amz-tagging-directive` 一律显式拒绝，不存在静默忽略，但尚未实现 COPY/REPLACE。
+- 标签必须成为 ObjectVersion 的独立持久化事实，不能混入 user metadata，也不能附着 delete marker。
+- 采用独立 `object_version_tags` 行表最符合边界：`object_version_id + position` 保持响应顺序，`object_version_id + tag_key` 保证唯一键；Application/bucket/key/version 隔离由事务内 join/lock 解析保证。
+- PutObject、CopyObject 和 Multipart Complete 的初始标签必须进入 `S3ObjectVersionCommit`，与 ObjectVersion 插入、head 切换、quota/outbox/GC 在同一事务内完成，不能提交后补写。
+- 独立 Put/DeleteObjectTagging 应由 Repository 在事务内锁 bucket、logical object 和 exact version，再原子替换标签；Memory 实现需要同等解析和 delete-marker 拒绝语义。
+- 标签限制按 S3/AWS 规则实现：最多 10 个、Key 1–128 Unicode 字符、Value 0–256 Unicode 字符、Key 唯一，字符集为 Unicode 字母/数字/空白和 `_ . : / = + - @`。
+- 字符校验必须显式排除 Unicode control；`\n`、`\t` 即使满足空白判断也不是合法标签字符，已加入负测。
+- `x-amz-tagging` 必须在 HTTP header 边界完成严格 form URL 解码：`+` 表示空格，`%2B` 表示加号，非法百分号、非 UTF-8 与未编码额外等号均拒绝。
+- 标签已作为 UploadIntent/MultipartUpload 的独立冻结事实进入 ObjectVersion 原子提交；CopyObject 默认 COPY，REPLACE 使用目标标签，UploadPartCopy 对标签头显式拒绝。
+- PostgreSQL 使用独立 `object_version_tags` 表和 delete-marker 复合外键；标签替换在精确版本锁下原子完成，不写入 `user_metadata`。
+- 对象级 `?tagging` classifier 位于普通 GET/PUT/Copy/Multipart 之前，GET/HEAD 仅在标签非空时返回 `x-amz-tagging-count`。
+- AWS CLI 能严格覆盖 Tagging 正向语义，但 invalid/duplicate/超过 10 个标签与坏 percent-encoding 可能在客户端模型层先失败；没有可审计 raw SigV4 发包器时必须记为 SKIP，不能冒充服务端 PASS。
+- 连续预览应以当前可见文件集合为导航边界，并在 item id/revision 变化时重建预览状态；否则旧签名 URL、Variant 或缩放状态会跨对象泄漏。

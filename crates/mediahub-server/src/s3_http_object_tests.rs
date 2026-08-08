@@ -135,6 +135,7 @@ fn s3_object_http_headers_include_version_metadata_range_and_http_date() {
             start: 2,
             end_exclusive: 6,
         }),
+        2,
     )
     .expect("response headers");
     assert_eq!(headers.get(CONTENT_LENGTH).expect("length"), "4");
@@ -143,6 +144,7 @@ fn s3_object_http_headers_include_version_metadata_range_and_http_date() {
     assert_eq!(headers.get(ETAG).expect("etag"), "\"5d41402abc4b2a76b9719d911017c592\"");
     assert_eq!(headers.get(LAST_MODIFIED).expect("modified"), "Thu, 01 Jan 1970 00:00:00 GMT");
     assert_eq!(headers.get("x-amz-version-id").expect("version"), "v1");
+    assert_eq!(headers.get("x-amz-tagging-count").expect("tag count"), "2");
     assert_eq!(headers.get("x-amz-meta-project").expect("metadata"), "prismark");
 }
 

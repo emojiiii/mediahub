@@ -12,8 +12,8 @@ use mediahub_core::{
     ObjectRetentionUpdateError, ObjectVersion, ObjectVersionId, ObjectVersionPayload,
     ObjectVersionState, PersistedBucketS3Configuration, PersistedS3Bucket, PersistedS3Object,
     PersistedUploadIntent, RetentionMode, S3Bucket, S3LifecycleConfiguration, S3Object,
-    S3VersionId, SourceProtocol, StorageGcReason, StoredObjectVersion, UploadIntent,
-    UploadIntentId, UploadIntentState, VersioningStatus,
+    S3ObjectTag, S3ObjectTagSet, S3VersionId, SourceProtocol, StorageGcReason, StoredObjectVersion,
+    UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
 };
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
@@ -23,10 +23,11 @@ use crate::{
     DeleteObjectRequest, DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion,
     FixedClock, InMemoryObjectStore, ListObjectVersionsRequest, NewS3ObjectLock, ObjectMetadata,
     ObjectPage, ObjectStore, ObjectStoreError, PutObjectLegalHoldRequest,
-    PutObjectRetentionRequest, PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError,
-    S3BucketRepository, S3DeleteLockReason, S3ObjectCommitTarget, S3ObjectListItem,
-    S3ObjectListQuery, S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectRequest,
-    S3ObjectService, S3ObjectServiceError, S3ObjectVersionCommit, S3ObjectVersionRead,
+    PutObjectRetentionRequest, PutObjectTaggingRequest, PutS3ObjectLockCommand,
+    PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository, S3DeleteLockReason,
+    S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectLockMutation, S3ObjectPage,
+    S3ObjectRepository, S3ObjectRequest, S3ObjectService, S3ObjectServiceError,
+    S3ObjectTaggingCommand, S3ObjectTaggingOutcome, S3ObjectVersionCommit, S3ObjectVersionRead,
     S3UploadIntentRepository, StreamedObject,
 };
 
@@ -36,6 +37,7 @@ struct State {
     intents: HashMap<UploadIntentId, UploadIntent>,
     objects: HashMap<ObjectId, S3Object>,
     versions: HashMap<ObjectId, Vec<ObjectVersion>>,
+    tags: HashMap<ObjectVersionId, S3ObjectTagSet>,
     superseded_versions: HashSet<ObjectVersionId>,
     deleted_versions: HashSet<ObjectVersionId>,
     gc_tasks: Vec<NewStorageGcTask>,
@@ -466,6 +468,54 @@ impl S3ObjectRepository for MemoryS3Repository {
             .collect())
     }
 
+    async fn find_s3_object_version_tags(
+        &self,
+        application_id: ApplicationId,
+        version_id: ObjectVersionId,
+    ) -> Result<Option<S3ObjectTagSet>, RepositoryError> {
+        let state = self.state();
+        let visible = state.versions.values().flatten().any(|version| {
+            version.id() == version_id
+                && version.application_id() == application_id
+                && version.state() == ObjectVersionState::Committed
+                && !version.is_delete_marker()
+                && !state.superseded_versions.contains(&version.id())
+                && !state.deleted_versions.contains(&version.id())
+        });
+        Ok(visible.then(|| state.tags.get(&version_id).cloned().unwrap_or_default()))
+    }
+
+    async fn get_s3_object_tagging(
+        &self,
+        command: &S3ObjectTaggingCommand,
+    ) -> Result<S3ObjectTaggingOutcome, RepositoryError> {
+        let state = self.state();
+        resolve_memory_object_tagging(&state, command)
+    }
+
+    async fn replace_s3_object_tagging(
+        &self,
+        command: &S3ObjectTaggingCommand,
+        tags: &S3ObjectTagSet,
+    ) -> Result<S3ObjectTaggingOutcome, RepositoryError> {
+        tags.validate()
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        let mut state = self.state();
+        match resolve_memory_object_tagging(&state, command)? {
+            S3ObjectTaggingOutcome::Found {
+                object, version, ..
+            } => {
+                state.tags.insert(version.id(), tags.clone());
+                Ok(S3ObjectTaggingOutcome::Found {
+                    object,
+                    version,
+                    tags: tags.clone(),
+                })
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
     async fn delete_s3_object(
         &self,
         command: &DeleteS3ObjectCommand,
@@ -769,6 +819,79 @@ impl S3ObjectRepository for MemoryS3Repository {
     ) -> Result<S3Object, RepositoryError> {
         unreachable!("ObjectService commits through the intent repository")
     }
+}
+
+fn resolve_memory_object_tagging(
+    state: &State,
+    command: &S3ObjectTaggingCommand,
+) -> Result<S3ObjectTaggingOutcome, RepositoryError> {
+    if !state.buckets.iter().any(|bucket| {
+        bucket.application_id() == command.application_id && bucket.id() == command.bucket_id
+    }) {
+        return Err(RepositoryError::NotFound);
+    }
+    let object = state
+        .objects
+        .values()
+        .find(|object| {
+            object.application_id() == command.application_id
+                && object.bucket_id() == command.bucket_id
+                && object.key() == command.object_key
+        })
+        .cloned();
+    let Some(object) = object else {
+        return Ok(if command.version_id.is_some() {
+            S3ObjectTaggingOutcome::VersionNotFound
+        } else {
+            S3ObjectTaggingOutcome::ObjectNotFound
+        });
+    };
+    let version = match &command.version_id {
+        Some(version_id) => {
+            state
+                .versions
+                .get(&object.id())
+                .into_iter()
+                .flatten()
+                .find(|version| {
+                    version.external_version_id() == version_id
+                        && version.state() == ObjectVersionState::Committed
+                        && !state.superseded_versions.contains(&version.id())
+                        && !state.deleted_versions.contains(&version.id())
+                })
+        }
+        None => object.current_version_id().and_then(|current_id| {
+            state
+                .versions
+                .get(&object.id())
+                .into_iter()
+                .flatten()
+                .find(|version| {
+                    version.id() == current_id
+                        && version.state() == ObjectVersionState::Committed
+                        && !state.superseded_versions.contains(&version.id())
+                        && !state.deleted_versions.contains(&version.id())
+                })
+        }),
+    };
+    let Some(version) = version.cloned() else {
+        return Ok(if command.version_id.is_some() {
+            S3ObjectTaggingOutcome::VersionNotFound
+        } else {
+            S3ObjectTaggingOutcome::ObjectNotFound
+        });
+    };
+    if version.is_delete_marker() {
+        return Ok(S3ObjectTaggingOutcome::DeleteMarker {
+            version_id: version.external_version_id().clone(),
+            is_current: object.current_version_id() == Some(version.id()),
+        });
+    }
+    Ok(S3ObjectTaggingOutcome::Found {
+        tags: state.tags.get(&version.id()).cloned().unwrap_or_default(),
+        object,
+        version: Box::new(version),
+    })
 }
 
 fn delete_lock_reason(
@@ -1112,6 +1235,9 @@ impl S3UploadIntentRepository for MemoryS3Repository {
             .entry(object.id())
             .or_default()
             .push(version.clone());
+        state
+            .tags
+            .insert(version.id(), intent.object_tags().clone());
         state.objects.insert(object.id(), object.clone());
         state.gc_tasks.extend(commit.gc_tasks.clone());
         let committed = rebuild_intent(
@@ -1329,6 +1455,7 @@ fn rebuild_intent(
         size_bytes,
         content_type: intent.content_type().map(str::to_owned),
         user_metadata: intent.user_metadata().clone(),
+        object_tags: intent.object_tags().clone(),
         lease_token,
         lease_until,
         committed_object_id,
@@ -1428,6 +1555,73 @@ fn memory_bucket_repository_persists_object_lock_configuration() {
             .expect("read in-memory Object Lock configuration")
             .expect("bucket exists");
         assert_eq!(persisted, configuration);
+    });
+}
+
+#[test]
+fn object_tags_are_frozen_replaced_deleted_and_tenant_scoped_in_memory() {
+    block_on(async {
+        let content = b"prismark";
+        let (application_id, _, repository, store, service) = setup(VersioningStatus::Enabled);
+        let initial = S3ObjectTagSet::new(vec![
+            S3ObjectTag::new("stage", "draft").expect("tag"),
+            S3ObjectTag::new("项目", "万象仓").expect("tag"),
+        ])
+        .expect("tag set");
+        let mut request = begin_request(application_id, content.len() as u64);
+        request.object_tags = initial.clone();
+        let begun = service.begin_put(&request).await.expect("begin tagged put");
+        store
+            .put_temporary(begun.intent.temporary_storage_key(), content, "text/plain")
+            .await
+            .expect("stage tagged object");
+        let completed = service
+            .complete_put(&complete_request(
+                application_id,
+                begun.intent.id(),
+                content,
+            ))
+            .await
+            .expect("complete tagged object");
+        let object_request = S3ObjectRequest {
+            application_id,
+            bucket_name: "assets".into(),
+            object_key: "folder/example.txt".into(),
+            version_id: None,
+        };
+        let fetched = service
+            .get_object_tags(&object_request)
+            .await
+            .expect("get tags");
+        assert_eq!(fetched.tags, initial);
+        assert!(
+            repository
+                .find_s3_object_version_tags(ApplicationId::new(), completed.version.id())
+                .await
+                .expect("cross-tenant lookup")
+                .is_none()
+        );
+
+        let replacement =
+            S3ObjectTagSet::new(vec![S3ObjectTag::new("stage", "published").expect("tag")])
+                .expect("replacement");
+        let replaced = service
+            .put_object_tags(&PutObjectTaggingRequest {
+                object: object_request.clone(),
+                tags: replacement.clone(),
+            })
+            .await
+            .expect("replace tags");
+        assert_eq!(replaced.tags, replacement);
+
+        let deleted = service
+            .delete_object_tags(&S3ObjectRequest {
+                version_id: Some(completed.version.external_version_id().clone()),
+                ..object_request
+            })
+            .await
+            .expect("delete tags");
+        assert!(deleted.tags.is_empty());
     });
 }
 
@@ -1557,6 +1751,7 @@ fn begin_request(application_id: ApplicationId, size: u64) -> BeginPutObjectRequ
         expected_size_bytes: size,
         content_type: Some("text/plain".into()),
         user_metadata: serde_json::json!({ "origin": "test" }),
+        object_tags: S3ObjectTagSet::empty(),
         expires_at: None,
     }
 }

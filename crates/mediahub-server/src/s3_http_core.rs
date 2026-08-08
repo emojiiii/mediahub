@@ -1098,6 +1098,33 @@ pub(super) async fn s3_put_object(
     request_id: Extension<RequestId>,
     content: Body,
 ) -> Result<Response, S3ApiError> {
+    if classify_s3_object_tagging(&uri, &request_id.0.0)? {
+        let content = to_bytes(content, MAX_S3_XML_BODY_BYTES)
+            .await
+            .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
+        let auth = authenticate_s3_application(
+            &state,
+            &method,
+            &uri,
+            &headers,
+            &content,
+            &request_id.0.0,
+        )
+        .await?;
+        return s3_put_object_tagging(
+            S3ObjectOperation {
+                state: &state,
+                auth: &auth,
+                bucket_name: &bucket_name,
+                object_key: &object_key,
+                uri: &uri,
+                request_id: &request_id.0.0,
+            },
+            &headers,
+            &content,
+        )
+        .await;
+    }
     if let Some(lock_operation) =
         classify_s3_object_version_lock(&uri, &request_id.0.0)?
     {
@@ -1276,9 +1303,28 @@ pub(super) async fn s3_get_object(
     headers: HeaderMap,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
+    let tagging_operation = classify_s3_object_tagging(&uri, &request_id.0.0)?;
     let lock_operation = classify_s3_object_version_lock(&uri, &request_id.0.0)?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    if tagging_operation {
+        if method != Method::GET {
+            return Err(S3ApiError::method_not_allowed(
+                "GetObjectTagging requires GET.",
+                uri.path(),
+                &request_id.0.0,
+            ));
+        }
+        return s3_get_object_tagging(S3ObjectOperation {
+            state: &state,
+            auth: &auth,
+            bucket_name: &bucket_name,
+            object_key: &object_key,
+            uri: &uri,
+            request_id: &request_id.0.0,
+        })
+        .await;
+    }
     if let Some(lock_operation) = lock_operation {
         if method != Method::GET {
             return Err(S3ApiError::method_not_allowed(

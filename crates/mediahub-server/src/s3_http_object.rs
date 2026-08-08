@@ -69,6 +69,7 @@ async fn s3_put_regular_object(
         .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     let content_type = s3_object_content_type(headers, resource, request_id)?;
     let user_metadata = s3_user_metadata(headers, resource, request_id)?;
+    let object_tags = parse_s3_tagging_header(headers, resource, request_id)?.unwrap_or_default();
     let expected_md5 = parse_content_md5(headers, resource, request_id)?;
     let object_lock =
         parse_put_object_lock_headers(headers, uri, request_id, OffsetDateTime::now_utc())?;
@@ -92,6 +93,7 @@ async fn s3_put_regular_object(
             expected_size_bytes: expected_size,
             content_type: Some(content_type.clone()),
             user_metadata,
+            object_tags,
             expires_at: None,
         })
         .await
@@ -244,7 +246,13 @@ async fn s3_read_regular_object(
     }
     if if_none_match_matches_s3(&headers, etag, resource, request_id)? {
         let mut response = s3_empty_response(StatusCode::NOT_MODIFIED, request_id);
-        insert_s3_object_headers(response.headers_mut(), &head.version, payload, None)?;
+        insert_s3_object_headers(
+            response.headers_mut(),
+            &head.version,
+            payload,
+            None,
+            head.tags.len(),
+        )?;
         return Ok(response);
     }
 
@@ -295,6 +303,7 @@ async fn s3_read_regular_object(
         &head.version,
         payload,
         range.as_ref(),
+        head.tags.len(),
     )?;
     Ok(response)
 }
@@ -488,6 +497,7 @@ fn insert_s3_object_headers(
     version: &ObjectVersion,
     payload: &StoredObjectVersion,
     range: Option<&S3ByteRange>,
+    tag_count: usize,
 ) -> Result<(), S3ApiError> {
     let resource = version.external_version_id().as_str();
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -527,6 +537,13 @@ fn insert_s3_object_headers(
     }
     insert_s3_version_id(headers, version.external_version_id())?;
     insert_s3_object_lock_headers(headers, version)?;
+    if tag_count > 0 {
+        headers.insert(
+            HeaderName::from_static("x-amz-tagging-count"),
+            HeaderValue::from_str(&tag_count.to_string())
+                .expect("a tag count is a valid header value"),
+        );
+    }
     insert_s3_user_metadata_headers(headers, payload.user_metadata(), resource)
 }
 

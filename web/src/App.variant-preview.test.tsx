@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -35,6 +36,30 @@ function renderPreview(item: ObjectItem = IMAGE) {
   const preview = (nextItem: ObjectItem) => <ThemeProvider defaultTheme="light"><QueryClientProvider client={queryClient}><ObjectPreviewModal item={nextItem} onClose={vi.fn()} /></QueryClientProvider></ThemeProvider>
   const rendered = render(preview(item))
   return { ...rendered, rerenderPreview: (nextItem: ObjectItem) => rendered.rerender(preview(nextItem)) }
+}
+
+const PREVIEW_ITEMS: ObjectItem[] = [
+  IMAGE,
+  { ...IMAGE, id: 'media_second', name: 'second.png', key: 'previews/second.png', sha256: 'def456', revision: 2 },
+  { ...IMAGE, id: 'media_third', name: 'third.png', key: 'previews/third.png', sha256: 'ghi789', revision: 3 },
+]
+
+function renderPreviewBrowser(initialIndex = 0) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  function PreviewBrowser() {
+    const [index, setIndex] = useState(initialIndex)
+    const item = PREVIEW_ITEMS[index]
+    return <ThemeProvider defaultTheme="light"><QueryClientProvider client={queryClient}><ObjectPreviewModal
+      item={item}
+      previousItem={index > 0 ? PREVIEW_ITEMS[index - 1] : undefined}
+      nextItem={index < PREVIEW_ITEMS.length - 1 ? PREVIEW_ITEMS[index + 1] : undefined}
+      position={index + 1}
+      totalItems={PREVIEW_ITEMS.length}
+      onNavigate={(nextItem) => setIndex(PREVIEW_ITEMS.findIndex((candidate) => candidate.id === nextItem.id))}
+      onClose={vi.fn()}
+    /></QueryClientProvider></ThemeProvider>
+  }
+  return render(<PreviewBrowser />)
 }
 
 function loadRasterImage({ imageWidth = 1600, imageHeight = 1200, viewportWidth = 800, viewportHeight = 600 } = {}) {
@@ -298,5 +323,93 @@ describe('图片实时 Variant 预览', () => {
     expect(await screen.findByTestId('open-file-viewer')).toBeInTheDocument()
     expect(screen.queryByTestId('image-variant-toolbar')).not.toBeInTheDocument()
     expect(getVariantUrl).not.toHaveBeenCalled()
+  })
+})
+
+describe('对象预览连续浏览', () => {
+  it('显示当前位置，并通过边界明确的按钮连续浏览可见文件', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockImplementation(async (mediaId) => ({
+      url: `https://media.example.test/${mediaId}.png?signature=${mediaId}`,
+      expiresAt: '',
+    }))
+
+    renderPreviewBrowser()
+
+    expect(await screen.findByTestId('raster-preview-image')).toHaveAttribute('src', expect.stringContaining('media_image'))
+    expect(screen.getByLabelText('当前第 1 项，共 3 项')).toHaveTextContent('1/3')
+    expect(screen.getByRole('button', { name: '预览上一项' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '预览下一项' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: '预览下一项' }))
+    expect(await screen.findByRole('heading', { name: 'second.png' })).toBeInTheDocument()
+    expect(screen.getByLabelText('当前第 2 项，共 3 项')).toHaveTextContent('2/3')
+    expect(screen.getByRole('button', { name: '预览上一项' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: '预览下一项' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: '预览下一项' }))
+    expect(await screen.findByRole('heading', { name: 'third.png' })).toBeInTheDocument()
+    expect(screen.getByLabelText('当前第 3 项，共 3 项')).toHaveTextContent('3/3')
+    expect(screen.getByRole('button', { name: '预览下一项' })).toBeDisabled()
+  })
+
+  it('支持左右方向键，但不劫持表单、contenteditable 与 Variant 参数区域', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockImplementation(async (mediaId) => ({ url: `https://media.example.test/${mediaId}.png`, expiresAt: '' }))
+    renderPreviewBrowser(1)
+    await screen.findByRole('heading', { name: 'second.png' })
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' })
+    expect(await screen.findByRole('heading', { name: 'third.png' })).toBeInTheDocument()
+    fireEvent.keyDown(window, { key: 'ArrowLeft' })
+    expect(await screen.findByRole('heading', { name: 'second.png' })).toBeInTheDocument()
+
+    fireEvent.keyDown(screen.getByRole('spinbutton', { name: 'Variant 宽度' }), { key: 'ArrowRight' })
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Variant 格式' }), { key: 'ArrowLeft' })
+
+    for (const tagName of ['input', 'select', 'textarea']) {
+      const control = document.createElement(tagName)
+      document.body.appendChild(control)
+      fireEvent.keyDown(control, { key: 'ArrowRight' })
+      control.remove()
+    }
+    const editable = document.createElement('div')
+    editable.setAttribute('contenteditable', 'true')
+    const editableChild = document.createElement('span')
+    editable.appendChild(editableChild)
+    document.body.appendChild(editable)
+    fireEvent.keyDown(editableChild, { key: 'ArrowRight' })
+    editable.remove()
+
+    expect(screen.getByRole('heading', { name: 'second.png' })).toBeInTheDocument()
+    expect(screen.getByLabelText('当前第 2 项，共 3 项')).toBeInTheDocument()
+  })
+
+  it('切换对象时重置原图、Variant、缩放和错误状态，且不沿用旧签名 URL', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockImplementation(async (mediaId) => {
+      if (mediaId === IMAGE.id) throw new Error('第一项签名已失效')
+      return { url: `https://media.example.test/${mediaId}.png?signature=${mediaId}`, expiresAt: '' }
+    })
+
+    renderPreviewBrowser()
+    expect(await screen.findByText('预览加载失败')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '预览下一项' }))
+
+    const secondImage = await screen.findByTestId('raster-preview-image')
+    expect(secondImage).toHaveAttribute('src', expect.stringContaining('signature=media_second'))
+    expect(secondImage).not.toHaveAttribute('src', expect.stringContaining('media_image'))
+    expect(screen.queryByText('预览加载失败')).not.toBeInTheDocument()
+
+    loadRasterImage()
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Variant 宽度' }), { target: { value: '720' } })
+    fireEvent.click(screen.getByRole('button', { name: '显示为原始大小 100%' }))
+    expect(screen.getByTestId('raster-preview-viewport')).toHaveAttribute('data-view-mode', 'actual')
+    expect(screen.getByRole('spinbutton', { name: 'Variant 宽度' })).toHaveValue(720)
+
+    fireEvent.click(screen.getByRole('button', { name: '预览下一项' }))
+    const thirdImage = await screen.findByTestId('raster-preview-image')
+    expect(thirdImage).toHaveAttribute('src', expect.stringContaining('signature=media_third'))
+    expect(thirdImage).not.toHaveAttribute('src', expect.stringContaining('signature=media_second'))
+    expect(screen.getByTestId('raster-preview-viewport')).toHaveAttribute('data-view-mode', 'fit')
+    expect(screen.getByRole('spinbutton', { name: 'Variant 宽度' })).toHaveValue(DEFAULT_VARIANT_PARAMS.width)
+    expect(screen.getByText('显示原图')).toBeInTheDocument()
   })
 })

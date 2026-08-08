@@ -66,6 +66,7 @@ async fn postgres_object_version_lock_contract() {
             expected_size_bytes: 8,
             content_type: Some("text/plain".into()),
             user_metadata: serde_json::json!({}),
+            object_tags: mediahub_core::S3ObjectTagSet::empty(),
             expires_at: None,
         })
         .await

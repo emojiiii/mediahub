@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use mediahub_core::{
     ApplicationId, BucketId, BucketS3Configuration, Checksum, DefaultRetention, EntityTag,
     NewStorageGcTask, ObjectId, ObjectRetention, ObjectVersion, ObjectVersionId,
-    ObjectVersionState, S3Bucket, S3LifecycleConfiguration, S3Object, S3VersionId, StorageGcTask,
-    StorageGcTaskId, UploadIntent, UploadIntentId, VersioningStatus,
+    ObjectVersionState, S3Bucket, S3LifecycleConfiguration, S3Object, S3ObjectTagSet, S3VersionId,
+    StorageGcTask, StorageGcTaskId, UploadIntent, UploadIntentId, VersioningStatus,
 };
 use time::OffsetDateTime;
 
@@ -213,6 +213,29 @@ pub enum PutS3ObjectLockOutcome {
     InvalidRetention,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3ObjectTaggingCommand {
+    pub application_id: ApplicationId,
+    pub bucket_id: BucketId,
+    pub object_key: String,
+    pub version_id: Option<S3VersionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum S3ObjectTaggingOutcome {
+    Found {
+        object: S3Object,
+        version: Box<ObjectVersion>,
+        tags: S3ObjectTagSet,
+    },
+    ObjectNotFound,
+    VersionNotFound,
+    DeleteMarker {
+        version_id: S3VersionId,
+        is_current: bool,
+    },
+}
+
 /// Persistence boundary for S3 bucket identity and configuration.
 ///
 /// Mutations that inspect emptiness or configuration state must lock the
@@ -356,6 +379,28 @@ pub trait S3ObjectRepository: Send + Sync {
         &self,
         object_id: ObjectId,
     ) -> Result<Vec<ObjectVersion>, RepositoryError>;
+
+    /// Reads tags for an already resolved committed data version while
+    /// preserving Application isolation. `None` means the version is not a
+    /// visible data version for that Application; an empty set is a valid hit.
+    async fn find_s3_object_version_tags(
+        &self,
+        application_id: ApplicationId,
+        version_id: ObjectVersionId,
+    ) -> Result<Option<S3ObjectTagSet>, RepositoryError>;
+
+    async fn get_s3_object_tagging(
+        &self,
+        command: &S3ObjectTaggingCommand,
+    ) -> Result<S3ObjectTaggingOutcome, RepositoryError>;
+
+    /// Replaces all tags after locking the tenant bucket, logical object and
+    /// exact committed data version. An empty set implements DeleteObjectTagging.
+    async fn replace_s3_object_tagging(
+        &self,
+        command: &S3ObjectTaggingCommand,
+        tags: &S3ObjectTagSet,
+    ) -> Result<S3ObjectTaggingOutcome, RepositoryError>;
 
     /// Applies S3 delete semantics while holding the bucket configuration,
     /// logical object, and affected version rows. Object Lock checks, head

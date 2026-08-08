@@ -15,6 +15,12 @@ enum S3MetadataDirective {
     Replace,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S3TaggingDirective {
+    Copy,
+    Replace,
+}
+
 async fn s3_copy_object(
     operation: S3ObjectOperation<'_>,
     signature: &ParsedSigV4,
@@ -45,10 +51,20 @@ async fn s3_copy_object(
     }
     let source = parse_s3_copy_source(headers, resource, request_id)?;
     let directive = parse_s3_metadata_directive(headers, resource, request_id)?;
+    let tagging_directive = parse_s3_tagging_directive(headers, resource, request_id)?;
+    let replacement_tags = parse_s3_tagging_header(headers, resource, request_id)?;
+    if tagging_directive == S3TaggingDirective::Copy && replacement_tags.is_some() {
+        return Err(S3ApiError::invalid_request(
+            "x-amz-tagging requires x-amz-tagging-directive=REPLACE for CopyObject.",
+            resource,
+            request_id,
+        ));
+    }
     if source.bucket_name == bucket_name
         && source.object_key == object_key
         && source.version_id.is_none()
         && directive == S3MetadataDirective::Copy
+        && tagging_directive == S3TaggingDirective::Copy
     {
         return Err(S3ApiError::invalid_argument(
             "This copy request is illegal because it is copying an object to itself without changing its metadata.",
@@ -91,6 +107,10 @@ async fn s3_copy_object(
             s3_user_metadata(headers, resource, request_id)?,
         ),
     };
+    let object_tags = match tagging_directive {
+        S3TaggingDirective::Copy => source_head.tags.clone(),
+        S3TaggingDirective::Replace => replacement_tags.unwrap_or_default(),
+    };
     let receipt = service
         .begin_put(&BeginPutObjectRequest {
             application_id: auth.application.id,
@@ -99,6 +119,7 @@ async fn s3_copy_object(
             expected_size_bytes: source_payload.size_bytes(),
             content_type: Some(content_type.clone()),
             user_metadata,
+            object_tags,
             expires_at: None,
         })
         .await
@@ -435,6 +456,22 @@ fn parse_s3_metadata_directive(
     }
 }
 
+fn parse_s3_tagging_directive(
+    headers: &HeaderMap,
+    resource: &str,
+    request_id: &str,
+) -> Result<S3TaggingDirective, S3ApiError> {
+    match optional_single_s3_header(headers, "x-amz-tagging-directive", resource, request_id)? {
+        None | Some("COPY") => Ok(S3TaggingDirective::Copy),
+        Some("REPLACE") => Ok(S3TaggingDirective::Replace),
+        Some(_) => Err(S3ApiError::invalid_argument(
+            "x-amz-tagging-directive must be COPY or REPLACE.",
+            resource,
+            request_id,
+        )),
+    }
+}
+
 fn reject_unsupported_s3_copy_headers(
     headers: &HeaderMap,
     part_copy: bool,
@@ -452,8 +489,6 @@ fn reject_unsupported_s3_copy_headers(
         ));
     }
     let unsupported = [
-        "x-amz-tagging",
-        "x-amz-tagging-directive",
         "x-amz-checksum-algorithm",
         "x-amz-website-redirect-location",
         "x-amz-server-side-encryption",
@@ -471,6 +506,17 @@ fn reject_unsupported_s3_copy_headers(
     {
         return Err(S3ApiError::not_implemented(
             format!("{name} is not supported for copy operations."),
+            resource,
+            request_id,
+        ));
+    }
+    if part_copy
+        && let Some(name) = ["x-amz-tagging", "x-amz-tagging-directive"]
+            .into_iter()
+            .find(|name| headers.contains_key(*name))
+    {
+        return Err(S3ApiError::invalid_argument(
+            format!("{name} is not valid for UploadPartCopy."),
             resource,
             request_id,
         ));

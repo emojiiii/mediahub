@@ -14,6 +14,7 @@ mod object_version;
 mod s3_bucket;
 mod s3_lifecycle;
 mod s3_storage;
+mod s3_tagging;
 mod upload_session;
 mod variant;
 mod visibility;
@@ -54,6 +55,10 @@ pub use s3_storage::{
     Checksum, ChecksumAlgorithm, EntityTag, NewStorageGcTask, PersistedUploadIntent,
     StorageGcReason, StorageGcTask, StorageGcTaskId, StorageGcTaskState, UploadIntent,
     UploadIntentId, UploadIntentState,
+};
+pub use s3_tagging::{
+    MAX_S3_OBJECT_TAG_KEY_CHARS, MAX_S3_OBJECT_TAG_VALUE_CHARS, MAX_S3_OBJECT_TAGS, S3ObjectTag,
+    S3ObjectTagSet, S3TaggingError,
 };
 pub use upload_session::{
     NewUploadSession, PersistedUploadSession, UploadSession, UploadSessionState,

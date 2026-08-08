@@ -89,17 +89,20 @@ mod s3_copy_tests {
     }
 
     #[test]
-    fn copy_never_silently_accepts_unsupported_tagging_or_storage_classes() {
+    fn copy_routes_tagging_to_directive_parser_and_rejects_storage_classes() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-amz-tagging",
             HeaderValue::from_static("project=prismark"),
         );
+        reject_unsupported_s3_copy_headers(&headers, false, "/bucket/key", "request")
+            .expect("CopyObject tagging is handled by its directive parser");
         assert_eq!(
-            reject_unsupported_s3_copy_headers(&headers, false, "/bucket/key", "request")
-                .expect_err("tagging must be explicit")
-                .code,
-            "NotImplemented"
+            parse_s3_tagging_header(&headers, "/bucket/key", "request")
+                .expect("tag header")
+                .expect("tags")
+                .len(),
+            1
         );
         headers.remove("x-amz-tagging");
         headers.insert("x-amz-storage-class", HeaderValue::from_static("GLACIER"));

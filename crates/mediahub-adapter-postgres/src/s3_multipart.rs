@@ -13,7 +13,7 @@ use mediahub_app::{
 };
 use mediahub_core::{
     ApplicationId, BucketId, Checksum, EntityTag, NewStorageGcTask, ObjectId, ObjectVersionId,
-    OffsetDateTime, StorageGcReason, StorageGcTaskId, UploadIntent, UploadIntentId,
+    OffsetDateTime, S3ObjectTagSet, StorageGcReason, StorageGcTaskId, UploadIntent, UploadIntentId,
     UploadIntentState,
 };
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow, types::Json};

@@ -15,13 +15,14 @@
 | --- | --- | --- | --- |
 | S3 入口 | 已完成 | 独立 `MEDIAHUB_S3_BIND_ADDR` listener，默认 `0.0.0.0:9000`；Bucket/Object 使用根路径；生产 Router 已删除 `/s3` 路由 | 增加反向代理、virtual-host style 与更多客户端矩阵 |
 | 对象模型 | 核心完成 | `objects`、不可变 `object_versions`、`upload_intents`、`storage_gc_tasks`；S3、WebDAV 普通文件路径和版本预览后端不读写 `Media` | 切换 JSON 写路径、Variant 等剩余消费者并删除旧模型 |
-| Versioning | 核心完成 | Unversioned/Enabled/Suspended、opaque version ID、null version、delete marker、精确版本读删、ListObjectVersions、当前指针重算 | 版本级 Tagging/Lock API 与更多客户端矩阵 |
+| Versioning | 核心完成 | Unversioned/Enabled/Suspended、opaque version ID、null version、delete marker、精确版本读删、ListObjectVersions、当前指针重算 | 控制台版本历史与更多客户端矩阵 |
 | Put/Get/Head/Copy | 核心完成 | SigV4 顺序、流式写入、SHA-256 + MD5、Content-MD5、单 Range、条件请求、metadata、版本响应头、CopyObject | 更多 checksum；外部 S3 Full GET/Copy 改成真正端到端流式读取 |
 | List/Delete | 核心完成 | ListObjectsV2 与 ListObjectVersions 的分页/marker/prefix/delimiter；DeleteObject/DeleteObjects 的 marker/null/lock/GC 语义 | ListObjectsV1 与更多 golden/客户端测试 |
 | Multipart | 核心完成 | Create/UploadPart/ListParts/Complete/Abort/ListMultipartUploads/UploadPartCopy；Part MD5、标准 multipart ETag、恢复与重放、ObjectVersion 原子提交、持久 GC | 真实客户端并发与故障注入矩阵 |
-| Bucket 配置 | 部分完成 | List/Create/Head/Delete/GetLocation；Versioning GET/PUT；Lifecycle GET/PUT/DELETE；Object Lock GET/PUT/CreateBucket header 与不可逆约束 | Policy、CORS、Notification、Tagging |
+| Bucket 配置 | 部分完成 | List/Create/Head/Delete/GetLocation；Versioning GET/PUT；Lifecycle GET/PUT/DELETE；Object Lock GET/PUT/CreateBucket header 与不可逆约束 | Policy、CORS、Notification、Bucket Tagging |
 | Lifecycle | 部分完成 | 配置 schema、parser、validator 与 Multipart 过期回收 | 完成基于 ObjectVersion 的 Expiration/Noncurrent/ExpiredMarker 执行器 |
 | Object Lock | 核心完成 | Bucket 配置、默认 Retention、PutObject 锁头、对象 Retention/Legal Hold GET/PUT、签名 Governance bypass、不可逆 Versioning 约束与删除事务保护 | CopyObject/Multipart 显式锁头支持与 native-client 矩阵 |
+| Object Tagging | 核心完成 | 当前/精确版本 GET/PUT/DELETE；独立版本标签表；PutObject、Copy COPY/REPLACE、Multipart 冻结与 TagCount | Bucket Tagging、标签条件 Policy/Lifecycle、真实 AWS CLI endpoint 回归 |
 | Policy/Auth | 未完成 | 现有 SigV4 和 Application 授权边界继续工作 | 替换固定权限为标准 S3 Policy evaluator |
 
 本轮没有加入旧 `/s3`、旧 schema 或旧品牌兼容代码。历史 `Media` 路径仍存在只是因为非 S3 消费者尚未全部迁移，不是新旧双写；S3 普通对象与 Multipart 的新写入只提交到 Object/ObjectVersion。
@@ -30,8 +31,8 @@
 
 - PostgreSQL 17 fresh migration：通过。
 - PostgreSQL Repository Contract：1/1 通过。
-- Server 全量测试：lib 8/8、server 155/155 通过，包含真实 PostgreSQL 的 SigV4 S3、WebDAV 和不可变版本预览用例。
-- PostgreSQL S3 列表合同与 Bucket Object Lock 合同：各 1/1 通过。
+- Server 全量测试：lib 8/8、server 165/165 通过，包含真实 PostgreSQL 的 SigV4 S3、WebDAV、Object Tagging 和不可变版本预览用例。
+- PostgreSQL Repository、S3 列表、Bucket Object Lock、ObjectVersion Lock 与 Object Tagging 合同：各 1/1 通过。
 - Silo `docker.io/pgsty/silo:latest`：真实 ObjectStore 与 Presigned PUT 合同 1/1 通过。
 - 真实测试修复了两个仅靠静态检查无法发现的问题：PostgreSQL constraint 自动命名冲突/NUL 检查，以及 generic S3 create-only copy 的能力差异。
 
@@ -1292,7 +1293,7 @@ PutBucketObjectLockConfiguration：
 - versionId/null version/delete marker response headers；
 - 标准 S3 XML error。
 
-后续纵向切片再完成 CopyObject/UploadPartCopy、Tagging、Bucket Policy、Notification、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token。未实现 operation 必须返回标准错误，不能假成功。
+CopyObject/UploadPartCopy 与版本级 Object Tagging 已由后续纵向切片完成。仍待实现的是 Bucket Policy、Notification、Bucket Tagging、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token；未实现 operation 必须返回标准错误，不能假成功。
 ## 10. Policy 实现
 
 ### 10.1 Core 类型
@@ -1959,7 +1960,7 @@ crates/mediahub-server/tests/s3/
 ### Phase 4：Multipart 接入版本模型
 
 - 删除同 Key active upload 限制；
-- Initiate 冻结 metadata/checksum/lock；
+- Initiate 冻结 metadata/checksum/tagging；显式 Object Lock headers 仍明确拒绝，Bucket DefaultRetention 在 Complete 事务内应用；
 - Complete 原子提交 version/head/quota/outbox/终态；
 - Abort 与 Complete 竞争、重放和 GC。
 - ListMultipartUploads 与 UploadPartCopy 已作为独立协议切片完成。
@@ -1970,7 +1971,7 @@ crates/mediahub-server/tests/s3/
 
 - Bucket 创建后启用、不可关闭、自动 Enabled、禁止 Suspended；
 - Default Retention、Object Retention、Legal Hold、Governance bypass；
-- PutObject/Multipart lock headers。
+- PutObject lock headers；Multipart 显式 lock headers 仍是后续项。
 
 当前 PutObject、Bucket DefaultRetention、对象级 Retention/Legal Hold 已完成；CopyObject 目标锁头和 Multipart 显式锁头暂时明确拒绝，不会静默忽略。无显式锁头的 Multipart Complete 会在版本提交事务内应用 Bucket DefaultRetention。
 
@@ -1987,7 +1988,7 @@ crates/mediahub-server/tests/s3/
 
 ### Phase 7：补齐 S3 扩展切片
 
-CopyObject/UploadPartCopy 已完成。后续依次实现 Tagging、Policy、Notification，再处理 CORS/SSE 等能力。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
+CopyObject/UploadPartCopy 与 Object Tagging 已完成。后续依次实现 Policy、Notification，再处理 Bucket Tagging、CORS/SSE 等能力。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
 
 ### Phase 8：切换其余消费者
 

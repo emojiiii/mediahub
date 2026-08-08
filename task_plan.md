@@ -134,11 +134,62 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 - [completed] 对象级 Retention / Legal Hold、PutObject lock headers 与默认 Retention。
 - [completed] 栅格图片预览缩放、平移、适应窗口与键盘交互。
 - [completed] 统一 PostgreSQL、Silo、Rust、OpenAPI、前端、格式与 Clippy 回归。
-- [in_progress] 更新最终差距说明并创建第二个本地提交；保持不 push。
+- [completed] 更新最终差距说明并创建第二个本地提交 `72eb4d4`；保持不 push。
 
 ## 范围边界
 
 - 不复制 Silo 的 AGPL 实现。
 - 不恢复旧 `/s3` 路由、旧 schema 或旧品牌兼容层。
 - 视频 Variant 继续留给独立异步服务与队列。
-- Policy、完整 Lifecycle 执行器、Tagging/Notification/CORS/SSE 等未在本切片完成的能力必须明确列为剩余差距，不伪装为已支持。
+- Policy、完整 Lifecycle 执行器、Notification/CORS/SSE 等未在本切片完成的能力必须明确列为剩余差距，不伪装为已支持。
+
+---
+
+# S3 Object Tagging 纵向切片（2026-08-08）
+
+## 目标
+
+基于干净提交 `72eb4d4` 实现绑定不可变 ObjectVersion 的标准 S3 Object Tagging，覆盖独立 tagging API、Put/Copy/Multipart 写入边界、响应计数、Memory/PostgreSQL repository，以及真实 PostgreSQL 17 与 SigV4 HTTP 验证；不提交、不推送。
+
+## 阶段
+
+- [completed] 1. 审计 operation classifier、ObjectVersion schema/repository 和 Put/Copy/Multipart 提交点
+- [completed] 2. 实现 core/app DTO、校验、Repository 与 Memory/PostgreSQL 持久化
+- [completed] 3. 实现对象 tagging API 和 Put/Copy/Multipart 标签语义
+- [completed] 4. 补齐 GET/HEAD tagging-count、标准 XML/错误与隔离测试
+- [completed] 5. 执行真实 PostgreSQL 17、SigV4、全量回归、strict clippy/fmt/diff 并清理容器
+
+## 约束
+
+- 只参考 `.research/silo` 的 operation 顺序、模块边界和测试组织，不复制 AGPL 代码。
+- 不改 `web`、`readme.md`、兼容脚本；不 commit、不 push。
+- 标签属于 ObjectVersion，不写入 `user_metadata`，不允许 delete marker 承载标签。
+
+## 错误记录
+
+| 错误 | 尝试 | 处理 |
+|---|---:|---|
+| 首次聚合检索包含不存在的根级 `migrations/` 路径，`rg` 返回退出码 1 | 1 | 改为先定位仓库实际 migration 目录，再执行定向检索 |
+| 首次追加规划记录的补丁上下文使用了终端乱码文本，未匹配文件 | 1 | 以 UTF-8 读取精确尾部后，用稳定中文上下文追加 |
+| Windows PowerShell 未展开传给 `rg` 的 `s3_http*.rs` 文件通配符 | 1 | 使用 `rg -g 's3_http*.rs'` 的原生 glob 过滤 |
+| 首次真实 PG contract 只设置了 `DATABASE_URL`，测试要求专用 `MEDIAHUB_TEST_POSTGRES_URL` | 1 | 设置仓库约定的专用变量后重新执行，contract 与 SigV4 用例均通过 |
+
+## 最终验证
+
+- Core 54/54、App 45/45、PostgreSQL adapter 28/28、Server 165/165 通过。
+- 真实 PostgreSQL 17 Object Tagging contract 1/1 通过。
+- SigV4 HTTP 巨型往返用例 1/1 通过，覆盖 Put/Get/Delete Tagging、MD5、计数、Copy COPY/REPLACE 与 Multipart 标签冻结。
+- `cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --check`、`git diff --check` 通过。
+- 临时 PG17 容器使用 tmpfs，已删除且未创建卷；未 commit、未 push，HEAD 保持 `72eb4d4`。
+
+---
+
+# PrismArk 第三阶段并行收口（2026-08-08）
+
+## 状态
+
+- [completed] 完成版本级 S3 Object Tagging 全纵向切片和独立 PostgreSQL 合同。
+- [completed] 完成 Object Lock 与 Object Tagging 的 AWS CLI 严格兼容矩阵；本机缺客户端时准确报告 SKIP。
+- [completed] 完成对象预览上一项/下一项、位置计数、方向键与状态隔离。
+- [completed] Rust 全工作区、PG17、严格 Clippy/Fmt、前端 182/182、OpenAPI 和生产构建统一回归。
+- [completed] 更新产品/修改文档并创建第三个本地检查点；保持不 push。

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use mediahub_core::{
     ApplicationId, BucketId, Checksum, EntityTag, ObjectId, ObjectVersionId, OffsetDateTime,
-    UploadIntentId,
+    S3ObjectTagSet, UploadIntentId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +30,7 @@ pub struct NewS3MultipartUpload {
     pub object_key: String,
     pub content_type: String,
     pub user_metadata: Value,
+    pub object_tags: S3ObjectTagSet,
     pub storage_backend: String,
     pub expires_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
@@ -42,6 +43,7 @@ impl NewS3MultipartUpload {
             || self.content_type.is_empty()
             || self.storage_backend.is_empty()
             || !self.user_metadata.is_object()
+            || self.object_tags.validate().is_err()
         {
             return Err(RepositoryError::Invariant(
                 "multipart identity, content type, backend, and metadata are invalid".into(),
@@ -64,6 +66,7 @@ pub struct S3MultipartUpload {
     pub object_key: String,
     pub content_type: String,
     pub user_metadata: Value,
+    pub object_tags: S3ObjectTagSet,
     pub storage_backend: String,
     pub state: S3MultipartUploadState,
     pub expires_at: OffsetDateTime,

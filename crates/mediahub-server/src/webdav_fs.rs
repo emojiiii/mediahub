@@ -575,6 +575,7 @@ impl MediaHubDavFs {
                 expected_size_bytes: expected_size,
                 content_type: Some(upload.content_type.clone()),
                 user_metadata: serde_json::json!({}),
+                object_tags: mediahub_core::S3ObjectTagSet::empty(),
                 expires_at: None,
             })
             .await
@@ -644,6 +645,7 @@ impl MediaHubDavFs {
                         .to_owned(),
                 ),
                 user_metadata: payload.user_metadata().clone(),
+                object_tags: mediahub_core::S3ObjectTagSet::empty(),
                 expires_at: None,
             })
             .await

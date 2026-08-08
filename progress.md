@@ -100,3 +100,26 @@
 - 最终 Rust 全工作区、全部 targets 在 PostgreSQL 17 上通过；Server 160/160，Repository/Listing/Bucket Lock/ObjectVersion Lock 合同全部通过。
 - 全工作区严格 Clippy `-D warnings`、`cargo fmt --check`、OpenAPI 10/10 与生成客户端一致性、Compose 配置、PowerShell 兼容脚本语法/Help 均通过。
 - 最终 PostgreSQL 与 Silo 临时容器均已按精确名称删除，没有测试容器残留。
+
+## S3 Object Tagging 纵向切片（2026-08-08）
+
+- 已确认干净基线 `72eb4d4`，且不会 commit/push。
+- 已读取 `planning-with-files` 技能与现有规划记录。
+- 已定位 Silo 对象 tagging 路由顺序，以及 PrismArk 当前 CopyObject 的显式拒绝边界。
+- 首次检索误用根级 `migrations/` 路径、首次计划补丁使用乱码上下文；均已记录并更换方法。
+- 已确定独立标签表与事务边界：初始标签进入版本 commit，后续替换由版本锁定 repository 命令完成。
+- Windows 下 `rg crates/.../s3_http*.rs` 不展开通配符导致一次检索失败；后续改用 `rg -g 's3_http*.rs'`。
+- 已完成 Core/App/Memory/PostgreSQL/HTTP/XML 全纵向实现；对象标签绑定精确 ObjectVersion，并覆盖 current/versionId、应用隔离与 delete marker 拒绝。
+- 已完成 PutObject 标签、CopyObject COPY/REPLACE、Multipart Initiate 冻结、GET/HEAD 标签计数；所有不支持组合均显式报错。
+- 标签字符校验已拒绝全部 control，新增换行与 Tab 负测；XML namespace/顺序和 header URL 解码均严格校验。
+- Core 54/54、App 45/45、PostgreSQL adapter 28/28、Server 165/165 已通过。
+- 使用 PostgreSQL 17 tmpfs 临时容器完成真实 tagging contract 1/1 与最终 SigV4 HTTP 1/1；容器已删除且无卷残留。
+- 全工作区 strict clippy、fmt check 与 diff check 通过；HEAD 仍为 `72eb4d4`，未 commit、未 push。
+
+## 第三阶段并行收口（2026-08-08）
+
+- 已完成 Object Lock AWS CLI 矩阵：Bucket 配置、默认 Governance、Retention/Legal Hold、无 bypass/未签名 bypass 拒绝、签名 bypass 与精确安全清理。
+- 已完成 Object Tagging AWS CLI 矩阵：精确版本 GET/PUT/DELETE、版本隔离、Copy COPY/REPLACE、TagCount 与本轮 VersionId 清理；无法由 CLI 原样发出的负例明确 SKIP。
+- 对象预览加入上一项/下一项、当前位置与左右方向键；切换对象会隔离签名 URL、Variant、缩放和错误状态，输入控件与 Variant 面板不被方向键劫持。
+- 主代理统一回归：Rust 全工作区全部 targets 通过，Server 165/165，PG Repository/Listing/Bucket Lock/ObjectVersion Lock/Object Tagging 合同各 1/1；严格 Clippy/Fmt 通过。
+- 前端 34 个测试文件、182/182 通过，OpenAPI 50 paths/74 operations/491 references、类型检查、生产构建与 viewer chunk 验证通过。

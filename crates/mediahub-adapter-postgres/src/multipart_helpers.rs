@@ -350,6 +350,15 @@ fn row_to_multipart_upload(row: PgRow) -> Result<S3MultipartUpload, RepositoryEr
             .try_get::<Json<serde_json::Value>, _>("user_metadata")
             .map_err(database_error)?
             .0,
+        object_tags: {
+            let tags = row
+                .try_get::<Json<S3ObjectTagSet>, _>("object_tags")
+                .map_err(database_error)?
+                .0;
+            tags.validate()
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+            tags
+        },
         storage_backend: row.try_get("storage_backend").map_err(database_error)?,
         state: parse_state(&row.try_get::<String, _>("state").map_err(database_error)?)?,
         expires_at: row.try_get("expires_at").map_err(database_error)?,

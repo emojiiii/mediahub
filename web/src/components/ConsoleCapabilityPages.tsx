@@ -133,7 +133,7 @@ export function VariantCenterPage() {
     state="available"
     aside={<div className="grid border-t border-separator bg-default-soft sm:grid-cols-3">
       <VariantFact label="变换" value="Resize · Fit · Crop" />
-      <VariantFact label="输出" value="WebP · AVIF · JPEG · PNG" />
+      <VariantFact label="输出" value="WebP · JPEG · PNG" />
       <VariantFact label="一致性" value="Lease · Fence · Cache" />
     </div>}
     items={[

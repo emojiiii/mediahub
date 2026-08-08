@@ -924,6 +924,9 @@ function ObjectsPage() {
   const safePageIndex = Math.min(pageIndex, Math.max(0, pages.length - 1))
   const visibleItems = pages[safePageIndex]?.items ?? []
   const visiblePrefixes = pages[safePageIndex]?.commonPrefixes ?? []
+  const previewIndex = previewItem ? visibleItems.findIndex((item) => item.id === previewItem.id) : -1
+  const previousPreviewItem = previewIndex > 0 ? visibleItems[previewIndex - 1] : undefined
+  const nextPreviewItem = previewIndex >= 0 && previewIndex < visibleItems.length - 1 ? visibleItems[previewIndex + 1] : undefined
   const currentPrefix = directoryMode ? filters.prefix ?? '' : ''
   const listNavigationState: ObjectListNavigationState = { from: location.pathname + location.search, objectList: { filters, filterDraft } }
   const hasCustomObjectFilters = Object.entries(filters).some(([key, value]) => key !== 'limit' && key !== 'status' && Boolean(value))
@@ -974,7 +977,16 @@ function ObjectsPage() {
     </section>
     {batchEditorOpen && <BatchEditModal selectedCount={selectedIds.length} pending={batch.isPending} error={batch.error} onClose={() => setBatchEditorOpen(false)} onExecute={(action) => batch.mutate(action)} />}
     {batchDeleteOpen && <DeleteObjectsModal count={selectedIds.length} pending={batch.isPending} error={batch.error} onClose={() => setBatchDeleteOpen(false)} onConfirm={() => batch.mutate({ type: 'delete' })} />}
-    {previewItem && <ObjectPreviewModal item={previewItem} onClose={() => setPreviewItem(null)} onEdit={() => { setPreviewItem(null); setEditorItem(previewItem) }} />}
+    {previewItem && <ObjectPreviewModal
+      item={previewItem}
+      previousItem={previousPreviewItem}
+      nextItem={nextPreviewItem}
+      position={previewIndex >= 0 ? previewIndex + 1 : undefined}
+      totalItems={previewIndex >= 0 ? visibleItems.length : undefined}
+      onNavigate={setPreviewItem}
+      onClose={() => setPreviewItem(null)}
+      onEdit={() => { setPreviewItem(null); setEditorItem(previewItem) }}
+    />}
     {editorItem && <ObjectEditorModal item={editorItem} onClose={() => setEditorItem(null)} onSaved={async () => { setEditorItem(null); await refreshResources() }} />}
     {deleteItem && <DeleteObjectsModal item={deleteItem} count={1} pending={remove.isPending} error={remove.error} onClose={() => setDeleteItem(null)} onConfirm={() => remove.mutate(deleteItem)} />}
   </>
@@ -1183,8 +1195,8 @@ export function calculateRasterPreviewFitZoom(viewport: RasterPreviewSize, image
 }
 
 export function isRasterPreviewKeyboardTargetEditable(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement
-    && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+  return target instanceof Element
+    && Boolean(target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [data-preview-navigation-ignore-keys]'))
 }
 
 function samePoint(left: RasterPreviewPoint, right: RasterPreviewPoint): boolean {
@@ -1360,7 +1372,7 @@ function RasterImageCanvas({ src, alt, resetKey, fallback, children }: { src?: s
 }
 
 function ImageVariantToolbar({ mode, params, pending, valid, failed, onModeChange, onParamsChange }: { mode: ImagePreviewMode; params: VariantParams; pending: boolean; valid: boolean; failed: boolean; onModeChange: (mode: ImagePreviewMode) => void; onParamsChange: (params: VariantParams) => void }) {
-  return <div data-testid="image-variant-toolbar" className="shrink-0 border-b border-separator bg-surface px-3 py-2">
+  return <div data-testid="image-variant-toolbar" data-preview-navigation-ignore-keys className="shrink-0 border-b border-separator bg-surface px-3 py-2">
     <div className="flex min-w-0 items-end gap-3 overflow-x-auto pb-1">
       <div className="shrink-0">
         <span className="mb-1 block text-[10px] font-medium text-muted">预览模式</span>
@@ -1377,7 +1389,24 @@ function ImageVariantToolbar({ mode, params, pending, valid, failed, onModeChang
   </div>
 }
 
-export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: ObjectItem; variant?: VariantParams; onClose: () => void; onEdit?: () => void }) {
+export type ObjectPreviewModalProps = {
+  item: ObjectItem
+  variant?: VariantParams
+  previousItem?: ObjectItem
+  nextItem?: ObjectItem
+  position?: number
+  totalItems?: number
+  onNavigate?: (item: ObjectItem) => void
+  onClose: () => void
+  onEdit?: () => void
+}
+
+export function ObjectPreviewModal(props: ObjectPreviewModalProps) {
+  const variantKey = props.variant ? JSON.stringify(props.variant) : 'original'
+  return <ObjectPreviewModalContent key={`${props.item.id}:${props.item.revision}:${variantKey}`} {...props} />
+}
+
+function ObjectPreviewModalContent({ item, variant, previousItem, nextItem, position, totalItems, onNavigate, onClose, onEdit }: ObjectPreviewModalProps) {
   const { resolvedTheme } = useTheme()
   const rasterImage = isRasterImageMimeType(item.type)
   const publicObject = item.visibility === '公开'
@@ -1455,6 +1484,18 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
   })
   const publicUrl = publicObject ? originalPreview.data?.url : undefined
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || isRasterPreviewKeyboardTargetEditable(event.target)) return
+      const targetItem = event.key === 'ArrowLeft' ? previousItem : event.key === 'ArrowRight' ? nextItem : undefined
+      if (!targetItem || !onNavigate) return
+      event.preventDefault()
+      onNavigate(targetItem)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [nextItem, onNavigate, previousItem])
+
   const loading = <div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载对象预览" color="accent" /><span>正在加载预览</span></div>
   const originalError = <div className="max-w-md px-6 text-center"><AlertCircle className="mx-auto size-8 text-danger" /><p className="mt-3 text-sm font-medium text-white">预览加载失败</p><p className="mt-1 text-xs leading-5 text-white/50">{errorMessage(originalPreview.error)}</p><Button variant="secondary" className="mt-4" onClick={() => originalPreview.refetch()}><RefreshCw className="size-4" />重试</Button></div>
   const genericMedia = originalPreview.isLoading ? loading : originalPreview.error ? originalError : currentUrl ? <Suspense fallback={<div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载多格式查看器" color="accent" /><span>正在加载查看器</span></div>}><EnhancedPreviewSurface fileName={item.name} mimeType={item.type} size={item.size} url={currentUrl} theme={resolvedTheme} /></Suspense> : null
@@ -1476,8 +1517,16 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
     </RasterImageCanvas>
   </>
 
+  const showNavigation = position !== undefined && totalItems !== undefined && totalItems > 0
+
   return <Modal title={variant ? 'Variant 预览' : '对象预览'} onClose={onClose} size="cover" containerClassName="h-[calc(100dvh-2rem)] max-h-[calc(100dvh-2rem)] sm:h-[calc(100dvh-3rem)] sm:max-h-[calc(100dvh-3rem)]" dialogClassName="flex h-full min-h-0 flex-col overflow-hidden" bodyClassName="flex min-h-0 flex-1 overflow-hidden p-0">
-    <div data-testid="object-preview-layout" className="grid h-full min-h-0 min-w-0 w-full grid-cols-[minmax(0,1fr)] grid-rows-[minmax(0,1fr)_minmax(18rem,42%)] lg:grid-cols-[minmax(0,1fr)_320px] lg:grid-rows-1">
+    <div className="flex h-full min-h-0 min-w-0 w-full flex-col">
+      {showNavigation && <nav aria-label="对象预览连续浏览" className="flex shrink-0 items-center justify-between gap-3 border-b border-separator bg-surface px-3 py-2 sm:px-4">
+        <Button size="sm" variant="ghost" className="min-w-0 px-2 sm:px-3" aria-label="预览上一项" isDisabled={!previousItem || !onNavigate} onClick={() => { if (previousItem && onNavigate) onNavigate(previousItem) }}><ChevronLeft className="size-4" />上一项</Button>
+        <output className="shrink-0 text-xs font-medium tabular-nums text-muted" aria-live="polite" aria-label={`当前第 ${position} 项，共 ${totalItems} 项`}>{position}/{totalItems}</output>
+        <Button size="sm" variant="ghost" className="min-w-0 px-2 sm:px-3" aria-label="预览下一项" isDisabled={!nextItem || !onNavigate} onClick={() => { if (nextItem && onNavigate) onNavigate(nextItem) }}>下一项<ChevronRight className="size-4" /></Button>
+      </nav>}
+      <div data-testid="object-preview-layout" className="grid min-h-0 min-w-0 w-full flex-1 grid-cols-[minmax(0,1fr)] grid-rows-[minmax(0,1fr)_minmax(18rem,42%)] lg:grid-cols-[minmax(0,1fr)_320px] lg:grid-rows-1">
       <div data-testid="object-preview-stage" className={cn('min-h-0 min-w-0 overflow-hidden bg-[#111317]', rasterImage ? 'flex flex-col' : 'grid place-items-center')}>{rasterImage ? rasterMedia : genericMedia}</div>
       <aside className="flex min-h-0 min-w-0 flex-col border-t border-separator bg-surface lg:border-l lg:border-t-0">
         <div className="border-b border-separator p-5"><div className="flex items-start gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-md bg-[#eff6ff] text-[#2563eb]"><FileImage className="size-5" /></span><div className="min-w-0"><h2 className="break-words text-sm font-semibold text-foreground">{item.name}</h2><code className="mt-1 block break-all text-[10px] leading-4 text-muted">{item.key}</code></div></div><div className="mt-4 flex flex-wrap gap-2"><Badge tone={item.status === 'active' ? 'positive' : 'warning'}>{item.status}</Badge><Badge tone={item.visibility === '公开' ? 'positive' : 'neutral'}>{item.visibility}</Badge></div></div>
@@ -1491,6 +1540,7 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
           {currentExpiresAt && <p className="col-span-2 pt-1 text-center text-[10px] text-muted">链接有效至 {formatDateTime(currentExpiresAt)}</p>}
         </div>
       </aside>
+      </div>
     </div>
   </Modal>
 }

@@ -1,8 +1,9 @@
 use mediahub_core::{
     ApplicationId, BucketId, Checksum, EntityTag, NewStorageGcTask, ObjectId, ObjectRetention,
     ObjectVersion, ObjectVersionId, ObjectVersionPayload, ObjectVersionState, S3Bucket,
-    S3ModelError, S3Object, S3VersionId, SourceProtocol, StorageGcReason, StorageGcTaskId,
-    StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
+    S3ModelError, S3Object, S3ObjectTagSet, S3VersionId, SourceProtocol, StorageGcReason,
+    StorageGcTaskId, StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState,
+    VersioningStatus,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -12,7 +13,8 @@ use crate::{
     Clock, DeleteS3ObjectCommand, DeleteS3ObjectOutcome, ObjectStore, ObjectStoreError,
     PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository,
     S3DeleteLockReason, S3ObjectCommitTarget, S3ObjectLockMutation, S3ObjectRepository,
-    S3ObjectVersionCommit, S3UploadIntentRepository, StreamedObject,
+    S3ObjectTaggingCommand, S3ObjectTaggingOutcome, S3ObjectVersionCommit,
+    S3UploadIntentRepository, StreamedObject,
 };
 
 pub const DEFAULT_S3_UPLOAD_INTENT_TTL_SECONDS: i64 = 3_600;
@@ -28,6 +30,7 @@ pub struct BeginPutObjectRequest {
     pub expected_size_bytes: u64,
     pub content_type: Option<String>,
     pub user_metadata: Value,
+    pub object_tags: S3ObjectTagSet,
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -114,6 +117,7 @@ pub struct DeleteObjectReceipt {
 pub struct S3HeadObjectReceipt {
     pub object: S3Object,
     pub version: ObjectVersion,
+    pub tags: S3ObjectTagSet,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +144,12 @@ pub struct PutObjectRetentionRequest {
 pub struct PutObjectLegalHoldRequest {
     pub object: S3ObjectRequest,
     pub legal_hold: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PutObjectTaggingRequest {
+    pub object: S3ObjectRequest,
+    pub tags: S3ObjectTagSet,
 }
 
 #[derive(Debug, Error)]
@@ -294,6 +304,7 @@ where
             request.expected_size_bytes,
             request.content_type.clone(),
             request.user_metadata.clone(),
+            request.object_tags.clone(),
             expires_at,
             now,
         )?;
@@ -624,6 +635,70 @@ where
         self.resolve_visible_version(request).await
     }
 
+    pub async fn get_object_tags(
+        &self,
+        request: &S3ObjectRequest,
+    ) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
+        let bucket = self
+            .bucket_repository
+            .find_s3_bucket(request.application_id, &request.bucket_name)
+            .await?
+            .ok_or(S3ObjectServiceError::BucketNotFound)?;
+        let outcome = self
+            .object_repository
+            .get_s3_object_tagging(&S3ObjectTaggingCommand {
+                application_id: request.application_id,
+                bucket_id: bucket.id(),
+                object_key: request.object_key.clone(),
+                version_id: request.version_id.clone(),
+            })
+            .await?;
+        map_object_tagging_outcome(outcome)
+    }
+
+    pub async fn put_object_tags(
+        &self,
+        request: &PutObjectTaggingRequest,
+    ) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
+        self.replace_object_tags(&request.object, &request.tags)
+            .await
+    }
+
+    pub async fn delete_object_tags(
+        &self,
+        request: &S3ObjectRequest,
+    ) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
+        self.replace_object_tags(request, &S3ObjectTagSet::empty())
+            .await
+    }
+
+    async fn replace_object_tags(
+        &self,
+        request: &S3ObjectRequest,
+        tags: &S3ObjectTagSet,
+    ) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
+        tags.validate()
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        let bucket = self
+            .bucket_repository
+            .find_s3_bucket(request.application_id, &request.bucket_name)
+            .await?
+            .ok_or(S3ObjectServiceError::BucketNotFound)?;
+        let outcome = self
+            .object_repository
+            .replace_s3_object_tagging(
+                &S3ObjectTaggingCommand {
+                    application_id: request.application_id,
+                    bucket_id: bucket.id(),
+                    object_key: request.object_key.clone(),
+                    version_id: request.version_id.clone(),
+                },
+                tags,
+            )
+            .await?;
+        map_object_tagging_outcome(outcome)
+    }
+
     pub async fn get_object_lock(
         &self,
         request: &S3ObjectRequest,
@@ -897,7 +972,45 @@ where
                 is_current: object.current_version_id() == Some(version.id()),
             });
         }
-        Ok(S3HeadObjectReceipt { object, version })
+        let tags = self
+            .object_repository
+            .find_s3_object_version_tags(request.application_id, version.id())
+            .await?
+            .ok_or_else(|| {
+                RepositoryError::Invariant(
+                    "resolved object version has no tenant-scoped tag record".into(),
+                )
+            })?;
+        Ok(S3HeadObjectReceipt {
+            object,
+            version,
+            tags,
+        })
+    }
+}
+
+fn map_object_tagging_outcome(
+    outcome: S3ObjectTaggingOutcome,
+) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
+    match outcome {
+        S3ObjectTaggingOutcome::Found {
+            object,
+            version,
+            tags,
+        } => Ok(S3HeadObjectReceipt {
+            object,
+            version: *version,
+            tags,
+        }),
+        S3ObjectTaggingOutcome::ObjectNotFound => Err(S3ObjectServiceError::ObjectNotFound),
+        S3ObjectTaggingOutcome::VersionNotFound => Err(S3ObjectServiceError::VersionNotFound),
+        S3ObjectTaggingOutcome::DeleteMarker {
+            version_id,
+            is_current,
+        } => Err(S3ObjectServiceError::DeleteMarker {
+            version_id,
+            is_current,
+        }),
     }
 }
 

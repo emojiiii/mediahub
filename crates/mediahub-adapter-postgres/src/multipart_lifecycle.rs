@@ -49,8 +49,9 @@ impl S3MultipartRepository for PostgresRepository {
         let expires_at = postgres_time(upload.expires_at);
         let row = sqlx::query(
             "INSERT INTO s3_multipart_uploads (upload_id, application_id, bucket_id, object_key, \
-             content_type, user_metadata, storage_backend, state, expires_at, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $9) RETURNING *",
+             content_type, user_metadata, object_tags, storage_backend, state, expires_at,
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $10) RETURNING *",
         )
         .bind(upload.upload_id)
         .bind(upload.application_id.as_uuid())
@@ -58,6 +59,7 @@ impl S3MultipartRepository for PostgresRepository {
         .bind(upload.object_key)
         .bind(upload.content_type)
         .bind(Json(upload.user_metadata))
+        .bind(Json(upload.object_tags))
         .bind(upload.storage_backend)
         .bind(expires_at)
         .bind(created_at)

@@ -363,8 +363,20 @@ pub(super) async fn s3_delete_object(
     headers: HeaderMap,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
+    let tagging_operation = classify_s3_object_tagging(&uri, &request_id.0.0)?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    if tagging_operation {
+        return s3_delete_object_tagging(S3ObjectOperation {
+            state: &state,
+            auth: &auth,
+            bucket_name: &bucket_name,
+            object_key: &object_key,
+            uri: &uri,
+            request_id: &request_id.0.0,
+        })
+        .await;
+    }
     if let Some(upload_id) = s3_query_value(&uri, "uploadId", &request_id.0.0)? {
         reject_s3_versioning(&uri, &request_id.0.0)?;
         return s3_abort_multipart_upload(
@@ -553,6 +565,16 @@ impl S3ApiError {
         Self::new(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
+            message,
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_tag(message: impl Into<String>, resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidTag",
             message,
             resource,
             request_id,

@@ -138,6 +138,8 @@ AWS CLI 提供最完整的低级 S3 API 覆盖：
 - Versioning：`null` version、Enabled、opaque VersionId、delete marker、精确版本读取与删除。
 - Multipart：CreateMultipartUpload、UploadPart、ListParts、CompleteMultipartUpload、AbortMultipartUpload。
 - 能力探测：CopyObject、UploadPartCopy、ListObjectVersions、ListMultipartUploads。
+- Object Tagging：PutObject `--tagging`、精确 VersionId 的 Get/Put/DeleteObjectTagging、版本隔离、TagCount、CopyObject 默认 COPY 与显式 REPLACE。
+- Object Lock：创建时启用 Object Lock、GET/PUT bucket configuration、默认 GOVERNANCE retention、PutObject 显式 retention/legal hold、精确 VersionId 的 GetObjectRetention/GetObjectLegalHold、拒绝无 bypass 与未签名 bypass、接受已签名 governance bypass。
 
 mcli/mc 覆盖 bucket、对象上传下载/stat、Range、高级目录列表、删除和 Versioning enable。mcli 没有稳定低级入口的条件请求、显式 pagination、DeleteObjects、UploadPartCopy 及低级 Multipart 操作会记为 `SKIP`。
 
@@ -153,6 +155,14 @@ rclone 覆盖 bucket、对象上传下载/metadata、Range、prefix/delimiter、
 | UploadPartCopy | Complete Multipart、下载目标并核对 SHA-256 | 必须 `PASS`；失败或内容不一致均为 `FAIL` |
 | ListObjectVersions | 列表必须包含本轮已知的普通 VersionId 和 Multipart VersionId | 必须 `PASS`；失败或错误列表均为 `FAIL` |
 | ListMultipartUploads | 列表必须包含本轮已知的 pending UploadId | 必须 `PASS`；失败或遗漏上传均为 `FAIL` |
+| Put/GetObjectTagging | PutObject 必须返回非 `null` VersionId；GetObjectTagging 必须报告同一 VersionId，且键值集合完全相等 | 必须 `PASS`；缺字段、多标签、少标签、重复键或值不一致均为 `FAIL` |
+| Put/DeleteObjectTagging | 替换后精确回读且不能保留旧标签；删除后必须返回空 TagSet，并确认另一版本标签不变 | 必须 `PASS`；合并旧标签或跨版本污染均为 `FAIL` |
+| Object Tagging version isolation | 同 key 两个 VersionId 分别精确回读不同标签集合 | 必须 `PASS`；只验证 latest 或两个版本返回同一集合均为 `FAIL` |
+| CopyObject Tagging | 默认 COPY 必须继承精确源版本标签；REPLACE 必须只保留 `--tagging` 指定集合；目标均使用返回的精确 VersionId 回读 | 必须 `PASS`；静默丢标签、错误继承或错误替换均为 `FAIL` |
+| Head/Get TagCount | 对 AWS CLI 实际输出中存在的 TagCount 逐个核对；两个输出模型均不暴露时单独记为 `SKIP` | 暴露但计数错误为 `FAIL`；不将字段缺失伪装成 `PASS` |
+| Bucket Object Lock | Create 后核对 HeadBucket 与 Versioning=Enabled；PUT 默认规则后再次 GET 并核对 Enabled/GOVERNANCE/Days=1 | 必须 `PASS`；空配置、错误模式或未持久化均为 `FAIL` |
+| Object retention / legal hold | PutObject 必须返回非 `null` VersionId 和 ETag；随后对同一 VersionId 核对 HeadObject、GetObjectRetention 与 GetObjectLegalHold | 必须 `PASS`；只返回成功码但状态不一致为 `FAIL` |
+| Governance bypass | 无 bypass 与 `--no-sign-request` bypass 都必须失败且精确版本仍存在；正常签名 bypass 后精确版本必须 404 | 必须 `PASS`；错误地删除或伪成功均为 `FAIL` |
 
 因此，错误地返回 200、空 XML、错误分页或错误对象不会被记录为通过。
 
@@ -189,7 +199,7 @@ JSON 的 `schema_version` 当前为 1，主要字段包括：
 }
 ```
 
-每个 result 包含 `client`、`operation`、`status`、`duration_ms` 和经过脱敏的 `message`。报告不包含 Access Key secret、数据库密码、主密钥、Silo root secret 或命令原始参数。
+每个 result 包含 `client`、`operation`、`status`、`duration_ms` 和经过脱敏的 `message`。Object Tagging 的 Put/Get、替换、TagCount、版本隔离、两种 CopyObject、删除、四类负例和精确版本清理各自使用独立 `Tagging.*` operation；仅在异常路径执行的兜底清理记录为 `Tagging.ClientCleanup`。Object Lock 的 bucket 配置、对象状态、拒绝路径、bypass 与清理也分别记录；其异常兜底为 `ObjectLock.ClientCleanup`。报告不包含 Access Key secret、数据库密码、主密钥、Silo root secret 或命令原始参数。
 
 ## 当前矩阵能力边界
 
@@ -203,8 +213,12 @@ JSON 的 `schema_version` 当前为 1，主要字段包括：
 - Multipart create/upload/list/complete/abort。
 - CopyObject 与 UploadPartCopy。
 - ListObjectVersions 与 ListMultipartUploads。
+- Object Tagging，包括 PutObject 标签、精确版本 Get/Put/Delete、版本隔离、CopyObject COPY/REPLACE；TagCount 只对安装的 AWS CLI 实际暴露字段作断言。
+- Bucket/Object Object Lock，包括默认 GOVERNANCE retention、显式对象 retention/legal hold、精确 VersionId 查询以及 governance bypass 的拒绝与允许路径。
 
-矩阵暂不覆盖 Bucket Policy、Tagging、CORS、Notification、SSE、Object Lock、Lifecycle 执行效果和 virtual-host style。Bucket/Object Object Lock 已在 Rust 的 SigV4 HTTP 与 PostgreSQL 合同测试中覆盖，后续会加入 native-client 矩阵。其他能力应在相应协议切片实现后以独立断言加入，不能以现有 `SKIP` 或其他操作的成功替代。
+Tagging 的 invalid key、duplicate key、超过 10 个标签和坏 percent-encoding 是四个独立负例 operation。AWS CLI 可能在本地模型层拒绝前三类输入，也没有可靠的原始 `x-amz-tagging` 畸形头发包入口；当前矩阵又没有可控的 raw SigV4 HTTP helper，因此它们明确记为 `SKIP`，不会把 CLI 本地报错伪装成服务端协议 `PASS`。以后加入可审计的原始签名发包器后，才能将这些负例提升为必须返回对应 4xx S3 XML 错误的断言。
+
+Object Lock 矩阵只创建 GOVERNANCE retention，不创建测试时间内无法安全清理的 COMPLIANCE retention。矩阵暂不覆盖 Bucket Policy、CORS、Notification、SSE、Lifecycle 执行效果和 virtual-host style。其他能力应在相应协议切片实现后以独立断言加入，不能以现有 `SKIP` 或其他操作的成功替代。
 
 ## 安全与清理
 
@@ -212,7 +226,10 @@ JSON 的 `schema_version` 当前为 1，主要字段包括：
 - AWS 和 rclone 通过进程环境接收凭据；mcli 使用进程级 `MC_HOST_prismark`，并将配置目录指向系统临时目录。
 - Docker `run` 使用 `--env NAME` 从当前进程传值，脚本日志不打印 secret 值。
 - Docker 资源带有唯一名称与 `prismark.s3-compat.run=<run-id>` label，但清理只操作本轮解析出的精确容器名和 network 名。
-- Endpoint 模式不会删除环境中的非本轮资源；每个客户端使用唯一 bucket，并在自身矩阵末尾删除。若出现 `FAIL` 导致外部 bucket 无法清空，报告会保留该 bucket 的 run ID 以便人工检查。
+- Endpoint 模式不会删除环境中的非本轮资源；AWS CLI 在创建普通 bucket 与 Object Lock bucket 前都要求 HeadBucket 明确返回 404/NoSuchBucket，无法证明名称未占用时直接 `FAIL`，不会进入创建或清理。每个客户端使用带 run ID 的唯一 bucket，并在自身矩阵末尾删除。
+- Tagging 矩阵在每次 PutObject/CopyObject 返回 opaque VersionId 后立即登记 `Key + VersionId`。正常及异常清理都只逐条删除这份内存清单并用 HeadObject 精确确认 404；不会调用 ListObjectVersions 遍历普通 bucket，也不会按 prefix 猜测或删除非本轮版本。若服务端创建对象却未返回 VersionId，矩阵宁可保留 bucket 并报告 `FAIL`，不会扩大删除范围。
+- Object Lock 正常路径和异常兜底都按“legal hold OFF → 使用已签名 bypass 删除仍处于 GOVERNANCE retention 的精确 VersionId → 删除 delete marker → 删除 bucket → HeadBucket 确认不存在”的顺序清理。不会等待 retention 到期，也不会创建 COMPLIANCE retention。
+- 若出现 `FAIL` 导致外部 bucket 无法清空，报告会保留精确的 Object Lock cleanup 结果和该 bucket 的 run ID 以便人工检查；脚本不会改名匹配或遍历删除其他 bucket。
 - 系统临时目录删除前会验证绝对路径位于系统 temp 下，且目录名匹配 `prismark-s3-compat-*`。
 
 ## 故障排查
@@ -222,3 +239,5 @@ JSON 的 `schema_version` 当前为 1，主要字段包括：
 3. `SignatureDoesNotMatch`：确认 endpoint 使用 Application AccessKey，而不是 PrismArk 底层 Silo/AWS 存储密钥；确认 region 为 `us-east-1` 或部署配置使用的 region。
 4. Silo 模式启动失败：先固定一个已验证的 `-SiloImage` digest，确认镜像包含 `mcli`。
 5. Endpoint 模式遗留 bucket：按报告中的 run ID 定位 `prismark-compat-<client>-<run-id>`，仅清理该 bucket。
+6. `ObjectLock.ClientCleanup = FAIL`：按报告中的精确 bucket 名检查残留 VersionId；先将该版本 legal hold 设为 OFF，再使用有权限且正确签名的 `--bypass-governance-retention` 删除精确版本，最后删除 bucket。不要对同前缀的其他 bucket 做批量清理。
+7. `Tagging.ClientCleanup = FAIL`：报告中的 bucket 仅属于该 run ID，但脚本不会遍历删除未知版本；根据此前失败 operation 返回的精确 key/versionId 做人工清理，不要对 `tagging/` 前缀执行批量删除。

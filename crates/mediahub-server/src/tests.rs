@@ -1,4 +1,4 @@
-use base64::engine::general_purpose::STANDARD;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use mediahub_app::{S3MultipartUploadState, S3ObjectRepository};
 use mediahub_core::{ObjectVersionPayload, VersioningStatus};
 
@@ -393,6 +393,10 @@ fn s3_test_xml_value(xml: &str, element: &str) -> Option<String> {
             .replace("&gt;", ">")
             .replace("&amp;", "&"),
     )
+}
+
+fn s3_test_content_md5(content: &[u8]) -> String {
+    STANDARD.encode(<md5::Md5 as md5::Digest>::digest(content))
 }
 
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
@@ -1021,6 +1025,7 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         .uri(&url)
         .header("host", address.to_string())
         .header(CONTENT_TYPE, "image/png")
+        .header("x-amz-tagging", "stage=draft&project=prismark")
         .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
         .body(content.clone())
         .expect("PUT request");
@@ -1030,6 +1035,105 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
     assert!(put_response.headers().contains_key(ETAG));
     assert!(put_response.headers().contains_key("x-amz-request-id"));
     assert_eq!(put_response.headers()["x-amz-version-id"], "null");
+
+    let mut tagged_head = http::Request::builder()
+        .method(Method::HEAD)
+        .uri(&url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("tagged HeadObject request");
+    sign_s3_test_request(&mut tagged_head, access_key_id, access_key_secret, None);
+    let tagged_head = send_s3_test_request(&client, tagged_head).await;
+    assert_eq!(tagged_head.status(), StatusCode::OK);
+    assert_eq!(tagged_head.headers()["x-amz-tagging-count"], "2");
+
+    let tagging_url = format!("{url}?tagging");
+    let mut get_tags = http::Request::builder()
+        .method(Method::GET)
+        .uri(&tagging_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetObjectTagging request");
+    sign_s3_test_request(&mut get_tags, access_key_id, access_key_secret, None);
+    let get_tags = send_s3_test_request(&client, get_tags).await;
+    assert_eq!(get_tags.status(), StatusCode::OK);
+    assert_eq!(get_tags.headers()["x-amz-version-id"], "null");
+    let get_tags_xml = get_tags.text().await.expect("GetObjectTagging XML");
+    assert!(get_tags_xml.contains("<Key>stage</Key><Value>draft</Value>"));
+    assert!(get_tags_xml.contains("<Key>project</Key><Value>prismark</Value>"));
+
+    let replacement_tags = br#"<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Key>stage</Key><Value>published</Value></Tag></TagSet></Tagging>"#.to_vec();
+    let mut missing_tag_md5 = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&tagging_url)
+        .header("host", address.to_string())
+        .body(replacement_tags.clone())
+        .expect("missing Content-MD5 PutObjectTagging request");
+    sign_s3_test_request(&mut missing_tag_md5, access_key_id, access_key_secret, None);
+    let missing_tag_md5 = send_s3_test_request(&client, missing_tag_md5).await;
+    assert_eq!(missing_tag_md5.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        missing_tag_md5
+            .text()
+            .await
+            .expect("missing Content-MD5 XML")
+            .contains("<Code>InvalidDigest</Code>")
+    );
+
+    let mut put_tags = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&tagging_url)
+        .header("host", address.to_string())
+        .header("content-md5", s3_test_content_md5(&replacement_tags))
+        .body(replacement_tags.clone())
+        .expect("PutObjectTagging request");
+    sign_s3_test_request(&mut put_tags, access_key_id, access_key_secret, None);
+    let put_tags = send_s3_test_request(&client, put_tags).await;
+    assert_eq!(put_tags.status(), StatusCode::OK);
+    assert_eq!(put_tags.headers()["x-amz-version-id"], "null");
+
+    let mut replaced_head = http::Request::builder()
+        .method(Method::HEAD)
+        .uri(&url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("replaced tagged HeadObject request");
+    sign_s3_test_request(&mut replaced_head, access_key_id, access_key_secret, None);
+    let replaced_head = send_s3_test_request(&client, replaced_head).await;
+    assert_eq!(replaced_head.status(), StatusCode::OK);
+    assert_eq!(replaced_head.headers()["x-amz-tagging-count"], "1");
+
+    let mut delete_tags = http::Request::builder()
+        .method(Method::DELETE)
+        .uri(&tagging_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("DeleteObjectTagging request");
+    sign_s3_test_request(&mut delete_tags, access_key_id, access_key_secret, None);
+    let delete_tags = send_s3_test_request(&client, delete_tags).await;
+    assert_eq!(delete_tags.status(), StatusCode::NO_CONTENT);
+    assert_eq!(delete_tags.headers()["x-amz-version-id"], "null");
+
+    let source_copy_tags = br#"<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Key>copy</Key><Value>source</Value></Tag></TagSet></Tagging>"#.to_vec();
+    let mut put_source_copy_tags = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&tagging_url)
+        .header("host", address.to_string())
+        .header("content-md5", s3_test_content_md5(&source_copy_tags))
+        .body(source_copy_tags)
+        .expect("source CopyObject tags request");
+    sign_s3_test_request(
+        &mut put_source_copy_tags,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    assert_eq!(
+        send_s3_test_request(&client, put_source_copy_tags)
+            .await
+            .status(),
+        StatusCode::OK
+    );
 
     let empty_url = format!("http://{address}/{}/empty/zero-byte.txt", bucket.name());
     let mut empty_put = http::Request::builder()
@@ -1269,6 +1373,8 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         .header("host", address.to_string())
         .header("x-amz-copy-source", &copy_source)
         .header("x-amz-metadata-directive", "REPLACE")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .header("x-amz-tagging", "copy=destination")
         .header(CONTENT_TYPE, "image/webp")
         .header("x-amz-meta-origin", "copy-object-test")
         .body(Vec::new())
@@ -1305,6 +1411,59 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
     let ObjectVersionPayload::Object(copied_payload) = copied_version.payload() else {
         panic!("CopyObject must commit an object payload");
     };
+    let copied_tags = state
+        .repository
+        .find_s3_object_version_tags(application.id, copied_version.id())
+        .await
+        .expect("copied tag lookup")
+        .expect("copied data version");
+    assert_eq!(copied_tags.len(), 1);
+    assert_eq!(copied_tags.iter().next().expect("copied tag").key(), "copy");
+    assert_eq!(
+        copied_tags.iter().next().expect("copied tag").value(),
+        "destination"
+    );
+
+    let copy_tags_key = "images/copied-tags.png";
+    let copy_tags_url = format!("http://{address}/{}/{}", bucket.name(), copy_tags_key);
+    let mut copy_tags = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&copy_tags_url)
+        .header("host", address.to_string())
+        .header("x-amz-copy-source", &copy_source)
+        .body(Vec::new())
+        .expect("CopyObject COPY tagging request");
+    sign_s3_test_request(&mut copy_tags, access_key_id, access_key_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, copy_tags).await.status(),
+        StatusCode::OK
+    );
+    let copied_tags_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), copy_tags_key)
+        .await
+        .expect("COPY tag object lookup")
+        .expect("COPY tag object");
+    let copied_tags_version = state
+        .repository
+        .find_current_s3_object_version(copied_tags_object.id())
+        .await
+        .expect("COPY tag version lookup")
+        .expect("COPY tag version");
+    let copied_source_tags = state
+        .repository
+        .find_s3_object_version_tags(application.id, copied_tags_version.id())
+        .await
+        .expect("COPY source tag lookup")
+        .expect("COPY data version");
+    assert_eq!(
+        copied_source_tags
+            .iter()
+            .next()
+            .expect("copied source tag")
+            .value(),
+        "source"
+    );
     assert_eq!(copied_payload.content_type(), Some("image/webp"));
     assert_eq!(
         copied_payload.user_metadata()["origin"],
@@ -1453,6 +1612,7 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         .header(CONTENT_TYPE, "application/octet-stream")
         .header("x-amz-acl", "private")
         .header("x-amz-meta-project", "prismark")
+        .header("x-amz-tagging", "kind=multipart")
         .body(Vec::new())
         .expect("CreateMultipartUpload request");
     sign_s3_test_request(
@@ -1539,6 +1699,29 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         "CompleteMultipartUpload response: {complete_xml}"
     );
     assert_eq!(complete_version_id, "null");
+    let multipart_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), multipart_key)
+        .await
+        .expect("multipart object lookup")
+        .expect("multipart object");
+    let multipart_version = state
+        .repository
+        .find_current_s3_object_version(multipart_object.id())
+        .await
+        .expect("multipart version lookup")
+        .expect("multipart version");
+    let multipart_tags = state
+        .repository
+        .find_s3_object_version_tags(application.id, multipart_version.id())
+        .await
+        .expect("multipart tag lookup")
+        .expect("multipart data version");
+    assert_eq!(multipart_tags.len(), 1);
+    assert_eq!(
+        multipart_tags.iter().next().expect("multipart tag").value(),
+        "multipart"
+    );
     assert!(complete_xml.contains("<CompleteMultipartUploadResult"));
     assert!(complete_xml.contains("<ETag>&quot;"));
     let completed_etag = s3_test_xml_value(&complete_xml, "ETag").expect("completed ETag");

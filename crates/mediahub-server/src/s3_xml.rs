@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest as _, Md5};
+use mediahub_core::{S3ObjectTag, S3ObjectTagSet, S3TaggingError};
 use quick_xml::{events::Event, reader::Reader};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -181,6 +182,16 @@ pub(crate) enum S3XmlError {
     InvalidXmlCharacter,
 }
 
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum S3TaggingXmlError {
+    #[error("the tagging XML request body exceeds the supported limit")]
+    InputTooLarge,
+    #[error("the tagging XML request body is malformed")]
+    MalformedXml,
+    #[error("the object tag set is invalid: {0}")]
+    InvalidTag(S3TaggingError),
+}
+
 impl S3XmlError {
     pub(crate) const fn s3_code(self) -> &'static str {
         match self {
@@ -327,6 +338,51 @@ pub(crate) fn parse_complete_multipart_upload_xml(
         return Err(S3XmlError::MissingPartNumber);
     }
     Ok(CompleteMultipartUploadRequest { parts })
+}
+
+pub(crate) fn parse_object_tagging_xml(input: &[u8]) -> Result<S3ObjectTagSet, S3TaggingXmlError> {
+    let root = parse_xml_document(input).map_err(|error| match error {
+        S3XmlError::InputTooLarge => S3TaggingXmlError::InputTooLarge,
+        _ => S3TaggingXmlError::MalformedXml,
+    })?;
+    if root.name != "Tagging"
+        || root.attributes != [("xmlns".to_owned(), S3_XML_NAMESPACE.to_owned())]
+        || !root.text.trim().is_empty()
+        || root.children.len() != 1
+    {
+        return Err(S3TaggingXmlError::MalformedXml);
+    }
+    let tag_set = &root.children[0];
+    if tag_set.name != "TagSet" || !tag_set.attributes.is_empty() || !tag_set.text.trim().is_empty()
+    {
+        return Err(S3TaggingXmlError::MalformedXml);
+    }
+    let mut tags = Vec::with_capacity(tag_set.children.len());
+    for tag in &tag_set.children {
+        if tag.name != "Tag"
+            || !tag.attributes.is_empty()
+            || !tag.text.trim().is_empty()
+            || tag.children.len() != 2
+        {
+            return Err(S3TaggingXmlError::MalformedXml);
+        }
+        let key = &tag.children[0];
+        let value = &tag.children[1];
+        if key.name != "Key"
+            || value.name != "Value"
+            || !key.attributes.is_empty()
+            || !value.attributes.is_empty()
+            || !key.children.is_empty()
+            || !value.children.is_empty()
+        {
+            return Err(S3TaggingXmlError::MalformedXml);
+        }
+        tags.push(
+            S3ObjectTag::new(key.text.clone(), value.text.clone())
+                .map_err(S3TaggingXmlError::InvalidTag)?,
+        );
+    }
+    S3ObjectTagSet::new(tags).map_err(S3TaggingXmlError::InvalidTag)
 }
 
 pub(crate) fn delete_result_xml(result: &DeleteResult) -> Result<String, S3XmlError> {
@@ -610,6 +666,7 @@ pub(crate) fn get_object_acl_xml(
 #[derive(Debug)]
 struct XmlNode {
     name: String,
+    attributes: Vec<(String, String)>,
     text: String,
     children: Vec<Self>,
 }
@@ -636,7 +693,7 @@ fn parse_xml_document(input: &[u8]) -> Result<XmlNode, S3XmlError> {
             .map_err(|_| S3XmlError::MalformedXml)?;
         match event {
             Event::Start(element) => {
-                validate_attributes(&reader, &element)?;
+                let attributes = decode_attributes(&reader, &element)?;
                 if stack.len() == MAX_XML_DEPTH || root.is_some() {
                     return Err(S3XmlError::MalformedXml);
                 }
@@ -645,13 +702,14 @@ fn parse_xml_document(input: &[u8]) -> Result<XmlNode, S3XmlError> {
                     return Err(S3XmlError::MalformedXml);
                 }
                 stack.push(XmlNode {
-                    name: decode_local_name(element.local_name().as_ref())?,
+                    name: decode_name(element.name().as_ref())?,
+                    attributes,
                     text: String::new(),
                     children: Vec::new(),
                 });
             }
             Event::Empty(element) => {
-                validate_attributes(&reader, &element)?;
+                let attributes = decode_attributes(&reader, &element)?;
                 node_count += 1;
                 if stack.len() == MAX_XML_DEPTH
                     || node_count > MAX_XML_NODES
@@ -660,7 +718,8 @@ fn parse_xml_document(input: &[u8]) -> Result<XmlNode, S3XmlError> {
                     return Err(S3XmlError::MalformedXml);
                 }
                 let node = XmlNode {
-                    name: decode_local_name(element.local_name().as_ref())?,
+                    name: decode_name(element.name().as_ref())?,
+                    attributes,
                     text: String::new(),
                     children: Vec::new(),
                 };
@@ -720,20 +779,23 @@ fn parse_xml_document(input: &[u8]) -> Result<XmlNode, S3XmlError> {
     root.ok_or(S3XmlError::MalformedXml)
 }
 
-fn validate_attributes(
+fn decode_attributes(
     reader: &Reader<&[u8]>,
     element: &quick_xml::events::BytesStart<'_>,
-) -> Result<(), S3XmlError> {
+) -> Result<Vec<(String, String)>, S3XmlError> {
+    let mut decoded = Vec::new();
     for attribute in element.attributes().with_checks(true) {
-        attribute
-            .map_err(|_| S3XmlError::MalformedXml)?
+        let attribute = attribute.map_err(|_| S3XmlError::MalformedXml)?;
+        let key = decode_name(attribute.key.as_ref())?;
+        let value = attribute
             .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|_| S3XmlError::MalformedXml)?;
+        decoded.push((key, value.into_owned()));
     }
-    Ok(())
+    Ok(decoded)
 }
 
-fn decode_local_name(name: &[u8]) -> Result<String, S3XmlError> {
+fn decode_name(name: &[u8]) -> Result<String, S3XmlError> {
     std::str::from_utf8(name)
         .map(str::to_owned)
         .map_err(|_| S3XmlError::MalformedXml)
@@ -771,6 +833,21 @@ fn append_text(stack: &mut [XmlNode], value: &str) -> Result<(), S3XmlError> {
 
 fn xml_document_start(root_name: &str) -> String {
     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><{root_name} xmlns=\"{S3_XML_NAMESPACE}\">")
+}
+
+pub(crate) fn object_tagging_xml(tags: &S3ObjectTagSet) -> Result<String, S3XmlError> {
+    tags.validate()
+        .map_err(|_| S3XmlError::InvalidXmlCharacter)?;
+    let mut output = xml_document_start("Tagging");
+    output.push_str("<TagSet>");
+    for tag in tags.iter() {
+        output.push_str("<Tag>");
+        push_element(&mut output, "Key", tag.key())?;
+        push_element(&mut output, "Value", tag.value())?;
+        output.push_str("</Tag>");
+    }
+    output.push_str("</TagSet></Tagging>");
+    Ok(output)
 }
 
 fn push_owner(output: &mut String, id: &str, display_name: &str) -> Result<(), S3XmlError> {

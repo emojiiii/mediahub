@@ -5,7 +5,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{ApplicationId, BucketId, ObjectId, ObjectVersionId, S3ModelError};
+use crate::{ApplicationId, BucketId, ObjectId, ObjectVersionId, S3ModelError, S3ObjectTagSet};
 
 const MAX_OPAQUE_TAG_BYTES: usize = 1_024;
 const MAX_STORAGE_NAME_BYTES: usize = 255;
@@ -182,6 +182,7 @@ pub struct UploadIntent {
     size_bytes: Option<u64>,
     content_type: Option<String>,
     user_metadata: Value,
+    object_tags: S3ObjectTagSet,
     lease_token: Option<String>,
     lease_until: Option<OffsetDateTime>,
     committed_object_id: Option<ObjectId>,
@@ -205,6 +206,7 @@ impl UploadIntent {
         expected_size_bytes: u64,
         content_type: Option<String>,
         user_metadata: Value,
+        object_tags: S3ObjectTagSet,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Self, S3ModelError> {
@@ -224,6 +226,7 @@ impl UploadIntent {
             size_bytes: None,
             content_type,
             user_metadata,
+            object_tags,
             lease_token: None,
             lease_until: None,
             committed_object_id: None,
@@ -240,6 +243,7 @@ impl UploadIntent {
         validate_storage_locator(&persisted.storage_backend, &persisted.final_storage_key)?;
         if persisted.temporary_storage_key == persisted.final_storage_key
             || !persisted.user_metadata.is_object()
+            || persisted.object_tags.validate().is_err()
             || persisted.expires_at <= persisted.created_at
         {
             return Err(S3ModelError::InvalidUploadIntent);
@@ -295,6 +299,7 @@ impl UploadIntent {
             size_bytes: persisted.size_bytes,
             content_type: persisted.content_type,
             user_metadata: persisted.user_metadata,
+            object_tags: persisted.object_tags,
             lease_token: persisted.lease_token,
             lease_until: persisted.lease_until,
             committed_object_id: persisted.committed_object_id,
@@ -366,6 +371,10 @@ impl UploadIntent {
         &self.user_metadata
     }
     #[must_use]
+    pub const fn object_tags(&self) -> &S3ObjectTagSet {
+        &self.object_tags
+    }
+    #[must_use]
     pub fn lease_token(&self) -> Option<&str> {
         self.lease_token.as_deref()
     }
@@ -412,6 +421,7 @@ pub struct PersistedUploadIntent {
     pub size_bytes: Option<u64>,
     pub content_type: Option<String>,
     pub user_metadata: Value,
+    pub object_tags: S3ObjectTagSet,
     pub lease_token: Option<String>,
     pub lease_until: Option<OffsetDateTime>,
     pub committed_object_id: Option<ObjectId>,
@@ -574,6 +584,7 @@ mod tests {
             42,
             Some("image/png".into()),
             json!({}),
+            S3ObjectTagSet::empty(),
             OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             OffsetDateTime::UNIX_EPOCH,
         )

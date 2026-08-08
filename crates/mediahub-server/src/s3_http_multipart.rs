@@ -25,6 +25,7 @@ async fn s3_create_multipart_upload(
         .ok_or_else(|| S3ApiError::no_such_bucket(resource, request_id))?;
     let content_type = s3_object_content_type(headers, resource, request_id)?;
     let user_metadata = s3_user_metadata(headers, resource, request_id)?;
+    let object_tags = parse_s3_tagging_header(headers, resource, request_id)?.unwrap_or_default();
     let now = OffsetDateTime::now_utc();
     let upload_id = format!("mh_mpu_{}", uuid::Uuid::now_v7().simple());
     let upload = state
@@ -36,6 +37,7 @@ async fn s3_create_multipart_upload(
             object_key: object_key.to_owned(),
             content_type,
             user_metadata,
+            object_tags,
             storage_backend: state.object_store.backend_name().to_owned(),
             expires_at: now + time::Duration::seconds(S3_MULTIPART_UPLOAD_SECONDS),
             created_at: now,
@@ -583,6 +585,7 @@ async fn s3_complete_multipart_upload(
                 expected_size_bytes: manifest.total_size,
                 content_type: Some(manifest.upload.content_type.clone()),
                 user_metadata: manifest.upload.user_metadata.clone(),
+                object_tags: manifest.upload.object_tags.clone(),
                 expires_at: Some(manifest.upload.expires_at),
             })
             .await

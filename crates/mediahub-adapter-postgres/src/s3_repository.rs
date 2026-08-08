@@ -5,9 +5,10 @@ use mediahub_app::{
     PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository,
     S3DeleteLockReason, S3ListingRepository, S3MultipartUploadListItem, S3MultipartUploadListQuery,
     S3MultipartUploadPage, S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery,
-    S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectVersionCommit,
-    S3ObjectVersionListItem, S3ObjectVersionListQuery, S3ObjectVersionPage, S3ObjectVersionRead,
-    S3UploadIntentRepository, StorageGcRepository, is_multipart_etag,
+    S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectTaggingCommand,
+    S3ObjectTaggingOutcome, S3ObjectVersionCommit, S3ObjectVersionListItem,
+    S3ObjectVersionListQuery, S3ObjectVersionPage, S3ObjectVersionRead, S3UploadIntentRepository,
+    StorageGcRepository, is_multipart_etag,
 };
 use mediahub_core::{
     ApplicationId, BucketId, BucketS3Configuration, Checksum, ChecksumAlgorithm, DefaultRetention,
@@ -15,9 +16,9 @@ use mediahub_core::{
     ObjectVersion, ObjectVersionId, ObjectVersionPayload, ObjectVersionState,
     PersistedBucketS3Configuration, PersistedObjectVersion, PersistedS3Bucket, PersistedS3Object,
     PersistedUploadIntent, RetentionMode, S3Bucket, S3LifecycleConfiguration, S3Object,
-    S3VersionId, SourceProtocol, StorageGcReason, StorageGcTask, StorageGcTaskId,
-    StorageGcTaskState, StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState,
-    VersioningStatus,
+    S3ObjectTag, S3ObjectTagSet, S3VersionId, SourceProtocol, StorageGcReason, StorageGcTask,
+    StorageGcTaskId, StorageGcTaskState, StoredObjectVersion, UploadIntent, UploadIntentId,
+    UploadIntentState, VersioningStatus,
 };
 use serde_json::{Value, json};
 use sqlx::{Postgres, QueryBuilder, Row, postgres::PgRow, types::Json};
@@ -947,6 +948,75 @@ impl S3ObjectRepository for PostgresRepository {
         rows.into_iter().map(row_to_object_version).collect()
     }
 
+    async fn find_s3_object_version_tags(
+        &self,
+        application_id: ApplicationId,
+        version_id: ObjectVersionId,
+    ) -> Result<Option<S3ObjectTagSet>, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM object_versions
+                WHERE id = $1 AND application_id = $2
+                  AND state = 'committed' AND NOT is_delete_marker
+                  AND superseded_at IS NULL
+             )",
+        )
+        .bind(version_id.as_uuid())
+        .bind(application_id.as_uuid())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let tags = if exists {
+            Some(load_object_version_tags(&mut transaction, version_id).await?)
+        } else {
+            None
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(tags)
+    }
+
+    async fn get_s3_object_tagging(
+        &self,
+        command: &S3ObjectTaggingCommand,
+    ) -> Result<S3ObjectTaggingOutcome, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let outcome = resolve_object_tagging(&mut transaction, command, false).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(outcome)
+    }
+
+    async fn replace_s3_object_tagging(
+        &self,
+        command: &S3ObjectTaggingCommand,
+        tags: &S3ObjectTagSet,
+    ) -> Result<S3ObjectTaggingOutcome, RepositoryError> {
+        tags.validate()
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let outcome = resolve_object_tagging(&mut transaction, command, true).await?;
+        let outcome = match outcome {
+            S3ObjectTaggingOutcome::Found {
+                object, version, ..
+            } => {
+                sqlx::query("DELETE FROM object_version_tags WHERE object_version_id = $1")
+                    .bind(version.id().as_uuid())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                insert_object_version_tags(&mut transaction, version.id(), tags).await?;
+                S3ObjectTaggingOutcome::Found {
+                    object,
+                    version,
+                    tags: tags.clone(),
+                }
+            }
+            outcome => outcome,
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(outcome)
+    }
+
     async fn delete_s3_object(
         &self,
         command: &DeleteS3ObjectCommand,
@@ -1400,6 +1470,114 @@ async fn enqueue_explicit_delete_gc_task(
     }
 }
 
+async fn resolve_object_tagging(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    command: &S3ObjectTaggingCommand,
+    exclusive: bool,
+) -> Result<S3ObjectTaggingOutcome, RepositoryError> {
+    let bucket_sql = if exclusive {
+        "SELECT id FROM buckets WHERE application_id = $1 AND id = $2 FOR UPDATE"
+    } else {
+        "SELECT id FROM buckets WHERE application_id = $1 AND id = $2 FOR SHARE"
+    };
+    let bucket_exists = sqlx::query_scalar::<_, uuid::Uuid>(bucket_sql)
+        .bind(command.application_id.as_uuid())
+        .bind(command.bucket_id.as_uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?
+        .is_some();
+    if !bucket_exists {
+        return Err(RepositoryError::NotFound);
+    }
+
+    let object_sql = if exclusive {
+        "SELECT * FROM objects
+         WHERE application_id = $1 AND bucket_id = $2 AND object_key = $3 FOR UPDATE"
+    } else {
+        "SELECT * FROM objects
+         WHERE application_id = $1 AND bucket_id = $2 AND object_key = $3 FOR SHARE"
+    };
+    let object = sqlx::query(object_sql)
+        .bind(command.application_id.as_uuid())
+        .bind(command.bucket_id.as_uuid())
+        .bind(&command.object_key)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?
+        .map(row_to_s3_object)
+        .transpose()?;
+    let Some(object) = object else {
+        return Ok(if command.version_id.is_some() {
+            S3ObjectTaggingOutcome::VersionNotFound
+        } else {
+            S3ObjectTaggingOutcome::ObjectNotFound
+        });
+    };
+
+    let version_row = if let Some(version_id) = &command.version_id {
+        let sql = if exclusive {
+            "SELECT * FROM object_versions
+             WHERE application_id = $1 AND bucket_id = $2 AND object_id = $3
+               AND external_version_id = $4 AND state = 'committed'
+               AND superseded_at IS NULL FOR UPDATE"
+        } else {
+            "SELECT * FROM object_versions
+             WHERE application_id = $1 AND bucket_id = $2 AND object_id = $3
+               AND external_version_id = $4 AND state = 'committed'
+               AND superseded_at IS NULL FOR SHARE"
+        };
+        sqlx::query(sql)
+            .bind(command.application_id.as_uuid())
+            .bind(command.bucket_id.as_uuid())
+            .bind(object.id().as_uuid())
+            .bind(version_id.as_str())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(database_error)?
+    } else if let Some(version_id) = object.current_version_id() {
+        let sql = if exclusive {
+            "SELECT * FROM object_versions
+             WHERE application_id = $1 AND bucket_id = $2 AND object_id = $3
+               AND id = $4 AND state = 'committed' AND superseded_at IS NULL FOR UPDATE"
+        } else {
+            "SELECT * FROM object_versions
+             WHERE application_id = $1 AND bucket_id = $2 AND object_id = $3
+               AND id = $4 AND state = 'committed' AND superseded_at IS NULL FOR SHARE"
+        };
+        sqlx::query(sql)
+            .bind(command.application_id.as_uuid())
+            .bind(command.bucket_id.as_uuid())
+            .bind(object.id().as_uuid())
+            .bind(version_id.as_uuid())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(database_error)?
+    } else {
+        None
+    };
+    let Some(version_row) = version_row else {
+        return Ok(if command.version_id.is_some() {
+            S3ObjectTaggingOutcome::VersionNotFound
+        } else {
+            S3ObjectTaggingOutcome::ObjectNotFound
+        });
+    };
+    let version = row_to_object_version(version_row)?;
+    if version.is_delete_marker() {
+        return Ok(S3ObjectTaggingOutcome::DeleteMarker {
+            version_id: version.external_version_id().clone(),
+            is_current: object.current_version_id() == Some(version.id()),
+        });
+    }
+    let tags = load_object_version_tags(transaction, version.id()).await?;
+    Ok(S3ObjectTaggingOutcome::Found {
+        object,
+        version: Box::new(version),
+        tags,
+    })
+}
+
 async fn delete_s3_object_in_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     command: &DeleteS3ObjectCommand,
@@ -1623,13 +1801,13 @@ impl S3UploadIntentRepository for PostgresRepository {
                 id, application_id, bucket_id, object_key, proposed_version_id, state,
                 storage_backend, temporary_storage_key, final_storage_key,
                 entity_tag, checksum_algorithm, checksum_value,
-                expected_size_bytes, size_bytes, content_type, user_metadata,
+                expected_size_bytes, size_bytes, content_type, user_metadata, object_tags,
                 lease_token, lease_until, committed_object_id, committed_version_id,
                 expires_at, created_at, updated_at
              ) VALUES (
                 $1, $2, $3, $4, $5, 'staging', $6, $7, $8,
-                NULL, NULL, NULL, $9, NULL, $10, $11,
-                NULL, NULL, NULL, NULL, $12, $13, $14
+                NULL, NULL, NULL, $9, NULL, $10, $11, $12,
+                NULL, NULL, NULL, NULL, $13, $14, $15
              )",
         )
         .bind(intent.id().as_uuid())
@@ -1643,6 +1821,7 @@ impl S3UploadIntentRepository for PostgresRepository {
         .bind(as_i64(intent.expected_size_bytes())?)
         .bind(intent.content_type())
         .bind(Json(intent.user_metadata().clone()))
+        .bind(Json(intent.object_tags().clone()))
         .bind(postgres_time(intent.expires_at()))
         .bind(postgres_time(intent.created_at()))
         .bind(postgres_time(intent.updated_at()))
@@ -1782,8 +1961,13 @@ impl S3UploadIntentRepository for PostgresRepository {
             bucket_id: intent.bucket_id(),
             object_key: intent.object_key(),
         };
-        let object =
-            commit_object_version_in_transaction(&mut transaction, &commit, expected).await?;
+        let object = commit_object_version_in_transaction(
+            &mut transaction,
+            &commit,
+            intent.object_tags(),
+            expected,
+        )
+        .await?;
 
         let result = sqlx::query(
             "UPDATE s3_upload_intents
@@ -1950,6 +2134,11 @@ impl S3UploadIntentRepository for PostgresRepository {
             .try_get::<Json<Value>, _>("user_metadata")
             .map_err(database_error)?
             .0;
+        let object_tags = validated_tag_set(
+            row.try_get::<Json<S3ObjectTagSet>, _>("object_tags")
+                .map_err(database_error)?
+                .0,
+        )?;
         let storage_backend: String = row.try_get("storage_backend").map_err(database_error)?;
         let intent_id = UploadIntentId::from_uuid(
             row.try_get::<Option<uuid::Uuid>, _>("upload_intent_id")
@@ -1966,6 +2155,7 @@ impl S3UploadIntentRepository for PostgresRepository {
             || intent.storage_backend() != storage_backend
             || intent.content_type() != Some(content_type.as_str())
             || intent.user_metadata() != &user_metadata
+            || intent.object_tags() != &object_tags
             || payload.content_type() != Some(content_type.as_str())
             || payload.user_metadata() != &user_metadata
         {
@@ -2078,8 +2268,13 @@ impl S3UploadIntentRepository for PostgresRepository {
 
         freeze_postgres_object_lock(&mut transaction, &mut commit).await?;
 
-        let object =
-            commit_object_version_in_transaction(&mut transaction, &commit, expected).await?;
+        let object = commit_object_version_in_transaction(
+            &mut transaction,
+            &commit,
+            intent.object_tags(),
+            expected,
+        )
+        .await?;
         let intent_updated = sqlx::query(
             "UPDATE s3_upload_intents
              SET state = 'committed', lease_token = NULL, lease_until = NULL,
@@ -2395,6 +2590,66 @@ async fn insert_object_version(
     .map_err(database_error)?;
     Ok(())
 }
+
+async fn insert_object_version_tags(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    version_id: ObjectVersionId,
+    tags: &S3ObjectTagSet,
+) -> Result<(), RepositoryError> {
+    tags.validate()
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+    for (position, tag) in tags.iter().enumerate() {
+        let position = i16::try_from(position)
+            .map_err(|_| RepositoryError::Invariant("tag position overflow".into()))?;
+        sqlx::query(
+            "INSERT INTO object_version_tags (
+                object_version_id, is_delete_marker, position, tag_key, tag_value
+             ) VALUES ($1, FALSE, $2, $3, $4)",
+        )
+        .bind(version_id.as_uuid())
+        .bind(position)
+        .bind(tag.key())
+        .bind(tag.value())
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn load_object_version_tags(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    version_id: ObjectVersionId,
+) -> Result<S3ObjectTagSet, RepositoryError> {
+    let rows = sqlx::query(
+        "SELECT tag_key, tag_value FROM object_version_tags
+         WHERE object_version_id = $1 ORDER BY position",
+    )
+    .bind(version_id.as_uuid())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let tags = rows
+        .into_iter()
+        .map(|row| {
+            S3ObjectTag::new(
+                row.try_get::<String, _>("tag_key")
+                    .map_err(database_error)?,
+                row.try_get::<String, _>("tag_value")
+                    .map_err(database_error)?,
+            )
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    S3ObjectTagSet::new(tags).map_err(|error| RepositoryError::Invariant(error.to_string()))
+}
+
+fn validated_tag_set(tags: S3ObjectTagSet) -> Result<S3ObjectTagSet, RepositoryError> {
+    tags.validate()
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+    Ok(tags)
+}
+
 struct ExpectedObjectIdentity<'a> {
     application_id: ApplicationId,
     bucket_id: BucketId,
@@ -2699,6 +2954,7 @@ async fn freeze_postgres_object_lock(
 async fn commit_object_version_in_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     commit: &S3ObjectVersionCommit,
+    object_tags: &S3ObjectTagSet,
     expected: ExpectedObjectIdentity<'_>,
 ) -> Result<S3Object, RepositoryError> {
     commit.validate()?;
@@ -2810,6 +3066,8 @@ async fn commit_object_version_in_transaction(
             advanced
         }
     };
+
+    insert_object_version_tags(transaction, commit.version.id(), object_tags).await?;
 
     for task in &commit.gc_tasks {
         if task.application_id != commit.version.application_id()
@@ -3015,6 +3273,11 @@ fn row_to_upload_intent(row: PgRow) -> Result<UploadIntent, RepositoryError> {
             .try_get::<Json<Value>, _>("user_metadata")
             .map_err(database_error)?
             .0,
+        object_tags: validated_tag_set(
+            row.try_get::<Json<S3ObjectTagSet>, _>("object_tags")
+                .map_err(database_error)?
+                .0,
+        )?,
         lease_token: row.try_get("lease_token").map_err(database_error)?,
         lease_until: row.try_get("lease_until").map_err(database_error)?,
         committed_object_id: row
@@ -3990,5 +4253,17 @@ mod tests {
             validate_null_version_replacement(&commit, Some(&previous)),
             Err(RepositoryError::Conflict)
         );
+    }
+
+    #[test]
+    fn migration_keeps_object_tags_version_scoped_and_out_of_user_metadata() {
+        let migration = include_str!("../migrations/0012_s3_object_versions.sql");
+        assert!(migration.contains("CREATE TABLE object_version_tags"));
+        assert!(migration.contains("UNIQUE (object_version_id, tag_key)"));
+        assert!(migration.contains("CHECK (position BETWEEN 0 AND 9)"));
+        assert!(migration.contains("REFERENCES object_versions (id, is_delete_marker)"));
+        assert!(migration.contains("CHECK (NOT is_delete_marker)"));
+        assert!(migration.contains("object_tags JSONB NOT NULL DEFAULT '[]'::jsonb"));
+        assert!(!migration.contains("user_metadata -> 'tags'"));
     }
 }
