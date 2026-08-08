@@ -83,6 +83,12 @@ fn control_plane_router(state: Arc<AppState>, web_root: Option<PathBuf>) -> Rout
             "/api/v1/access-keys/{access_key_id}",
             patch(update_access_key).delete(revoke_access_key),
         )
+        .route(
+            "/api/v1/access-keys/{access_key_id}/s3-policy",
+            get(get_access_key_s3_policy)
+                .put(put_access_key_s3_policy)
+                .delete(delete_access_key_s3_policy),
+        )
         .route("/api/v1/buckets", get(list_buckets).post(create_bucket))
         .route(
             "/api/v1/buckets/{name}",

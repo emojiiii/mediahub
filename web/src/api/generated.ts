@@ -64,6 +64,105 @@ export interface paths {
         };
         trace?: never;
     };
+    "/api/v1/access-keys/{access_key_id}/s3-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read an access key S3 Identity Policy */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    access_key_id: components["parameters"]["AccessKeyId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["S3IdentityPolicy"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                404: components["responses"]["NotFound"];
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        /** Install or replace an access key S3 Identity Policy */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    access_key_id: components["parameters"]["AccessKeyId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["S3IdentityPolicy"];
+                };
+            };
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["S3IdentityPolicy"];
+                    };
+                };
+                400: components["responses"]["InvalidRequest"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+                413: components["responses"]["PayloadTooLarge"];
+                415: components["responses"]["UnsupportedMediaType"];
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        post?: never;
+        /** Delete an access key S3 Identity Policy */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    access_key_id: components["parameters"]["AccessKeyId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Successful response with no body */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/applications": {
         parameters: {
             query?: never;
@@ -3372,6 +3471,29 @@ export interface components {
         ResetPassword: {
             password: string;
             token: string;
+        };
+        /** @description S3 Identity Policy attached to one Access Key. Missing policy means implicit deny; legacy permissions are never converted or used as fallback. Maximum encoded request size is 20 KiB. */
+        S3IdentityPolicy: {
+            Id?: string;
+            Statement: components["schemas"]["S3IdentityPolicyStatement"] | components["schemas"]["S3IdentityPolicyStatement"][];
+            /** @enum {string} */
+            Version: "2012-10-17" | "2008-10-17";
+        };
+        /** @description AWS-style identity statement. The server additionally requires exactly one of Action/NotAction and one of Resource/NotResource, and rejects Principal fields. */
+        S3IdentityPolicyStatement: {
+            Action?: string | string[];
+            /** @description AWS condition operator/key/value map. Supported operators and keys are validated strictly by the server. */
+            Condition?: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
+            /** @enum {string} */
+            Effect: "Allow" | "Deny";
+            NotAction?: string | string[];
+            NotResource?: string | string[];
+            Resource?: string | string[];
+            Sid?: string;
         };
         Session: {
             created_at: string;

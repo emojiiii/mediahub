@@ -9,6 +9,7 @@ mod idempotency;
 mod media;
 mod outbox;
 mod s3_bucket_policy;
+mod s3_identity_policy;
 mod s3_lifecycle;
 mod s3_multipart;
 mod s3_repository;

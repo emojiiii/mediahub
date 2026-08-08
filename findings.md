@@ -219,3 +219,27 @@
 - Bucket Policy 管理要求调用身份属于 bucket owner account；权限不足为 403，权限正确但跨 owner 为 405。`x-amz-expected-bucket-owner` 不匹配始终为 403。
 - 参考：AWS PutBucketPolicy https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketPolicy.html ，GetBucketPolicy https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicy.html ，DeleteBucketPolicy https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketPolicy.html ，GetBucketPolicyStatus https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicyStatus.html 。
 - README 与 `docs/s3-compatibility.md` 仍把完整 S3 quota 和 Bucket Policy 标为未实现；Policy HTTP/授权接线通过后必须更新能力矩阵与兼容测试边界，不能让产品文档继续低估或误报当前状态。
+# S3 Policy 全 handler action 映射审计（2026-08-08）
+
+主线按当前协议分类器与 Core `S3PolicyAction` 审查得到以下接线边界；首批 anonymous 数据面只覆盖前三项，不能据此宣称全部 Policy enforcement 完成。
+
+| 协议操作 | 必须求值的 action | 关键条件 |
+|---|---|---|
+| GetObject / HeadObject | 无 `versionId` 为 `GetObject`，有 `versionId` 为 `GetObjectVersion` | object ARN、VersionId |
+| ListObjectsV2 / v1 | `ListBucket` | prefix、delimiter、max-keys |
+| HeadBucket | `ListBucket` | bucket ARN |
+| ListBuckets | `ListAllMyBuckets` | account resource `*`，仅 Identity Policy |
+| CreateBucket | `CreateBucket` | account resource `*`，仅 Identity Policy；创建后不能拿目标 bucket policy 反向授权 |
+| ListObjectVersions | `ListBucketVersions` | prefix、delimiter、max-keys |
+| ListMultipartUploads | `ListBucketMultipartUploads` | prefix、delimiter、max-uploads 当前 Core 尚无独立 key，未知 key 不得伪装支持 |
+| Get/Put Versioning、Lifecycle、Bucket Object Lock、Policy/PolicyStatus、DeleteBucket | 各自同名 bucket action | owner-only 特例与标准 policy action 都要满足既定协议顺序 |
+| PutObject、CreateMultipartUpload、UploadPart、CompleteMultipartUpload | `PutObject` | object ARN；Multipart 生命周期所有阶段绑定同一目标 key |
+| CopyObject | source `GetObject`/`GetObjectVersion` + target `PutObject` | 两个 bucket/tenant 分别求值，任一拒绝则整体拒绝 |
+| UploadPartCopy | source `GetObject`/`GetObjectVersion` + target `PutObject` | 同 CopyObject，不能只验证 upload 所属 target |
+| DeleteObject / DeleteObjects item | 无 version 为 `DeleteObject`，显式 version 为 `DeleteObjectVersion` | batch 每项独立返回错误；治理绕过另需 `BypassGovernanceRetention` |
+| Get/Put/Delete Object Tagging | 根据 `versionId` 选择普通或 Version action | VersionId；不能以 `GetObject` 代替 tagging action |
+| Get/Put Object ACL | `GetObjectAcl` / `PutObjectAcl` | 当前仅私有 ACL 形状也必须授权 |
+| Get/Put Retention、LegalHold | 各自 action | exact/current version；治理绕过为额外 action，不替代 mutation action |
+| AbortMultipartUpload / ListParts | `AbortMultipartUpload` / `ListMultipartUploadParts` | object ARN 与 upload 所属 bucket/key 一致 |
+
+认证顺序不变量：完全没有任何认证材料时才可构造 Anonymous；存在 Authorization、任一 `X-Amz-*` credential/signature query 或不完整签名时必须走认证错误，绝不能降级匿名。signed principal 的 account ID 来自调用方 access key 所属 application，不来自目标 bucket。无 Identity Policy 为 implicit deny，不回退旧 permissions。

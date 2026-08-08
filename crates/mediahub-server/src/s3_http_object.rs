@@ -210,28 +210,35 @@ async fn abort_s3_staged_put(
     let _ = state.object_store.backend_name();
 }
 
+struct S3ReadObjectOperation<'a> {
+    state: &'a AppState,
+    application_id: ApplicationId,
+    bucket_name: &'a str,
+    object_key: &'a str,
+    uri: &'a Uri,
+    request_id: &'a str,
+    version_id: Option<S3VersionId>,
+}
+
 async fn s3_read_regular_object(
-    operation: S3ObjectOperation<'_>,
+    operation: S3ReadObjectOperation<'_>,
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, S3ApiError> {
-    let S3ObjectOperation {
+    let S3ReadObjectOperation {
         state,
-        auth,
+        application_id,
         bucket_name,
         object_key,
         uri,
         request_id,
+        version_id,
     } = operation;
     let resource = uri.path();
-    auth.authorize("media:read")
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
-    validate_s3_object_key(object_key, resource, request_id)?;
-    let version_id = parse_s3_version_id(uri, request_id)?;
     let service = runtime_s3_object_service(state, resource, request_id)?;
     let head = service
         .head(&S3ObjectRequest {
-            application_id: auth.application.id,
+            application_id,
             bucket_name: bucket_name.to_owned(),
             object_key: object_key.to_owned(),
             version_id,

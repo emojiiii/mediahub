@@ -95,6 +95,14 @@ pub fn document() -> Result<Value> {
     document["components"]["parameters"] = contract::parameters();
     document["components"]["responses"] = contract::error_responses();
     document["components"]["securitySchemes"] = contract::security_schemes();
+    let schemas = document["components"]["schemas"]
+        .as_object_mut()
+        .context("OpenAPI component schemas are not an object")?;
+    schemas.extend(
+        contract::s3_identity_policy_schemas()
+            .into_iter()
+            .map(|(name, schema)| (name.to_owned(), schema)),
+    );
     Ok(document)
 }
 
@@ -121,10 +129,10 @@ mod tests {
         let paths = document["paths"]
             .as_object()
             .ok_or_else(|| anyhow!("paths must be an object"))?;
-        ensure!(paths.len() == 50, "expected 50 paths, got {}", paths.len());
+        ensure!(paths.len() == 51, "expected 51 paths, got {}", paths.len());
         ensure!(
-            contract::OPERATION_COUNT == 74,
-            "expected 74 operations, got {}",
+            contract::OPERATION_COUNT == 77,
+            "expected 77 operations, got {}",
             contract::OPERATION_COUNT
         );
         ensure!(
@@ -203,7 +211,7 @@ mod tests {
                 }
             }
         }
-        ensure!(operations == 74, "expected 74 operations, got {operations}");
+        ensure!(operations == 77, "expected 77 operations, got {operations}");
         Ok(())
     }
 
@@ -229,6 +237,42 @@ mod tests {
                 "unresolved reference: {reference}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn access_key_s3_identity_policy_contract_is_strict_and_csrf_protected() -> Result<()> {
+        let document = document()?;
+        let path = &document["paths"]["/api/v1/access-keys/{access_key_id}/s3-policy"];
+        ensure!(
+            path["get"]["security"] == serde_json::json!([{ "SessionCookie": [] }]),
+            "policy GET must require a session"
+        );
+        for method in ["put", "delete"] {
+            ensure!(
+                path[method]["security"]
+                    == serde_json::json!([{ "SessionCookie": [], "CsrfToken": [] }]),
+                "policy {method} must require session CSRF"
+            );
+        }
+        ensure!(
+            path["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                == serde_json::json!("#/components/schemas/S3IdentityPolicy")
+                && path["put"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+                    == serde_json::json!("#/components/schemas/S3IdentityPolicy"),
+            "policy PUT request and response must share the canonical schema"
+        );
+        let policy = &document["components"]["schemas"]["S3IdentityPolicy"];
+        ensure!(
+            policy["additionalProperties"] == serde_json::json!(false)
+                && policy["properties"]["Statement"]["oneOf"]
+                    .as_array()
+                    .is_some_and(|variants| variants.len() == 2)
+                && policy["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("never converted")),
+            "policy schema must document strict shape, single/array Statement, and no fallback"
+        );
         Ok(())
     }
 
@@ -267,6 +311,8 @@ mod tests {
                     "Bucket",
                     "CreateAccessKeyResponse",
                     "LifecycleRule",
+                    "S3IdentityPolicy",
+                    "S3IdentityPolicyStatement",
                 ],
             ),
             (

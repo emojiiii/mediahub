@@ -99,6 +99,7 @@ pub(super) async fn s3_bucket_get(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     let operation = classify_s3_bucket_get(&uri, &request_id.0.0)?;
@@ -110,6 +111,7 @@ pub(super) async fn s3_bucket_get(
                 OriginalUri(uri),
                 method,
                 headers,
+                connect_info,
                 request_id,
             )
             .await

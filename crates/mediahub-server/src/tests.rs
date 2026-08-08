@@ -1360,6 +1360,27 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         })
         .await
         .expect("persist access key");
+    let data_identity_policy = mediahub_app::S3IdentityPolicyDocument::parse(
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::{}/*"}},{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::{}"}}]}}"#,
+            bucket.name(),
+            bucket.name(),
+        )
+        .as_bytes(),
+    )
+    .expect("S3 gateway test identity policy");
+    mediahub_app::S3IdentityPolicyRepository::put_s3_identity_policy(
+        &state.repository,
+        &mediahub_app::PutS3IdentityPolicy {
+            application_id: application.id,
+            access_key_id: access_key_id.to_owned(),
+            policy: data_identity_policy,
+            updated_at: OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .expect("persist S3 gateway test identity policy")
+    .expect("S3 gateway test access key");
     let backup_access_key_id = "mh_ak_sub2api_backup_test";
     let backup_access_key_secret = "sub2api-backup-test-secret";
     state
@@ -4654,6 +4675,7 @@ async fn startup_rejects_database_key_versions_missing_from_the_keyring(pool: sq
 }
 
 include!("handlers_object_versions_tests.rs");
+include!("access_key_policy_tests.rs");
 
 #[test]
 fn signed_media_url_tokens_reject_tampering() {

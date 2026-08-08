@@ -311,7 +311,10 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 - [completed] 3. 实现标准 Bucket Policy Core parser/validator/evaluator、稳定序列化、PolicyStatus 与表驱动测试
 - [completed] 4. 对照 Silo 梳理 Bucket Policy classifier、handler、错误顺序、匿名访问与持久化接线清单
 - [completed] 5. 集成审计、fresh PG17、workspace、Clippy/fmt/diff 回归
-- [in_progress] 6. Bucket Policy 持久化/API/SigV4/anonymous 授权纵向接线
+- [completed] 6. Bucket Policy 持久化/API/SigV4 与读取数据面 anonymous 授权纵向接线
+- [completed] 7. Access Key Identity Policy persistence、管理 API 与控制台编辑器
+- [completed] 8. anonymous GetObject/HeadObject/ListObjectsV2 与 signed Identity + Bucket Policy 数据面决策
+- [pending] 9. 扩展统一授权到写入、Copy、Multipart、Tagging、Object Lock、Lifecycle 与 Bucket 控制面
 
 ## 不变量
 
@@ -339,4 +342,5 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 | 预签名 GET 集成测试的签名 helper 将绝对 URL 直接作为 SigV4 canonical URI，而生产验签使用 HTTP origin-form | 1 | helper 改为签署 `path_and_query`，并新增发送前本地 parse/verify 断言；生产验签器无需放宽 |
 | 修正 canonical URI 后预签名 helper 本地自验仍失败：它仍按空 body 摘要签名，而验签器按 S3 预签名规则使用 `UNSIGNED-PAYLOAD` | 1 | query presign 明确使用 `SignableBody::UnsignedPayload`；保留本地自验和真实 HTTP 回归双重断言 |
 | Workspace strict Clippy 报告 `S3BucketDeleteOperation` 三个变体重复 `Delete` 前缀 | 1 | 变体简化为 `Bucket`、`Policy`、`Lifecycle`，不添加 lint 豁免，协议行为不变 |
+| 检查并发代理是否已创建 Server 授权文件时，把“尚无匹配”的可选 `rg` 与 `git status` 放在同一命令，导致包装器返回 1 | 1 | status 输出已取得；后续用 `Test-Path` 或将可选检索单独容错，不再让预期无匹配标记整条命令失败 |
 | 修复签名 helper 的首个补丁误把 `task_plan.md` 表格上下文放在 `tests.rs` 文件段内 | 1 | 拆分为带显式文件切换的补丁后成功应用，未产生部分源码改动 |

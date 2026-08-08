@@ -215,6 +215,191 @@ async fn revoke_access_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_access_key_s3_policy(
+    State(state): State<Arc<AppState>>,
+    Path(access_key_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (_, access_key) = owned_access_key_by_id(&state, &headers, &access_key_id).await?;
+    let snapshot = owned_s3_identity_policy_snapshot(&state, &access_key).await?;
+    let policy = snapshot
+        .policy
+        .ok_or_else(|| ApiError::not_found("S3 Identity Policy not found"))?;
+    Ok(s3_identity_policy_json_response(&policy))
+}
+
+async fn put_access_key_s3_policy(
+    State(state): State<Arc<AppState>>,
+    Path(access_key_id): Path<String>,
+    request_id: Extension<RequestId>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    verify_csrf(&state, request.headers()).await?;
+    let (user_id, access_key) =
+        owned_access_key_by_id(&state, request.headers(), &access_key_id).await?;
+    if access_key.revoked_at.is_some() {
+        return Err(ApiError::conflict("access key is revoked"));
+    }
+
+    let policy = parse_s3_identity_policy_request(request).await?;
+    let updated_at = OffsetDateTime::now_utc();
+    let snapshot = state
+        .repository
+        .put_s3_identity_policy(&PutS3IdentityPolicy {
+            application_id: access_key.application_id,
+            access_key_id: access_key.access_key_id.clone(),
+            policy,
+            updated_at,
+        })
+        .await
+        .map_err(ApiError::from_repository)?
+        .ok_or_else(|| ApiError::not_found("access key not found"))?;
+    let policy = snapshot
+        .policy
+        .ok_or_else(|| ApiError::unavailable("persisted S3 Identity Policy is unavailable"))?;
+    record_session_audit(
+        &state,
+        user_id,
+        &request_id.0.0,
+        SessionAudit {
+            application_id: access_key.application_id,
+            action: "access_key.s3_policy.updated",
+            target_type: "access_key",
+            target_id: access_key.access_key_id,
+            summary: serde_json::json!({
+                "revision": snapshot.revision,
+                "sha256": policy.sha256(),
+            }),
+        },
+    )
+    .await;
+    Ok(s3_identity_policy_json_response(&policy))
+}
+
+async fn delete_access_key_s3_policy(
+    State(state): State<Arc<AppState>>,
+    Path(access_key_id): Path<String>,
+    headers: HeaderMap,
+    request_id: Extension<RequestId>,
+) -> Result<StatusCode, ApiError> {
+    verify_csrf(&state, &headers).await?;
+    let (user_id, access_key) = owned_access_key_by_id(&state, &headers, &access_key_id).await?;
+    let snapshot = state
+        .repository
+        .delete_s3_identity_policy(&DeleteS3IdentityPolicy {
+            application_id: access_key.application_id,
+            access_key_id: access_key.access_key_id.clone(),
+            updated_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .map_err(ApiError::from_repository)?
+        .ok_or_else(|| ApiError::not_found("access key not found"))?;
+    record_session_audit(
+        &state,
+        user_id,
+        &request_id.0.0,
+        SessionAudit {
+            application_id: access_key.application_id,
+            action: "access_key.s3_policy.deleted",
+            target_type: "access_key",
+            target_id: access_key.access_key_id,
+            summary: serde_json::json!({
+                "revision": snapshot.revision,
+                "sha256": serde_json::Value::Null,
+            }),
+        },
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn owned_access_key_by_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    access_key_id: &str,
+) -> Result<(UserId, AccessKeyRecord), ApiError> {
+    let user = authenticate(state, headers).await?;
+    let access_key = state
+        .repository
+        .find_access_key(access_key_id)
+        .await
+        .map_err(ApiError::from_repository)?
+        .ok_or_else(|| ApiError::not_found("access key not found"))?;
+    let owned = state
+        .repository
+        .application_for_user_by_id(user.id, access_key.application_id)
+        .await
+        .map_err(ApiError::from_repository)?
+        .is_some();
+    if !owned {
+        return Err(ApiError::not_found("access key not found"));
+    }
+    Ok((user.id, access_key))
+}
+
+async fn owned_s3_identity_policy_snapshot(
+    state: &AppState,
+    access_key: &AccessKeyRecord,
+) -> Result<mediahub_app::S3IdentityPolicySnapshot, ApiError> {
+    let snapshot = state
+        .repository
+        .get_s3_identity_policy(&access_key.access_key_id)
+        .await
+        .map_err(ApiError::from_repository)?
+        .ok_or_else(|| ApiError::not_found("access key not found"))?;
+    if snapshot.identity.application_id != access_key.application_id {
+        return Err(ApiError::not_found("access key not found"));
+    }
+    Ok(snapshot)
+}
+
+async fn parse_s3_identity_policy_request(
+    request: Request,
+) -> Result<S3IdentityPolicyDocument, ApiError> {
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type != Some("application/json") {
+        return Err(ApiError::unsupported_media_type(
+            "S3 Identity Policy must use application/json",
+        ));
+    }
+    if let Some(content_length) = request.headers().get(CONTENT_LENGTH) {
+        let content_length = content_length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| ApiError::bad_request("Content-Length is invalid"))?;
+        if content_length > MAX_S3_POLICY_BYTES {
+            return Err(ApiError::payload_too_large(
+                "S3 Identity Policy exceeds the 20 KiB limit",
+            ));
+        }
+    }
+    let body = to_bytes(request.into_body(), MAX_S3_POLICY_BYTES + 1)
+        .await
+        .map_err(|_| ApiError::payload_too_large("S3 Identity Policy exceeds the 20 KiB limit"))?;
+    if body.len() > MAX_S3_POLICY_BYTES {
+        return Err(ApiError::payload_too_large(
+            "S3 Identity Policy exceeds the 20 KiB limit",
+        ));
+    }
+    let policy = S3IdentityPolicy::parse(&body)
+        .map_err(|error| ApiError::bad_request(format!("invalid S3 Identity Policy: {error}")))?;
+    Ok(S3IdentityPolicyDocument::from_policy(&policy))
+}
+
+fn s3_identity_policy_json_response(policy: &S3IdentityPolicyDocument) -> Response {
+    let mut response = policy.stable_json().to_owned().into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
 async fn owned_application_by_app_id(
     state: &AppState,
     headers: &HeaderMap,
@@ -310,4 +495,3 @@ async fn session_response<T: Serialize>(
     );
     Ok(response)
 }
-

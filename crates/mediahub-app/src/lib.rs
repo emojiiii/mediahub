@@ -19,6 +19,7 @@ pub mod object_store_contract;
 mod ports;
 mod s3_authorization;
 mod s3_bucket_policy;
+mod s3_identity_policy;
 mod s3_lifecycle;
 mod s3_multipart;
 mod s3_object_service;
@@ -72,6 +73,10 @@ pub use s3_authorization::{
 pub use s3_bucket_policy::{
     S3_ACCOUNT_ID_DIGITS, S3AccountId, S3BucketIdentity, S3BucketPolicyDocument,
     S3BucketPolicyRepository, S3BucketPolicySnapshot,
+};
+pub use s3_identity_policy::{
+    DeleteS3IdentityPolicy, PutS3IdentityPolicy, S3AccessKeyIdentity, S3IdentityPolicyDocument,
+    S3IdentityPolicyRepository, S3IdentityPolicySnapshot,
 };
 pub use s3_lifecycle::{
     DEFAULT_S3_LIFECYCLE_BATCH_SIZE, DEFAULT_S3_LIFECYCLE_GC_MAX_ATTEMPTS,

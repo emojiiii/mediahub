@@ -204,3 +204,11 @@
 - 主线使用全新 PostgreSQL 17 数据库完成 workspace all-targets 串行回归：PG quota/policy/lifecycle/tagging/lock/listing contracts 全部通过，Server 172/172、Core 80/80、App 63/63；仅真实外部 S3 contract 按环境约定 ignored。
 - 全量回归修正了两个全局 Bucket namespace 的旧测试假设，并修复集成测试 SigV4 presigner 的 origin-form 与 `UNSIGNED-PAYLOAD` 构造；生产验签未放宽，预签名 GET 现在发送前自验与真实 HTTP 双通过。
 - Workspace strict Clippy `-D warnings`、workspace fmt 已通过；当前切片准备本地提交，不 push。下一切片继续 Identity Policy persistence/Server decision 与 anonymous 数据面授权接线。
+- 已创建本地提交 `3e6d40d feat: enforce S3 quotas and add policy control plane`，未 push。
+- 下一批三个不重叠切片已并发启动：Identity Policy App/PG persistence；Server anonymous GET/HEAD/List + unified authorization；Access Key Policy 管理 API 与控制台编辑器。主代理负责全 action 映射审计、接口收敛和最终 fresh PG/workspace 验证。
+- `0015` 已完成 Access Key Identity Policy JSONB/hash/revision 持久化；snapshot 明确携带调用方 application 的稳定 12 位 account ID，无 policy 为 implicit deny，绝不从旧 permissions fallback。主代理独立复验 App 64/64 与 fresh PG17 contract 1/1。
+- 控制面已新增 Identity Policy GET/PUT/DELETE、OpenAPI 51 paths/77 operations 与暗/亮主题控制台编辑器；CSRF/tenant 404/20 KiB/strict parse/revoked/audit 均有 SQLx HTTP 合同，DenyAll 模板需用户显式保存。
+- GetObject、HeadObject、ListObjectsV2 已接入统一 Identity + Bucket Policy：坏/partial/lowercase SigV4 不降级匿名，读取前完成授权，私有 bucket 对存在/不存在 key 均 403；真实 PG17 HTTP 合同覆盖 anonymous/signed Allow、Identity/Bucket Deny 与 NoSuchBucket/NoSuchKey。
+- 主线在全新 PostgreSQL 17 数据库从 0001 应用至 0015 后完成 workspace all-targets：PG adapter 30/30、App 64/64、Core 80/80、Server 179/179，全部 PostgreSQL contracts 通过；仅需外部独立 S3 的 contract 按环境约定 ignored。
+- Workspace strict Clippy `-D warnings` 通过；Web 36 files / 188 tests、OpenAPI verify、typecheck、production build 与 viewer chunk verification 全部通过。下一步是把同一 Policy 授权扩展到剩余 action。
+- Raw SigV4 offline golden、workspace fmt 与 git diff check 再次通过；测试容器 `prismark-s3quota-pg17-main-0808` 经确认 mounts=0 后按精确名称删除，测试数据库随容器清理。

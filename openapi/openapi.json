@@ -2306,6 +2306,148 @@
         ],
         "type": "object"
       },
+      "S3IdentityPolicy": {
+        "additionalProperties": false,
+        "description": "S3 Identity Policy attached to one Access Key. Missing policy means implicit deny; legacy permissions are never converted or used as fallback. Maximum encoded request size is 20 KiB.",
+        "properties": {
+          "Id": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "Statement": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/S3IdentityPolicyStatement"
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/S3IdentityPolicyStatement"
+                },
+                "maxItems": 100,
+                "minItems": 1,
+                "type": "array"
+              }
+            ]
+          },
+          "Version": {
+            "enum": [
+              "2012-10-17",
+              "2008-10-17"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "Version",
+          "Statement"
+        ],
+        "type": "object"
+      },
+      "S3IdentityPolicyStatement": {
+        "additionalProperties": false,
+        "description": "AWS-style identity statement. The server additionally requires exactly one of Action/NotAction and one of Resource/NotResource, and rejects Principal fields.",
+        "properties": {
+          "Action": {
+            "oneOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "items": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              }
+            ]
+          },
+          "Condition": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "description": "AWS condition operator/key/value map. Supported operators and keys are validated strictly by the server.",
+            "type": "object"
+          },
+          "Effect": {
+            "enum": [
+              "Allow",
+              "Deny"
+            ],
+            "type": "string"
+          },
+          "NotAction": {
+            "oneOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "items": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              }
+            ]
+          },
+          "NotResource": {
+            "oneOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "items": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              }
+            ]
+          },
+          "Resource": {
+            "oneOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "items": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              }
+            ]
+          },
+          "Sid": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        "required": [
+          "Effect"
+        ],
+        "type": "object"
+      },
       "Session": {
         "additionalProperties": false,
         "properties": {
@@ -3075,6 +3217,133 @@
           }
         ],
         "summary": "Update an access key"
+      }
+    },
+    "/api/v1/access-keys/{access_key_id}/s3-policy": {
+      "delete": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccessKeyId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful response with no body"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "CsrfToken": [],
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Delete an access key S3 Identity Policy"
+      },
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccessKeyId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3IdentityPolicy"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Read an access key S3 Identity Policy"
+      },
+      "put": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccessKeyId"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/S3IdentityPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3IdentityPolicy"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "CsrfToken": [],
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Install or replace an access key S3 Identity Policy"
       }
     },
     "/api/v1/admin/applications": {

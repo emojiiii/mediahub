@@ -136,4 +136,42 @@ describe('MediaHub API facade', () => {
     expect(update).toEqual(expect.objectContaining({ phase: 'running', operationId: 'update_123', targetVersion: 'prod-bbbbbbbbbbbb' }))
     expect(fetchMock.mock.calls[1][0].method).toBe('POST')
   })
+
+  it('manages S3 Identity Policy separately from access-key secrets and legacy permissions', async () => {
+    const policy = {
+      Version: '2012-10-17' as const,
+      Statement: [{ Sid: 'DenyAll', Effect: 'Deny' as const, Action: 's3:*', Resource: '*' }],
+    }
+    const fetchMock = vi.fn(async (request: Request) => {
+      const url = new URL(request.url)
+      if (url.pathname !== '/api/v1/access-keys/mh_ak_policy/s3-policy') return new Response(null, { status: 404 })
+      if (request.method === 'GET') {
+        return new Response(JSON.stringify({ error: { code: 'not_found', message: 'S3 Identity Policy not found' } }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (request.method === 'PUT') {
+        return new Response(JSON.stringify(policy), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (request.method === 'DELETE') return new Response(null, { status: 204 })
+      return new Response(null, { status: 405 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    document.cookie = 'mediahub_csrf=csrf-policy-test; path=/'
+    const { api } = await import('./index')
+    api.setApplication('app_policy')
+
+    await expect(api.getAccessKeyS3Policy('mh_ak_policy')).resolves.toBeNull()
+    await expect(api.putAccessKeyS3Policy('mh_ak_policy', policy)).resolves.toEqual(policy)
+    await expect(api.deleteAccessKeyS3Policy('mh_ak_policy')).resolves.toBeUndefined()
+
+    const putRequest = fetchMock.mock.calls.map(([request]) => request).find((request) => request.method === 'PUT')
+    expect(putRequest?.headers.get('X-CSRF-Token')).toBe('csrf-policy-test')
+    expect(putRequest?.headers.get('X-MediaHub-App-Id')).toBe('app_policy')
+    await expect(putRequest?.clone().json()).resolves.toEqual(policy)
+    expect(JSON.stringify(await putRequest?.clone().json())).not.toContain('secret')
+    api.setApplication(undefined)
+    document.cookie = 'mediahub_csrf=; Max-Age=0; path=/'
+  })
 })

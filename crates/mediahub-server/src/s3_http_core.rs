@@ -552,26 +552,35 @@ pub(super) async fn s3_list_objects(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
     validate_s3_bucket_name(&bucket_name)
         .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-
-    auth.authorize("media:list")
-        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
-    let bucket = state
-        .repository
-        .find_s3_bucket(auth.application.id, &bucket_name)
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "S3 Bucket lookup failed");
-            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
-        })?
-        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
     let query = ListObjectsV2Query::parse(uri.query())
         .map_err(|error| s3_list_api_error(error, uri.path(), &request_id.0.0))?;
+    let max_keys = u64::try_from(query.max_keys).expect("S3 max-keys is bounded at 1000");
+    let authorization = authorize_s3_data_request(
+        &state,
+        &method,
+        &uri,
+        &headers,
+        S3DataAuthorizationInput {
+            action: S3PolicyAction::ListBucket,
+            bucket_name: &bucket_name,
+            object_key: None,
+            version_id: None,
+            prefix: Some(&query.prefix),
+            delimiter: query.delimiter.as_deref(),
+            max_keys: Some(max_keys),
+            secure_transport: s3_data_secure_transport(&uri),
+            source_ip: s3_data_source_ip(connect_info.as_ref()),
+        },
+        &request_id.0.0,
+    )
+    .await?;
+    let application_id = authorization.application_id();
+    let bucket_id = authorization.bucket.bucket_id;
     let codec = s3_list_token_codec(&state);
     let cursor = query
         .decode_continuation_cursor(&codec, &bucket_name)
@@ -579,9 +588,9 @@ pub(super) async fn s3_list_objects(
     let page = state
         .repository
         .list_current_s3_objects(
-            auth.application.id,
+            application_id,
             &S3ObjectListQuery {
-                bucket_id: bucket.id(),
+                bucket_id,
                 prefix: query.prefix.clone(),
                 start_after: cursor.or_else(|| query.start_after.clone()),
                 delimiter: query.delimiter.is_some(),
@@ -594,8 +603,8 @@ pub(super) async fn s3_list_objects(
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?;
     let result = s3_list_result_from_object_page(
-        auth.application.id,
-        bucket.id(),
+        application_id,
+        bucket_id,
         bucket_name,
         query,
         page,
@@ -1348,101 +1357,127 @@ pub(super) async fn s3_get_object(
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
-    let tagging_operation = classify_s3_object_tagging(&uri, &request_id.0.0)?;
-    let lock_operation = classify_s3_object_version_lock(&uri, &request_id.0.0)?;
-    let auth =
-        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
-    if tagging_operation {
-        if method != Method::GET {
-            return Err(S3ApiError::method_not_allowed(
-                "GetObjectTagging requires GET.",
-                uri.path(),
-                &request_id.0.0,
-            ));
-        }
-        return s3_get_object_tagging(S3ObjectOperation {
-            state: &state,
-            auth: &auth,
-            bucket_name: &bucket_name,
-            object_key: &object_key,
-            uri: &uri,
-            request_id: &request_id.0.0,
-        })
-        .await;
-    }
-    if let Some(lock_operation) = lock_operation {
-        if method != Method::GET {
-            return Err(S3ApiError::method_not_allowed(
-                "Object retention and legal hold subresources require GET.",
-                uri.path(),
-                &request_id.0.0,
-            ));
-        }
-        return s3_get_object_version_lock(
-            S3ObjectOperation {
+    let operation = classify_s3_object_get(&uri, &request_id.0.0)?;
+    if operation == S3ObjectGetOperation::PlainRead {
+        let version_id = parse_s3_version_id(&uri, &request_id.0.0)?;
+        let action = if version_id.is_some() {
+            S3PolicyAction::GetObjectVersion
+        } else {
+            S3PolicyAction::GetObject
+        };
+        let authorization = authorize_s3_data_request(
+            &state,
+            &method,
+            &uri,
+            &headers,
+            S3DataAuthorizationInput {
+                action,
+                bucket_name: &bucket_name,
+                object_key: Some(&object_key),
+                version_id: version_id.as_ref().map(S3VersionId::as_str),
+                prefix: None,
+                delimiter: None,
+                max_keys: None,
+                secure_transport: s3_data_secure_transport(&uri),
+                source_ip: s3_data_source_ip(connect_info.as_ref()),
+            },
+            &request_id.0.0,
+        )
+        .await?;
+        return s3_read_regular_object(
+            S3ReadObjectOperation {
                 state: &state,
-                auth: &auth,
+                application_id: authorization.application_id(),
                 bucket_name: &bucket_name,
                 object_key: &object_key,
                 uri: &uri,
                 request_id: &request_id.0.0,
+                version_id,
             },
-            lock_operation,
+            method,
+            headers,
         )
         .await;
     }
-    if s3_query_flag(&uri, "acl", &request_id.0.0)? {
-        reject_s3_versioning(&uri, &request_id.0.0)?;
-        if method != Method::GET {
-            return Err(S3ApiError::invalid_argument(
-                "GetObjectAcl requires GET.",
-                uri.path(),
-                &request_id.0.0,
-            ));
+
+    let auth =
+        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    let signed_operation = S3ObjectOperation {
+        state: &state,
+        auth: &auth,
+        bucket_name: &bucket_name,
+        object_key: &object_key,
+        uri: &uri,
+        request_id: &request_id.0.0,
+    };
+    match operation {
+        S3ObjectGetOperation::Tagging => {
+            if method != Method::GET {
+                return Err(S3ApiError::method_not_allowed(
+                    "GetObjectTagging requires GET.",
+                    uri.path(),
+                    &request_id.0.0,
+                ));
+            }
+            s3_get_object_tagging(signed_operation).await
         }
-        return s3_get_object_acl(
-            &state,
-            &auth,
-            &bucket_name,
-            &object_key,
-            &uri,
-            &request_id.0.0,
-        )
-        .await;
-    }
-    if let Some(upload_id) = s3_query_value(&uri, "uploadId", &request_id.0.0)? {
-        reject_s3_versioning(&uri, &request_id.0.0)?;
-        if method != Method::GET {
-            return Err(S3ApiError::invalid_argument(
-                "ListParts requires GET.",
-                uri.path(),
-                &request_id.0.0,
-            ));
+        S3ObjectGetOperation::VersionLock(lock_operation) => {
+            if method != Method::GET {
+                return Err(S3ApiError::method_not_allowed(
+                    "Object retention and legal hold subresources require GET.",
+                    uri.path(),
+                    &request_id.0.0,
+                ));
+            }
+            s3_get_object_version_lock(signed_operation, lock_operation).await
         }
-        return s3_list_parts(
-            &state,
-            &auth,
-            &bucket_name,
-            &object_key,
-            &upload_id,
-            &uri,
+        S3ObjectGetOperation::Acl => {
+            reject_s3_versioning(&uri, &request_id.0.0)?;
+            if method != Method::GET {
+                return Err(S3ApiError::invalid_argument(
+                    "GetObjectAcl requires GET.",
+                    uri.path(),
+                    &request_id.0.0,
+                ));
+            }
+            s3_get_object_acl(
+                &state,
+                &auth,
+                &bucket_name,
+                &object_key,
+                &uri,
+                &request_id.0.0,
+            )
+            .await
+        }
+        S3ObjectGetOperation::ListParts(upload_id) => {
+            reject_s3_versioning(&uri, &request_id.0.0)?;
+            if method != Method::GET {
+                return Err(S3ApiError::invalid_argument(
+                    "ListParts requires GET.",
+                    uri.path(),
+                    &request_id.0.0,
+                ));
+            }
+            s3_list_parts(
+                &state,
+                &auth,
+                &bucket_name,
+                &object_key,
+                &upload_id,
+                &uri,
+                &request_id.0.0,
+            )
+            .await
+        }
+        S3ObjectGetOperation::UnsupportedSubresource(name) => Err(S3ApiError::not_implemented(
+            format!("The {name} object subresource is not implemented."),
+            uri.path(),
             &request_id.0.0,
-        )
-        .await;
+        )),
+        S3ObjectGetOperation::PlainRead => unreachable!("plain read returned above"),
     }
-    s3_read_regular_object(
-        S3ObjectOperation {
-            state: &state,
-            auth: &auth,
-            bucket_name: &bucket_name,
-            object_key: &object_key,
-            uri: &uri,
-            request_id: &request_id.0.0,
-        },
-        method,
-        headers,
-    )
-    .await
 }

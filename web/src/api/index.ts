@@ -1,6 +1,12 @@
 import { createMediaHubClient, resolveApiBaseUrl } from './client'
 import type { components } from './generated'
 import { sha256File } from '../upload-hash'
+import {
+  validateS3IdentityPolicyJson,
+  type S3IdentityPolicyDocument,
+} from '../access-key-policy'
+
+export type { S3IdentityPolicyDocument } from '../access-key-policy'
 
 export const apiBaseUrl = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL?.trim())
 
@@ -316,6 +322,9 @@ type Api = {
   updateAccessKey(accessKeyId: string, input: AccessKeyInput): Promise<AccessKey>
   rotateAccessKey(appId: string, key: AccessKey): Promise<OneTimeSecret>
   revokeAccessKey(accessKeyId: string): Promise<void>
+  getAccessKeyS3Policy(accessKeyId: string): Promise<S3IdentityPolicyDocument | null>
+  putAccessKeyS3Policy(accessKeyId: string, policy: S3IdentityPolicyDocument): Promise<S3IdentityPolicyDocument>
+  deleteAccessKeyS3Policy(accessKeyId: string): Promise<void>
   getWebhooks(): Promise<WebhookEndpoint[]>
   getWebhookDeliveries(webhookId: string, filters?: WebhookDeliveryFilters): Promise<WebhookDeliveryPage>
   replayWebhookDelivery(webhookId: string, eventId: string): Promise<void>
@@ -385,6 +394,12 @@ async function backendResult<T>(request: PromiseLike<ClientResult<T>>): Promise<
 
 async function backendData<T>(request: PromiseLike<ClientResult<T>>): Promise<T> { return (await backendResult(request)).data }
 async function backendOk(request: PromiseLike<ClientResult<unknown>>): Promise<void> { const result = await request; if (result.error !== undefined || !result.response.ok) throw clientError(result.response, result.error) }
+
+function parsedS3IdentityPolicy(value: unknown, status: number): S3IdentityPolicyDocument {
+  const result = validateS3IdentityPolicyJson(JSON.stringify(value))
+  if (!result.valid) throw new ApiRequestError(status, 'invalid_response', `服务端返回了无效的 S3 Policy：${result.message}`)
+  return result.policy
+}
 const bytes = (value: number) => Number.isFinite(value) && value >= 0 ? value : 0
 function formatStorage(value: number): string { if (value < 1024 ** 2) return `${Math.max(0, Math.round(value / 1024))} KB`; if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`; return `${(value / 1024 ** 3).toFixed(2)} GB` }
 const visibilityLabel = (visibility: Visibility): ObjectItem['visibility'] => visibility === 'public' ? '公开' : '私有'
@@ -646,6 +661,18 @@ const backendApi: Api = {
   async updateAccessKey(id, input) { return accessKeyFromBackend(await backendData(backendClient.PATCH('/api/v1/access-keys/{access_key_id}', { params: { path: { access_key_id: id } }, body: { name: input.name, permissions: input.permissions, expires_at: input.expiresAt } }))) },
   async rotateAccessKey(appId, key) { const secret = await backendApi.createAccessKey(appId, { name: `${key.name}-rotated`, permissions: key.permissions, expiresAt: key.expiresAt }); try { await backendApi.revokeAccessKey(key.id); return { ...secret, title: '访问密钥已轮换' } } catch { return { ...secret, title: '新密钥已创建；旧密钥撤销失败，请手动撤销' } } },
   async revokeAccessKey(id) { await backendOk(backendClient.DELETE('/api/v1/access-keys/{access_key_id}', { params: { path: { access_key_id: id } } })) },
+  async getAccessKeyS3Policy(id) {
+    const result = await backendClient.GET('/api/v1/access-keys/{access_key_id}/s3-policy', { params: { path: { access_key_id: id } } })
+    if (result.response.status === 404) return null
+    const { data, response } = await backendResult(Promise.resolve(result))
+    return parsedS3IdentityPolicy(data, response.status)
+  },
+  async putAccessKeyS3Policy(id, policy) {
+    const validation = validateS3IdentityPolicyJson(JSON.stringify(policy))
+    if (!validation.valid) throw new ApiRequestError(400, 'invalid_s3_policy', validation.message)
+    return parsedS3IdentityPolicy(await backendData(backendClient.PUT('/api/v1/access-keys/{access_key_id}/s3-policy', { params: { path: { access_key_id: id } }, body: validation.policy })), 200)
+  },
+  async deleteAccessKeyS3Policy(id) { await backendOk(backendClient.DELETE('/api/v1/access-keys/{access_key_id}/s3-policy', { params: { path: { access_key_id: id } } })) },
   async getWebhooks() { return (await backendData(backendClient.GET('/api/v1/webhooks'))).map(webhookFromBackend) },
   async getWebhookDeliveries(webhookId, filters = {}) { const page: BackendWebhookDeliveryPage = await backendData(backendClient.GET('/api/v1/webhooks/{webhook_id}/deliveries', { params: { path: { webhook_id: webhookId }, query: { status: filters.status, limit: filters.limit, cursor: filters.cursor } } })); return { items: page.items.map((item: BackendWebhookDelivery) => ({ eventId: item.event_id, endpointId: item.endpoint_id, eventType: item.event_type, attemptCount: item.attempt_count, status: item.status, lastResponseStatus: item.last_response_status ?? null, lastError: item.last_error ?? null, createdAt: item.created_at, updatedAt: item.updated_at, nextAttemptAt: item.next_attempt_at ?? null, deliveredAt: item.delivered_at ?? null, deadLetteredAt: item.dead_lettered_at ?? null, replayCount: item.replay_count, lastReplayedAt: item.last_replayed_at ?? null })), nextCursor: page.next_cursor } },
   async replayWebhookDelivery(webhookId, eventId) { await backendOk(backendClient.POST('/api/v1/webhooks/{webhook_id}/deliveries/{event_id}/replay', { params: { path: { webhook_id: webhookId, event_id: eventId } } })) },

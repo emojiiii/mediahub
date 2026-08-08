@@ -2,12 +2,13 @@
 
 use std::{
     borrow::Cow,
+    net::SocketAddr,
     sync::{Arc, atomic::Ordering},
 };
 
 use axum::{
     body::{Body, Bytes, to_bytes},
-    extract::{Extension, OriginalUri, Path, State},
+    extract::{ConnectInfo, Extension, OriginalUri, Path, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{
@@ -24,21 +25,24 @@ use mediahub_app::{
     DeleteObjectReceipt, DeleteObjectRequest, NewS3MultipartPart, NewS3MultipartUpload,
     NewS3ObjectLock, ObjectStore, ObjectStoreError, PrepareClaimedUploadCommitRequest,
     PutObjectLegalHoldRequest, PutObjectRetentionRequest, PutObjectTaggingRequest, RepositoryError,
-    S3BucketIdentity, S3BucketPolicyDocument, S3BucketPolicyRepository, S3BucketRepository,
-    S3DeleteLockReason, S3ListingRepository, S3MultipartAbort, S3MultipartCompletionClaim,
-    S3MultipartManifest, S3MultipartManifestError, S3MultipartPartPut, S3MultipartRepository,
-    S3MultipartUpload, S3MultipartUploadListQuery, S3MultipartUploadPage, S3MultipartUploadState,
-    S3ObjectListItem, S3ObjectListQuery, S3ObjectPage, S3ObjectRepository, S3ObjectRequest,
-    S3ObjectService, S3ObjectServiceError, S3ObjectVersionListQuery, S3ObjectVersionPage,
-    S3UploadIntentRepository, StorageGcRepository, StreamingUploadError, is_lowercase_md5_hex,
+    S3AuthorizationOutcome, S3AuthorizationPrincipal, S3AuthorizationRequest,
+    S3AuthorizationService, S3BucketIdentity, S3BucketPolicyDocument, S3BucketPolicyRepository,
+    S3BucketRepository, S3DeleteLockReason, S3IdentityPolicyRepository, S3ListingRepository,
+    S3MultipartAbort, S3MultipartCompletionClaim, S3MultipartManifest, S3MultipartManifestError,
+    S3MultipartPartPut, S3MultipartRepository, S3MultipartUpload, S3MultipartUploadListQuery,
+    S3MultipartUploadPage, S3MultipartUploadState, S3ObjectListItem, S3ObjectListQuery,
+    S3ObjectPage, S3ObjectRepository, S3ObjectRequest, S3ObjectService, S3ObjectServiceError,
+    S3ObjectVersionListQuery, S3ObjectVersionPage, S3SignedPrincipal, S3UploadIntentRepository,
+    StorageGcRepository, StreamingUploadError, is_lowercase_md5_hex,
 };
 use mediahub_core::{
     ApplicationId, Bucket, BucketId, Checksum, ChecksumAlgorithm, DefaultRetention,
     DefaultRetentionPeriod, EntityTag, MAX_S3_POLICY_BYTES, NewStorageGcTask, ObjectRetention,
     ObjectVersion, ObjectVersionPayload, OffsetDateTime, RetentionMode, S3Bucket, S3BucketPolicy,
-    S3ObjectTag, S3ObjectTagSet, S3VersionId, StorageGcReason, StorageGcTaskId,
-    StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
-    Visibility,
+    S3IdentityPolicy, S3IdentityPolicyRequest, S3ObjectTag, S3ObjectTagSet, S3PolicyAction,
+    S3PolicyDecision, S3PolicyQuery, S3PolicyResourceScope, S3VersionId, StorageGcReason,
+    StorageGcTaskId, StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState,
+    VersioningStatus, Visibility,
 };
 use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
@@ -72,6 +76,7 @@ const S3_MULTIPART_COMPLETION_LEASE_SECONDS: i64 = 5 * 60;
 include!("s3_http_bucket.rs");
 include!("s3_http_configuration.rs");
 include!("s3_http_policy.rs");
+include!("s3_data_authorization.rs");
 include!("s3_http_tagging.rs");
 include!("s3_http_object_lock.rs");
 include!("s3_http_object_version_lock.rs");
@@ -103,3 +108,5 @@ include!("s3_http_copy_tests.rs");
 include!("s3_http_tagging_tests.rs");
 #[cfg(test)]
 include!("s3_http_listing_tests.rs");
+#[cfg(test)]
+include!("s3_data_authorization_tests.rs");
