@@ -73,6 +73,8 @@ pub(super) async fn run_lifecycle_worker(repository: PostgresRepository, object_
         repository.clone(),
         SystemClock,
     );
+    let s3_lifecycle = S3LifecycleService::new(repository.clone(), SystemClock);
+    let mut s3_lifecycle_cursor = S3LifecycleBatchCursor::default();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
@@ -84,6 +86,22 @@ pub(super) async fn run_lifecycle_worker(repository: PostgresRepository, object_
         match repository.expire_multipart_uploads(now, 100).await {
             Ok(_) => {}
             Err(error) => warn!(error = %error, "S3 multipart expiry scan failed"),
+        }
+        match s3_lifecycle.run_batch(s3_lifecycle_cursor, 100).await {
+            Ok(receipt) => {
+                s3_lifecycle_cursor = receipt.next_cursor;
+                if receipt.applied > 0 || receipt.locked > 0 || receipt.retries > 0 {
+                    info!(
+                        examined = receipt.examined,
+                        applied = receipt.applied,
+                        skipped = receipt.skipped,
+                        locked = receipt.locked,
+                        retries = receipt.retries,
+                        "S3 lifecycle batch completed"
+                    );
+                }
+            }
+            Err(error) => warn!(error = %error, "S3 lifecycle batch failed"),
         }
         match repository.list_expired_media(now, 100).await {
             Ok(media) => {

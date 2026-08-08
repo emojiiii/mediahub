@@ -141,7 +141,7 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 - 不复制 Silo 的 AGPL 实现。
 - 不恢复旧 `/s3` 路由、旧 schema 或旧品牌兼容层。
 - 视频 Variant 继续留给独立异步服务与队列。
-- Policy、完整 Lifecycle 执行器、Notification/CORS/SSE 等未在本切片完成的能力必须明确列为剩余差距，不伪装为已支持。
+- 该阶段未完成的 Policy、Lifecycle、Notification/CORS/SSE 必须明确披露；后续 Lifecycle 核心执行器已进入独立纵向切片，历史记录不冒充当时已支持。
 
 ---
 
@@ -193,3 +193,105 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 - [completed] 完成对象预览上一项/下一项、位置计数、方向键与状态隔离。
 - [completed] Rust 全工作区、PG17、严格 Clippy/Fmt、前端 182/182、OpenAPI 和生产构建统一回归。
 - [completed] 更新产品/修改文档并创建第三个本地检查点；保持不 push。
+
+---
+
+# 标准 S3 Lifecycle 执行器纵向切片（2026-08-08）
+
+## 目标
+
+基于干净提交 `2d512fd`，复用现有 `S3LifecycleConfiguration`、`ObjectVersion`、`delete_s3_object`、GC 和 Object Lock 事务边界，实现有界、幂等、竞争安全且不扫描对象存储的数据生命周期执行器；不 commit、不 push。
+
+## 阶段
+
+- [completed] 1. 审计 worker、Lifecycle 配置 revision、对象删除/Multipart 清理与 Object Lock 事务边界
+- [completed] 2. 定义 Lifecycle 扫描候选、执行命令、时钟与 Memory/PostgreSQL repository 端口
+- [completed] 3. 实现 current expiration、noncurrent expiration、expired delete marker 与 multipart abort
+- [completed] 4. 接入有界 worker，并补齐 fake clock、表驱动、竞争/配置变更/Object Lock 测试
+- [completed] 5. 执行真实 PostgreSQL 17 contract、全量相关 tests、strict clippy/fmt/diff 并精确清理容器
+
+## 约束与关键不变量
+
+- 仅参考 `.research/silo` 的行为、模块边界和测试思路，不复制 AGPL 代码。
+- 不编辑 `web`、`readme.md`、`docs/s3-compatibility.md`、`scripts`；不 commit、不 push。
+- 扫描只产生候选；执行必须在同一事务重检配置 revision、current/exact version 与 Object Lock/Legal Hold。
+- Lifecycle 永不 bypass Governance；竞争或配置变化只能安全 skip/retry，不能删除新 head。
+- GC reason 必须使用 `LifecycleExpiration`；worker 有界、幂等且不得扫描对象存储。
+- 现有普通 DeleteObject 语义保持不变；Lifecycle 使用独立候选/执行命令，但内部复用相同的版本隐藏、head 迁移、Object Lock 与 GC 入队原语。
+- 先完成可编译纵向切片再扩充测试：App、PostgreSQL test target 与 Server binary 已分别编译通过。
+
+## 终态并发安全复审
+
+- [completed] 只读复审确认配置 revision、head/exact-version fencing、Object Lock 与 GC 原子性基本正确。
+- [completed] 统一 Lifecycle Multipart Abort 与 Complete 的 `upload → intent → bucket` 锁顺序，消除 ABBA 死锁。
+- [completed] 将单 key 全版本无界锁改为 action 所需的精确版本锁，并优化候选索引。
+- [completed] 让 scan/query 本身消耗 batch 预算并改善 current/noncurrent/multipart/bucket 公平性。
+- [completed] 补齐普通 Days/Date Expiration 清理到期 sole delete marker 与 UTC 午夜 marker 时间。
+- [pending] 对 S3 全链路 quota 事实做独立闭环；禁止只在 Lifecycle 删除侧单边扣减。
+- [completed] 完成独立 PG17、workspace、Clippy、fmt、diff 复验。
+- [completed] 创建本地提交，不 push。
+
+## 错误记录
+
+| 错误 | 尝试 | 处理 |
+|---|---:|---|
+| Windows PowerShell 未展开传给 `rg` 的 `crates/.../src/*.rs` 通配符 | 1 | 改用目录参数配合 `rg -g '*.rs'`，不重复原命令 |
+| 并行只读聚合中一个 `rg` 无匹配返回 1，包装器中止其余输出 | 1 | 后续将无匹配返回码 1 视为正常，并拆分为确定文件/行段读取 |
+| App test target 首次编译缺少 Memory Lifecycle 的 `StorageGcTaskId` import | 1 | 补充 core 类型 import 后重新编译，不改设计 |
+| worker 模块检索命令的 PowerShell 双引号转义不完整 | 1 | 改用单引号固定文本检索，不重复原转义形式 |
+| worker 接线补丁命中后方 `match`，Lifecycle block 被插入 stale-upload match 内 | 1 | 读取精确行段后移除误插块，并插入主 lifecycle loop 的 Multipart expiry 之后 |
+| Fake Clock 测试模块缺少 `S3LifecycleConfiguration` import | 1 | 只补测试 import 后重跑针对性测试 |
+| 补测试 import 的首个 patch 含空 hunk，校验失败 | 1 | 删除空 hunk，使用单一有效上下文重新应用 |
+| batch cursor 修正 patch 再次误带空 hunk | 1 | 移除空 hunk，并在后续 patch 中禁止无上下文的文件切换 |
+| PG lib 旧静态测试只截取 `delete_lock_reason`，重构后锁逻辑位于 `delete_lock_reason_at` | 1 | 更新静态断言检查共享 helper；运行时 PG17 contract 已通过 |
+| Server `lifecycle` 过滤词额外命中无关认证测试，因缺 `DATABASE_URL` 失败 | 1 | 精确过滤 `s3_http::s3_lifecycle`；全量回归显式设置临时 PG17 URL |
+| 首次 `cargo fmt --check` 报告新文件标准格式差异 | 1 | 运行 `cargo fmt --all` 做机械格式化后重检 |
+| 最终范围守卫发现工作期间出现并发 `docs/s3-compatibility.md` / `scripts/s3-compat/**` 改动 | 1 | 确认本切片未编辑这些文件；不回退并发成果，最终单独披露；Lifecycle 自有文件范围继续审计 |
+| 新增 Memory 分支测试使用了旧 helper 未内置 MD5 的新字节串 | 1 | 改用现有 `null-version` 固定向量后重跑；失败发生在 Lifecycle 执行前 |
+
+---
+
+# PostgreSQL S3 Lifecycle 事务安全与资源边界修复（2026-08-08）
+
+## 目标
+
+在不提交、不推送且保留共享工作区改动的前提下，修复 PostgreSQL Lifecycle 执行器的 Multipart 锁序、精确版本锁、配额一致性与 SQL 有界性，并以真实 PostgreSQL contract 验证。
+
+## 阶段
+
+- [completed] 1. 审计 Complete/Abort 锁序、Application quota 与现有删除原语
+- [completed] 2. 重构 Lifecycle 事务为按 action 精确锁定并消除 ABBA
+- [completed] 3. 实现可证明的 used/reserved quota 对账或记录阻塞证据
+- [completed] 4. 对齐候选查询与 0013 索引，补充 PostgreSQL contract
+- [completed] 5. 运行 targeted PG17、fmt、clippy 与差异检查
+
+## 写入约束
+
+- 业务源码限定 `crates/mediahub-adapter-postgres/src/s3_lifecycle.rs`、`migrations/0013_s3_lifecycle_executor.sql`、`tests/s3_lifecycle_contract.rs`。
+- quota 若必须修改同 crate 其他文件，先向用户说明证据和必要性；本轮不会 commit/push。
+- 共享工作区已有未提交改动全部保留，不回退他人文件。
+
+## 已确认决策
+
+- Multipart Lifecycle 严格遵循既有 Complete 的 `upload -> attached intent -> bucket -> cleanup` 锁序；bucket 锁后再次验证配置 revision 与 rule。
+- Object Lifecycle 保持 `bucket -> object`，但每个 action 只锁精确 current/exact/null/marker；不再加载全部历史。
+- 当前 S3 全写入链路未接入 Application quota，本轮不修改 quota；以 contract 证明 Lifecycle 前后 `used_bytes/reserved_bytes` 不漂移，并记录完整 S3 quota 为下一切片 blocker。
+
+## 错误记录
+
+| 错误 | 尝试 | 处理 |
+|---|---:|---|
+| 并行检索中某个 `rg` 无匹配返回 1，导致聚合调用整体无输出 | 2 | 第一次后 quota 检索已归一化；第二次遗漏。后续所有混合聚合改用 `Promise.allSettled`，不再依赖每条命令退出码 |
+| 首次 PostgreSQL adapter 编译发现新 SQL 中 `COLLATE "C"` 的 Rust 字符串引号未转义，并暴露精确锁返回 owned version 后的 7 处借用遗漏 | 1 | 改为转义 SQL identifier，并在调用既有 helper 时显式借用；不改变事务设计 |
+| 同时更新 plan/progress 的补丁因 progress 行内空格上下文不精确而整体未应用 | 1 | 用 `rg` 读取精确文本后拆分补丁，避免重复原上下文 |
+| 首次 `docker exec psql -c` EXPLAIN 被 Windows 参数传递剥离 `COLLATE "C"` 的 identifier 引号 | 1 | 索引定义已成功核对；EXPLAIN 改为经 stdin 传 SQL，避免命令行引号重解释 |
+| 最终范围检索再次把“预期无匹配”的 `rg` 放入 `Promise.all`，导致聚合无输出 | 3 | 立即改用 `Promise.allSettled`；此后不再并行聚合任何可能返回 1 的裸 `rg` |
+
+## 验证记录
+
+- 一次性 PostgreSQL 17 fresh migration 成功。
+- `s3_lifecycle_contract` 1/1 通过，新增覆盖：Complete-like upload-first 锁序无 ABBA、锁住无关 sibling 不阻塞 exact noncurrent 删除、特殊字符 prefix 精确匹配、current/noncurrent/marker/multipart/idempotent 全程 quota sentinel 不漂移。
+- final fresh migration 上 `s3_lifecycle_contract` 再次 1/1 通过，并覆盖 intent/bucket 顺序、UTC marker 动作时间与普通 Days/Date sole marker 到期前后语义。
+- `EXPLAIN` 在禁用顺序扫描时确认 current、noncurrent、marker、multipart 与 lifecycle bucket 查询均使用 0013 索引；prefix 改为 Unicode 安全的 C-collation 半开区间后，current/marker 计划不再出现 LIMIT 前 Sort。
+- 最终验证：App Lifecycle 4/4、PG adapter lib 28/28、PG17 Lifecycle contract 1/1、Server binary check、adapter all-target strict Clippy、workspace fmt check、git diff check 全部通过。
+- 临时 PostgreSQL 17 容器使用 tmpfs、无 volume，已按精确名称删除；本轮未 commit、未 push。

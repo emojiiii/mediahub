@@ -19,8 +19,9 @@
 | Put/Get/Head/Copy | 核心完成 | SigV4 顺序、流式写入、SHA-256 + MD5、Content-MD5、单 Range、条件请求、metadata、版本响应头、CopyObject | 更多 checksum；外部 S3 Full GET/Copy 改成真正端到端流式读取 |
 | List/Delete | 核心完成 | ListObjectsV2 与 ListObjectVersions 的分页/marker/prefix/delimiter；DeleteObject/DeleteObjects 的 marker/null/lock/GC 语义 | ListObjectsV1 与更多 golden/客户端测试 |
 | Multipart | 核心完成 | Create/UploadPart/ListParts/Complete/Abort/ListMultipartUploads/UploadPartCopy；Part MD5、标准 multipart ETag、恢复与重放、ObjectVersion 原子提交、持久 GC | 真实客户端并发与故障注入矩阵 |
+| Application Quota | 部分完成 | JSON/原生上传链路已有 `used_bytes/reserved_bytes` 账本 | S3 Put/Multipart/Copy/覆盖/null replacement/永久删除必须作为独立纵向切片一次性接入，禁止只在 Lifecycle 删除侧扣减 |
 | Bucket 配置 | 部分完成 | List/Create/Head/Delete/GetLocation；Versioning GET/PUT；Lifecycle GET/PUT/DELETE；Object Lock GET/PUT/CreateBucket header 与不可逆约束 | Policy、CORS、Notification、Bucket Tagging |
-| Lifecycle | 部分完成 | 配置 schema、parser、validator 与 Multipart 过期回收 | 完成基于 ObjectVersion 的 Expiration/Noncurrent/ExpiredMarker 执行器 |
+| Lifecycle | 核心完成 | 配置 schema/parser/validator；ObjectVersion Expiration、Noncurrent Expiration、Expired Marker、Multipart Abort；事务复检、Object Lock 与持久 GC | 标签/大小过滤、Transition、性能与多实例 soak 矩阵 |
 | Object Lock | 核心完成 | Bucket 配置、默认 Retention、PutObject 锁头、对象 Retention/Legal Hold GET/PUT、签名 Governance bypass、不可逆 Versioning 约束与删除事务保护 | CopyObject/Multipart 显式锁头支持与 native-client 矩阵 |
 | Object Tagging | 核心完成 | 当前/精确版本 GET/PUT/DELETE；独立版本标签表；PutObject、Copy COPY/REPLACE、Multipart 冻结与 TagCount | Bucket Tagging、标签条件 Policy/Lifecycle、真实 AWS CLI endpoint 回归 |
 | Policy/Auth | 未完成 | 现有 SigV4 和 Application 授权边界继续工作 | 替换固定权限为标准 S3 Policy evaluator |
@@ -33,6 +34,7 @@
 - PostgreSQL Repository Contract：1/1 通过。
 - Server 全量测试：lib 8/8、server 165/165 通过，包含真实 PostgreSQL 的 SigV4 S3、WebDAV、Object Tagging 和不可变版本预览用例。
 - PostgreSQL Repository、S3 列表、Bucket Object Lock、ObjectVersion Lock 与 Object Tagging 合同：各 1/1 通过。
+- PostgreSQL Lifecycle 合同 1/1、App 52/52 通过；覆盖 Enabled/Suspended/Unversioned、配置与 head 竞争、Retention、GC、Multipart 锁序、公平预算和普通 Expiration marker。
 - Silo `docker.io/pgsty/silo:latest`：真实 ObjectStore 与 Presigned PUT 合同 1/1 通过。
 - 真实测试修复了两个仅靠静态检查无法发现的问题：PostgreSQL constraint 自动命名冲突/NUL 检查，以及 generic S3 create-only copy 的能力差异。
 
@@ -1977,7 +1979,7 @@ crates/mediahub-server/tests/s3/
 
 验收：锁定版本在用户、Lifecycle 和 GC 路径均不会被提前物理删除。
 
-### Phase 6：Lifecycle 有限子集
+### Phase 6：Lifecycle 有限子集（核心纵向闭环已完成）
 
 - parser/validator/evaluator；
 - Expiration、NoncurrentVersionExpiration、ExpiredObjectDeleteMarker、AbortIncompleteMultipartUpload；

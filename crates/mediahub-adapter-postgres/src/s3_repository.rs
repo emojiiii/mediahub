@@ -1288,16 +1288,24 @@ fn delete_lock_reason(
     version: &ObjectVersion,
     command: &DeleteS3ObjectCommand,
 ) -> Option<S3DeleteLockReason> {
+    delete_lock_reason_at(version, command.deleted_at, command.bypass_governance)
+}
+
+pub(crate) fn delete_lock_reason_at(
+    version: &ObjectVersion,
+    deleted_at: OffsetDateTime,
+    bypass_governance: bool,
+) -> Option<S3DeleteLockReason> {
     if version.legal_hold() {
         return Some(S3DeleteLockReason::LegalHold);
     }
     let retention = version.retention()?;
-    if retention.retain_until() <= command.deleted_at {
+    if retention.retain_until() <= deleted_at {
         return None;
     }
     match retention.mode() {
         RetentionMode::Compliance => Some(S3DeleteLockReason::ComplianceRetention),
-        RetentionMode::Governance if !command.bypass_governance => {
+        RetentionMode::Governance if !bypass_governance => {
             Some(S3DeleteLockReason::GovernanceRetention)
         }
         RetentionMode::Governance => None,
@@ -1327,7 +1335,7 @@ fn explicit_delete_gc_task(
     })
 }
 
-async fn mark_current_version_noncurrent(
+pub(crate) async fn mark_current_version_noncurrent(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     object: &S3Object,
     changed_at: OffsetDateTime,
@@ -1354,7 +1362,7 @@ async fn mark_current_version_noncurrent(
     }
 }
 
-async fn update_deleted_object_head(
+pub(crate) async fn update_deleted_object_head(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     object: &S3Object,
     current_version_id: Option<ObjectVersionId>,
@@ -1379,7 +1387,7 @@ async fn update_deleted_object_head(
     }
 }
 
-async fn advance_object_to_delete_marker(
+pub(crate) async fn advance_object_to_delete_marker(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     object: &S3Object,
     marker: &ObjectVersion,
@@ -1414,7 +1422,7 @@ async fn advance_object_to_delete_marker(
     }
 }
 
-async fn hide_exact_deleted_version(
+pub(crate) async fn hide_exact_deleted_version(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     version: &ObjectVersion,
     deleted_at: OffsetDateTime,
@@ -1444,6 +1452,18 @@ async fn enqueue_explicit_delete_gc_task(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     task: &NewStorageGcTask,
 ) -> Result<(), RepositoryError> {
+    if task.reason != StorageGcReason::ExplicitDelete {
+        return Err(RepositoryError::Invariant(
+            "explicit delete GC task has the wrong reason".into(),
+        ));
+    }
+    enqueue_object_version_gc_task(transaction, task).await
+}
+
+pub(crate) async fn enqueue_object_version_gc_task(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: &NewStorageGcTask,
+) -> Result<(), RepositoryError> {
     insert_storage_gc_task(transaction, task).await?;
     let row = sqlx::query(
         "SELECT * FROM storage_gc_tasks WHERE storage_backend = $1 AND storage_key = $2",
@@ -1462,7 +1482,7 @@ async fn enqueue_explicit_delete_gc_task(
         && persisted.multipart_upload_id.is_none()
         && persisted.storage_backend == task.storage_backend
         && persisted.storage_key == task.storage_key
-        && persisted.reason == StorageGcReason::ExplicitDelete
+        && persisted.reason == task.reason
     {
         Ok(())
     } else {
@@ -2498,7 +2518,7 @@ impl StorageGcRepository for PostgresRepository {
         Ok(failed)
     }
 }
-async fn insert_object_version(
+pub(crate) async fn insert_object_version(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     version: &ObjectVersion,
 ) -> Result<(), RepositoryError> {
@@ -2887,7 +2907,7 @@ async fn lock_active_null_version(
         .transpose()
 }
 
-async fn supersede_active_null_version(
+pub(crate) async fn supersede_active_null_version(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     active_null: Option<&ObjectVersion>,
     superseded_at: OffsetDateTime,
@@ -3378,7 +3398,7 @@ fn parse_storage_gc_task_state(value: &str) -> Result<StorageGcTaskState, Reposi
         _ => Err(invariant("persisted storage GC state is invalid")),
     }
 }
-fn row_to_s3_bucket(row: PgRow) -> Result<S3Bucket, RepositoryError> {
+pub(crate) fn row_to_s3_bucket(row: PgRow) -> Result<S3Bucket, RepositoryError> {
     let configuration = row_to_s3_configuration(&row)?;
     S3Bucket::from_persistence(PersistedS3Bucket {
         id: BucketId::from_uuid(row.try_get("id").map_err(database_error)?),
@@ -3425,7 +3445,7 @@ fn row_to_s3_configuration(row: &PgRow) -> Result<BucketS3Configuration, Reposit
     .map_err(invariant)
 }
 
-fn row_to_s3_object(row: PgRow) -> Result<S3Object, RepositoryError> {
+pub(crate) fn row_to_s3_object(row: PgRow) -> Result<S3Object, RepositoryError> {
     S3Object::from_persistence(PersistedS3Object {
         id: ObjectId::from_uuid(row.try_get("id").map_err(database_error)?),
         application_id: ApplicationId::from_uuid(
@@ -3444,7 +3464,7 @@ fn row_to_s3_object(row: PgRow) -> Result<S3Object, RepositoryError> {
     .map_err(invariant)
 }
 
-fn row_to_object_version(row: PgRow) -> Result<ObjectVersion, RepositoryError> {
+pub(crate) fn row_to_object_version(row: PgRow) -> Result<ObjectVersion, RepositoryError> {
     let is_delete_marker: bool = row.try_get("is_delete_marker").map_err(database_error)?;
     let payload = if is_delete_marker {
         ObjectVersionPayload::DeleteMarker
@@ -3731,8 +3751,18 @@ mod tests {
     #[test]
     fn delete_lock_and_gc_helpers_bind_the_exact_version_storage_target() {
         let source = include_str!("s3_repository.rs");
+        let wrapper = source
+            .split("fn delete_lock_reason(")
+            .nth(1)
+            .expect("delete lock wrapper")
+            .split("pub(crate) fn delete_lock_reason_at")
+            .next()
+            .expect("delete lock wrapper boundary");
+        assert!(wrapper.contains("delete_lock_reason_at"));
+        assert!(wrapper.contains("command.bypass_governance"));
+        assert!(wrapper.contains("command.deleted_at"));
         let lock = source
-            .split("fn delete_lock_reason")
+            .split("pub(crate) fn delete_lock_reason_at")
             .nth(1)
             .expect("delete lock helper")
             .split("fn explicit_delete_gc_task")
@@ -3741,8 +3771,8 @@ mod tests {
         assert!(lock.contains("version.legal_hold()"));
         assert!(lock.contains("RetentionMode::Compliance"));
         assert!(lock.contains("RetentionMode::Governance"));
-        assert!(lock.contains("command.bypass_governance"));
-        assert!(lock.contains("retention.retain_until() <= command.deleted_at"));
+        assert!(lock.contains("!bypass_governance"));
+        assert!(lock.contains("retention.retain_until() <= deleted_at"));
 
         let gc = source
             .split("fn explicit_delete_gc_task")

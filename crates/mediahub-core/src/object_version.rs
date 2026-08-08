@@ -462,6 +462,20 @@ impl ObjectVersion {
         self.became_noncurrent_at
     }
 
+    /// Updates the mutable chronology fact maintained by the object-head
+    /// transaction while preserving immutable version identity and payload.
+    pub fn with_became_noncurrent_at(
+        &self,
+        became_noncurrent_at: Option<OffsetDateTime>,
+    ) -> Result<Self, S3ModelError> {
+        if became_noncurrent_at.is_some_and(|value| value < self.created_at) {
+            return Err(S3ModelError::InvalidObjectVersionPayload);
+        }
+        let mut updated = self.clone();
+        updated.became_noncurrent_at = became_noncurrent_at;
+        Ok(updated)
+    }
+
     /// Freezes Object Lock metadata while creating a committed data version.
     /// Immutable payload facts and identity are preserved.
     pub fn with_initial_object_lock(

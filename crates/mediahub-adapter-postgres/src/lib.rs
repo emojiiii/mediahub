@@ -8,6 +8,7 @@ mod data_plane;
 mod idempotency;
 mod media;
 mod outbox;
+mod s3_lifecycle;
 mod s3_multipart;
 mod s3_repository;
 mod short_links;

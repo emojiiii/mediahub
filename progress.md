@@ -123,3 +123,67 @@
 - 对象预览加入上一项/下一项、当前位置与左右方向键；切换对象会隔离签名 URL、Variant、缩放和错误状态，输入控件与 Variant 面板不被方向键劫持。
 - 主代理统一回归：Rust 全工作区全部 targets 通过，Server 165/165，PG Repository/Listing/Bucket Lock/ObjectVersion Lock/Object Tagging 合同各 1/1；严格 Clippy/Fmt 通过。
 - 前端 34 个测试文件、182/182 通过，OpenAPI 50 paths/74 operations/491 references、类型检查、生产构建与 viewer chunk 验证通过。
+
+## 标准 S3 Lifecycle 执行器纵向切片（2026-08-08）
+
+- 已运行 planning session catchup，并确认干净基线 `2d512fd`，未 commit、未 push。
+- 已创建本切片计划，开始只读审计 worker、Lifecycle 配置、对象删除、GC、Object Lock 与 Multipart 清理边界。
+- 初始检索确认 Core 已有 Lifecycle 配置模型、ObjectVersion noncurrent 时间、Lifecycle GC reason；尚无标准对象 Lifecycle worker。
+- 已确认现有 worker 只处理 legacy Media lifecycle 和全局 Multipart TTL；标准 S3 Lifecycle 将作为独立有界 pass 接入，并继续由持久 GC worker 删除底层 blob。
+- 已确认 Bucket S3 configuration revision 可直接用作执行 fence，Multipart 也已有事务化 abort+GC 清理原语。
+- 已完成第一阶段事务审计：确定 Lifecycle 采用“有界 scan candidate → 专用 transaction execute → 既有持久 GC worker”三段式，不直接调用外部 DeleteObject 命令。
+- 已开始定义 repository DTO：current candidate 带 expected current/version/config revision，exact candidate 带内部 version id/noncurrent timestamp，multipart candidate 带 upload id/initiation/config revision。
+- 一次只读 helper 检索因 PowerShell 文件通配符未展开而失败，已记录并切换为 `rg -g`；未产生源码修改。
+- 第二次只读聚合被 `rg` 的正常“无匹配”退出码中止，已记录；改为确定文件读取后直接进入实现。
+- 已新增可编译的 App 生命周期端口、候选/命令/outcome、UTC 日边界 helper 和有界 `S3LifecycleService`；`cargo check -p mediahub-app` 通过。
+- Service 已支持 Enabled+Prefix、current Days/Date、noncurrent Days、expired marker、multipart abort、跨规则去重、配置 revision command fence 与 bucket cursor。
+- 已补齐 Memory Lifecycle repository、真实 lifecycle configuration revision 更新、对象/版本执行与 LifecycleExpiration GC；首次 test-target 编译只发现一个缺失 import，已修复。
+- 已完成 PostgreSQL metadata-only 候选查询、同事务配置/current/exact/Object Lock 重检、LifecycleExpiration GC、expired marker 与 Multipart abort；`cargo check -p mediahub-adapter-postgres --tests` 一次通过。
+- 新增 `0013_s3_lifecycle_executor.sql` 元数据索引；未扫描对象存储。
+- Server worker 已接入有界 S3 Lifecycle batch 与内存 cursor；首次补丁误命中后方 match，已按精确行段移动到主循环。
+- 可编译完整纵向切片已交付：App、PostgreSQL `--tests` 和 Server binary 均编译通过；现在进入 Fake Clock、表驱动与真实 PG17 竞争合同阶段。
+- 已新增 UTC 日边界表驱动测试和 Fake Clock 有界 batch 测试；首次编译只缺测试类型 import，已修复。
+- App Lifecycle 针对性测试 2/2 通过；剩余一个 Memory multipart seed dead-code warning 将由 Memory 执行测试消除。
+- Memory Lifecycle current expiration + Multipart cleanup 端到端测试 1/1 通过，dead-code warning 已消除。
+- 新增真实 PostgreSQL contract，`--no-run` 编译通过；临时 PG17 使用 tmpfs 与随机回环端口 `127.0.0.1:49415`，容器名 `prismark-lifecycle-pg17-codex`。
+- 真实 PostgreSQL 17 Lifecycle contract 1/1 通过，覆盖 current/noncurrent/sole marker/Multipart/idempotency/config revision/current head/Object Lock 延长。
+- 修正 batch 在“恰好耗尽 limit”时的 bucket cursor：保留当前 bucket 以便下一批继续剩余 action，避免恰逢满页时跳过该 bucket 后续规则。
+- App 全量 48/48、PG17 Lifecycle contract 1/1、Core Lifecycle 3/3 通过。
+- PostgreSQL lib 27/28 通过；唯一失败是旧源码静态断言未跟随共享 Object Lock helper 重构，待更新后重跑。Server lifecycle filter 因失败即停尚未执行。
+- PostgreSQL lib 修复后 28/28 通过；Server S3 Lifecycle parser/schema 7/7 通过。宽泛过滤另命中一个缺 `DATABASE_URL` 的无关认证测试，已改为精确过滤策略。
+- 精确 Server Lifecycle parser/schema 7/7 通过，transition/tag filter 等不支持能力仍在 PUT 阶段显式拒绝。
+- 首次 fmt check 仅有标准排版差异，准备运行 workspace formatter。
+- `cargo fmt --all` 已执行，随后 `cargo fmt --all -- --check` 通过。
+- 全工作区 strict Clippy `cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- Worker/Fake Clock/Memory/PG17/配置竞争/current race/Object Lock 延长测试阶段完成，进入全工作区串行回归与最终清理。
+- 全工作区 `cargo test --workspace --all-targets -- --test-threads=1` 通过：Server 165/165、App 48/48、Core 54/54、PG adapter 28/28，全部 PG contracts（含 Lifecycle 1/1）通过；真实外部 S3 contract 按既有条件保持 ignored。
+- `git diff --check` 通过。范围守卫检测到任务期间由并发工作新增的兼容文档/脚本改动；本切片未触碰，也不会回退或纳入 Lifecycle 修改清单。
+- 新增 Unversioned/Suspended Lifecycle delete 语义测试；首次运行因旧测试 helper 缺新内容的 MD5 向量而失败，已改用既有固定向量。
+- 补充后 App 全量 49/49 通过，明确覆盖 Date due/future、Unversioned 与 Suspended 生命周期删除语义。
+- 最终 workspace strict Clippy、fmt check、`git diff --check` 再次通过。
+- 临时 PostgreSQL 17 容器 `prismark-lifecycle-pg17-codex` 已按精确名称删除；使用 tmpfs，未创建匹配卷。
+- 终态审阅补齐 Memory stale-completing attached-intent 清理；Memory Lifecycle 2/2、App Lifecycle planner 2/2、App strict Clippy 通过。
+- 最终 App 全量 49/49、workspace strict Clippy、fmt check、`git diff --check` 通过；没有重新创建测试容器。
+
+## PostgreSQL Lifecycle 事务安全与资源边界修复（2026-08-08）
+
+- 已确认 S3 Put、Multipart commit 与 S3 delete 均未维护 `applications.used_bytes/reserved_bytes`；依用户补充约束，本轮不单边修改 quota，完整 S3 quota 记为独立下一切片。
+- 已把 Multipart Lifecycle 执行改为 `upload FOR UPDATE -> bucket FOR SHARE -> revision/rule recheck -> abort/cleanup`，与 CompleteMultipartUpload 的 upload-first 顺序一致，消除已识别 ABBA。
+- 已移除 Lifecycle 的全历史 `fetch_all + FOR UPDATE`；current/noncurrent/null/marker 均按 ID 或唯一 null version 精确锁，EODM 在 object head 锁下用存在性查询确认没有 sibling。
+- PostgreSQL adapter test target 已通过编译；首次编译发现 SQL identifier 转义与 owned version 借用问题，已定向修复。
+- 0013 已新增 lifecycle bucket partial index，并按 tenant/state/order 调整 current/noncurrent/marker/multipart 索引；候选 prefix 改用转义 LIKE，避免 `LEFT(...)` 阻断 pattern index。
+- 一次性 PostgreSQL 17 fresh migration 与真实 `s3_lifecycle_contract` 1/1 通过；竞争合同确认 Complete-like 事务持有 upload 时仍可立即取得 bucket，Lifecycle 随后恢复并完成 abort。
+- 精确锁合同在无关 active sibling 被另一个事务 `FOR UPDATE` 持有期间仍完成目标 noncurrent 删除；特殊 `%`、`_`、反斜杠 prefix 合同通过；quota sentinel 在全部动作和幂等重跑后保持不变。
+- 根据集成反馈，PG marker 创建时间、前版本 noncurrent 时间和 object 更新时间已统一为 UTC 当日 00:00；eligibility/Object Lock 和永久删除仍使用实际 evaluated_at。
+- PG 已显式 override 普通 Expiration marker 候选：Days 下推 marker cutoff，Date 到期前返回空，显式 EODM 即时候选；执行期锁 marker 后用 `_at` helper 二次复检。
+- Multipart helper 已拆出 attached intent prelock 与“使用已锁 intent 清理”原语；Lifecycle 现在严格按 `upload -> intent -> bucket -> cleanup`，并新增 intent/bucket 竞争合同。
+- Prefix 进一步从转义 LIKE 改为 Unicode scalar 安全的 C-collation 半开区间；0013 object prefix index 改用默认 C 排序 opclass并 include current pointer。真实 EXPLAIN 的 current/marker 计划已无 LIMIT 前 Sort，noncurrent/multipart 也沿时间顺序 partial index。
+- 最终门禁通过：App Lifecycle 4/4、PG adapter lib 28/28、fresh PG17 Lifecycle contract 1/1、Server binary check、adapter all-target strict Clippy、workspace fmt check、git diff check。
+- 测试 PostgreSQL 17 容器采用 tmpfs 且无 volume，已按精确名称删除；未 commit、未 push。
+- 主代理终态语义审计修正 UTC Days cutoff 为 `start_today - days` 且严格 `<`；并修正 Enabled current Expiration，使受保护 data version 仍可创建 delete marker，受保护 noncurrent exact version 才返回 `Locked`。
+- 独立只读并发审计发现并阻止了提前提交：Lifecycle Abort/Multipart Complete 存在反向锁序，planner 的空扫描不消耗预算且会饥饿后续 action，PostgreSQL target 会无界锁定单 key 全部活跃版本。
+- 审计同时确认普通 Days/Date Expiration 还应清理到期 sole delete marker，Lifecycle marker 时间应归一到动作日 UTC 00:00；这些问题已拆为两个不重叠子任务并发修复。
+- Quota 检查确认当前 S3 ObjectVersion 上传/提交整体尚未完整接入 `applications` 计量；本轮禁止只在 Lifecycle 侧单边扣减，完整 S3 quota 将作为独立纵向切片处理。
+- 主代理使用全新 `postgres:17-alpine` tmpfs 容器独立复验：Lifecycle contract 1/1 通过；全 workspace 所有 targets 通过，App 52/52、Server 165/165、PG adapter 28/28，全部 PG contracts 各 1/1。
+- 主代理再次完成 `cargo clippy --workspace --all-targets -- -D warnings`、workspace fmt check、raw SigV4 offline golden 与 `git diff --check`；仅有既有 Windows linker 信息提示。
+- 主代理创建的容器 `prismark-lifecycle-pg17-main-0808b` 已按精确名称删除；使用 tmpfs、无匹配 volume。

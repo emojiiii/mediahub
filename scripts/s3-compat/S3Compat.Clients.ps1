@@ -9,6 +9,7 @@ $script:AwsOperations = @(
     'Versioning.DeleteMarker', 'Versioning.ExactDelete', 'Multipart.Create',
     'Multipart.UploadPart', 'Multipart.ListParts', 'Multipart.Complete',
     'Multipart.Abort', 'MultipartUploads.List', 'ObjectVersions.List',
+    'RawSigV4.SelfTest',
     'Tagging.PutObject', 'Tagging.PutObjectTagging', 'Tagging.TagCount',
     'Tagging.VersionIsolation', 'Tagging.CopyDefault', 'Tagging.CopyReplace',
     'Tagging.DeleteObjectTagging', 'Tagging.InvalidTag.Negative',
@@ -204,7 +205,7 @@ function Add-AwsTrackedVersion {
         [string]$Context
     )
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($VersionId) -and $VersionId -ne 'null') "$Context did not return an opaque VersionId"
-    $Versions.Add([pscustomobject]@{ Key = $Key; VersionId = $VersionId })
+    [void]$Versions.Add([pscustomobject]@{ Key = $Key; VersionId = $VersionId })
 }
 
 function Invoke-AwsTrackedVersionCleanup {
@@ -274,6 +275,86 @@ function Invoke-AwsTagCountCase {
         $watch.Stop()
         Add-CompatResult -Client aws -Operation Tagging.TagCount -Status FAIL -DurationMs $watch.ElapsedMilliseconds -Message $_.Exception.Message
     }
+}
+
+function New-AwsTaggingNegativeSeed {
+    param(
+        [object]$Client,
+        [string]$Endpoint,
+        [string]$Region,
+        [string]$Bucket,
+        [string]$Key,
+        [string]$PayloadPath,
+        [System.Collections.Generic.List[object]]$Versions,
+        [string]$Context
+    )
+
+    $put = ConvertFrom-CompatJson -Json (Invoke-AwsApi -Client $Client -Endpoint $Endpoint -Region $Region -Operation put-object -Arguments @(
+        '--bucket', $Bucket,
+        '--key', $Key,
+        '--body', $PayloadPath
+    )).Output -Context $Context
+    $versionId = Get-JsonPropertyString -Object $put -Name VersionId
+    Add-AwsTrackedVersion -Versions $Versions -Key $Key -VersionId $versionId -Context $Context
+    return $versionId
+}
+
+function Register-AwsRawAcceptedVersion {
+    param(
+        [object]$Response,
+        [string]$Key,
+        [System.Collections.Generic.List[object]]$Versions,
+        [string]$Context
+    )
+
+    if ($Response.StatusCode -lt 200 -or $Response.StatusCode -gt 299) {
+        return
+    }
+    $versionId = [string]$Response.VersionId
+    if ([string]::IsNullOrWhiteSpace($versionId) -or $versionId -eq 'null') {
+        throw "$Context was unexpectedly accepted but did not return an exact opaque x-amz-version-id; no guessed cleanup will be attempted"
+    }
+    foreach ($tracked in $Versions) {
+        if ([string]$tracked.Key -eq $Key -and [string]$tracked.VersionId -eq $versionId) {
+            return
+        }
+    }
+    Add-AwsTrackedVersion -Versions $Versions -Key $Key -VersionId $versionId -Context $Context
+}
+
+function Assert-S3RawInvalidTagResponse {
+    param(
+        [object]$Response,
+        [string]$Context
+    )
+
+    Assert-Condition ($Response.StatusCode -ge 400 -and $Response.StatusCode -le 499) "$Context returned HTTP $($Response.StatusCode), expected a 4xx InvalidTag response: $($Response.Body)"
+    Assert-Condition (-not $Response.BodyTruncated) "$Context returned an oversized error body that could not be audited"
+    Assert-Condition (-not $Response.HeadersTruncated) "$Context returned oversized response headers that could not be audited"
+    $contentType = [string]$Response.Headers['content-type']
+    Assert-Condition ($contentType -match '(?i)(application|text)/xml') "$Context did not return an XML Content-Type: $contentType"
+
+    $document = New-Object Xml.XmlDocument
+    $document.XmlResolver = $null
+    try {
+        $document.LoadXml([string]$Response.Body)
+    }
+    catch {
+        throw "$Context returned malformed S3 error XML: $($_.Exception.Message)"
+    }
+    Assert-Condition ($null -ne $document.DocumentElement -and $document.DocumentElement.LocalName -eq 'Error') "$Context XML root was not Error"
+    $elements = @{}
+    foreach ($node in $document.DocumentElement.ChildNodes) {
+        if ($node -is [Xml.XmlElement] -and -not $elements.ContainsKey($node.LocalName)) {
+            $elements[$node.LocalName] = [string]$node.InnerText
+        }
+    }
+    Assert-Condition ($elements.ContainsKey('Code') -and $elements['Code'] -eq 'InvalidTag') "$Context returned S3 error code '$($elements['Code'])' instead of InvalidTag"
+    Assert-Condition ($elements.ContainsKey('Message') -and -not [string]::IsNullOrWhiteSpace($elements['Message'])) "$Context omitted the S3 error Message"
+    Assert-Condition ($elements.ContainsKey('RequestId') -and -not [string]::IsNullOrWhiteSpace($elements['RequestId'])) "$Context omitted the S3 error RequestId"
+    $headerRequestId = [string]$Response.Headers['x-amz-request-id']
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($headerRequestId)) "$Context omitted x-amz-request-id"
+    Assert-Condition ($headerRequestId -eq $elements['RequestId']) "$Context returned different request IDs in XML and x-amz-request-id"
 }
 
 function Invoke-AwsObjectLockBucketCleanup {
@@ -646,10 +727,60 @@ function Invoke-AwsCompatibilityMatrix {
         Assert-AwsTagSet -Response $untouched -Expected @{ generation = 'two'; scope = 'latest' } -Context 'untouched second-version tag set'
         'DeleteObjectTagging emptied only the exact target version tag set'
     } | Out-Null
-    Add-SkipResult -Client aws -Operation Tagging.InvalidTag.Negative -Reason 'AWS CLI may reject invalid tag shapes before transmission, and this matrix has no controlled raw SigV4 HTTP helper; no server-side result is claimed'
-    Add-SkipResult -Client aws -Operation Tagging.DuplicateKey.Negative -Reason 'AWS CLI may validate duplicate tag keys locally, and this matrix has no controlled raw SigV4 HTTP helper; no server-side result is claimed'
-    Add-SkipResult -Client aws -Operation Tagging.TooMany.Negative -Reason 'AWS CLI may enforce the ten-tag model before transmission, and this matrix has no controlled raw SigV4 HTTP helper; no server-side result is claimed'
-    Add-SkipResult -Client aws -Operation Tagging.BadPercentEncoding.Negative -Reason 'AWS CLI does not provide a reliable raw x-amz-tagging header surface for malformed percent encoding, and this matrix has no controlled raw SigV4 HTTP helper'
+    Invoke-CompatCase -Client aws -Operation RawSigV4.SelfTest -Body {
+        Assert-Condition (Test-S3RawSigV4Golden) 'raw SigV4 offline golden failed'
+        'AWS S3 signature, path-style URI, canonical query, and Content-MD5 goldens matched'
+    } | Out-Null
+    Invoke-CompatCase -Client aws -Operation Tagging.InvalidTag.Negative -Body {
+        $key = "tagging/negative-invalid-tag-${RunId}.txt"
+        $versionId = New-AwsTaggingNegativeSeed -Client $Client -Endpoint $Endpoint -Region $Region -Bucket $bucket -Key $key -PayloadPath $payloadPath -Versions $context.TagVersions -Context 'InvalidTag negative seed PutObject'
+        $invalidKey = 'k' * 129
+        $xml = "<Tagging xmlns=`"http://s3.amazonaws.com/doc/2006-03-01/`"><TagSet><Tag><Key>${invalidKey}</Key><Value>value</Value></Tag></TagSet></Tagging>"
+        $response = Invoke-S3RawSigV4Request -Method PUT -Endpoint $Endpoint -Bucket $bucket -Key $key -QueryParameters @(
+            [pscustomobject]@{ Name = 'tagging'; Value = '' },
+            [pscustomobject]@{ Name = 'versionId'; Value = $versionId }
+        ) -AdditionalHeaders @{} -Body ([Text.Encoding]::UTF8.GetBytes($xml)) -ContentType 'application/xml' -AccessKeyId $Credential.AccessKeyId -SecretAccessKey $Credential.SecretAccessKey -Region $Region
+        Register-AwsRawAcceptedVersion -Response $response -Key $key -Versions $context.TagVersions -Context 'invalid tag key PutObjectTagging'
+        Assert-S3RawInvalidTagResponse -Response $response -Context 'invalid tag key PutObjectTagging'
+        'raw signed PutObjectTagging rejected a 129-character key with S3 InvalidTag'
+    } | Out-Null
+    Invoke-CompatCase -Client aws -Operation Tagging.DuplicateKey.Negative -Body {
+        $key = "tagging/negative-duplicate-key-${RunId}.txt"
+        $versionId = New-AwsTaggingNegativeSeed -Client $Client -Endpoint $Endpoint -Region $Region -Bucket $bucket -Key $key -PayloadPath $payloadPath -Versions $context.TagVersions -Context 'duplicate key negative seed PutObject'
+        $xml = '<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Key>same</Key><Value>one</Value></Tag><Tag><Key>same</Key><Value>two</Value></Tag></TagSet></Tagging>'
+        $response = Invoke-S3RawSigV4Request -Method PUT -Endpoint $Endpoint -Bucket $bucket -Key $key -QueryParameters @(
+            [pscustomobject]@{ Name = 'tagging'; Value = '' },
+            [pscustomobject]@{ Name = 'versionId'; Value = $versionId }
+        ) -AdditionalHeaders @{} -Body ([Text.Encoding]::UTF8.GetBytes($xml)) -ContentType 'application/xml' -AccessKeyId $Credential.AccessKeyId -SecretAccessKey $Credential.SecretAccessKey -Region $Region
+        Register-AwsRawAcceptedVersion -Response $response -Key $key -Versions $context.TagVersions -Context 'duplicate key PutObjectTagging'
+        Assert-S3RawInvalidTagResponse -Response $response -Context 'duplicate key PutObjectTagging'
+        'raw signed PutObjectTagging rejected duplicate keys with S3 InvalidTag'
+    } | Out-Null
+    Invoke-CompatCase -Client aws -Operation Tagging.TooMany.Negative -Body {
+        $key = "tagging/negative-too-many-${RunId}.txt"
+        $versionId = New-AwsTaggingNegativeSeed -Client $Client -Endpoint $Endpoint -Region $Region -Bucket $bucket -Key $key -PayloadPath $payloadPath -Versions $context.TagVersions -Context 'too many tags negative seed PutObject'
+        $tagXml = New-Object System.Text.StringBuilder
+        foreach ($index in 0..10) {
+            [void]$tagXml.Append("<Tag><Key>key${index}</Key><Value>value</Value></Tag>")
+        }
+        $xml = "<Tagging xmlns=`"http://s3.amazonaws.com/doc/2006-03-01/`"><TagSet>$($tagXml.ToString())</TagSet></Tagging>"
+        $response = Invoke-S3RawSigV4Request -Method PUT -Endpoint $Endpoint -Bucket $bucket -Key $key -QueryParameters @(
+            [pscustomobject]@{ Name = 'tagging'; Value = '' },
+            [pscustomobject]@{ Name = 'versionId'; Value = $versionId }
+        ) -AdditionalHeaders @{} -Body ([Text.Encoding]::UTF8.GetBytes($xml)) -ContentType 'application/xml' -AccessKeyId $Credential.AccessKeyId -SecretAccessKey $Credential.SecretAccessKey -Region $Region
+        Register-AwsRawAcceptedVersion -Response $response -Key $key -Versions $context.TagVersions -Context 'too many tags PutObjectTagging'
+        Assert-S3RawInvalidTagResponse -Response $response -Context 'too many tags PutObjectTagging'
+        'raw signed PutObjectTagging rejected eleven tags with S3 InvalidTag'
+    } | Out-Null
+    Invoke-CompatCase -Client aws -Operation Tagging.BadPercentEncoding.Negative -Body {
+        $key = "tagging/negative-bad-percent-${RunId}.txt"
+        $response = Invoke-S3RawSigV4Request -Method PUT -Endpoint $Endpoint -Bucket $bucket -Key $key -QueryParameters @() -AdditionalHeaders @{
+            'x-amz-tagging' = 'bad=%'
+        } -Body ([IO.File]::ReadAllBytes($payloadPath)) -ContentType 'application/octet-stream' -AccessKeyId $Credential.AccessKeyId -SecretAccessKey $Credential.SecretAccessKey -Region $Region
+        Register-AwsRawAcceptedVersion -Response $response -Key $key -Versions $context.TagVersions -Context 'bad percent-encoding PutObject'
+        Assert-S3RawInvalidTagResponse -Response $response -Context 'bad percent-encoding PutObject'
+        'raw signed PutObject rejected malformed x-amz-tagging percent encoding with S3 InvalidTag'
+    } | Out-Null
     Invoke-CompatCase -Client aws -Operation Versioning.ExactRead -Body {
         $v1 = ConvertFrom-CompatJson -Json (Invoke-AwsApi -Client $Client -Endpoint $Endpoint -Region $Region -Operation put-object -Arguments @('--bucket', $bucket, '--key', $context.NullKey, '--body', $payloadPath, '--metadata', 'generation=one')).Output -Context 'put version one'
         $v2Payload = Join-Path $work 'v2.txt'

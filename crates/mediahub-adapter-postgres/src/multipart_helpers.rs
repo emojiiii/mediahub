@@ -1,6 +1,6 @@
 // Multipart locking, validation, persistent cleanup, and row conversion helpers.
 
-async fn lock_upload(
+pub(crate) async fn lock_upload(
     transaction: &mut Transaction<'_, Postgres>,
     upload_id: &str,
 ) -> Result<S3MultipartUpload, RepositoryError> {
@@ -181,10 +181,14 @@ fn validate_attachable_intent(
     validate_intent_identity(upload, intent)?;
     if intent.state() != UploadIntentState::Committing
         || intent.lease_token() != Some(completion_token)
-        || intent.lease_until().is_none_or(|lease_until| lease_until <= now)
+        || intent
+            .lease_until()
+            .is_none_or(|lease_until| lease_until <= now)
         || intent.expected_size_bytes() != total_size
         || intent.size_bytes() != Some(total_size)
-        || intent.entity_tag().is_none_or(|etag| !is_multipart_etag(etag.as_str()))
+        || intent
+            .entity_tag()
+            .is_none_or(|etag| !is_multipart_etag(etag.as_str()))
         || intent.checksum().is_none()
     {
         return Err(RepositoryError::Conflict);
@@ -212,17 +216,31 @@ async fn enqueue_attached_intent_cleanup(
     .await
 }
 
-async fn abort_attached_intent(
+pub(crate) async fn lock_attached_upload_intent(
     transaction: &mut Transaction<'_, Postgres>,
     upload: &S3MultipartUpload,
-    completion_token: Option<&str>,
-    now: OffsetDateTime,
-) -> Result<(), RepositoryError> {
+) -> Result<Option<UploadIntent>, RepositoryError> {
     let Some(intent_id) = upload.upload_intent_id else {
-        return Ok(());
+        return Ok(None);
     };
     let intent = lock_upload_intent(transaction, intent_id).await?;
     validate_intent_identity(upload, &intent)?;
+    Ok(Some(intent))
+}
+
+async fn abort_locked_attached_intent(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    locked_intent: Option<&UploadIntent>,
+    completion_token: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    let intent = match (upload.upload_intent_id, locked_intent) {
+        (None, None) => return Ok(()),
+        (Some(expected_id), Some(intent)) if intent.id() == expected_id => intent,
+        _ => return Err(RepositoryError::Conflict),
+    };
+    validate_intent_identity(upload, intent)?;
     if intent.state() == UploadIntentState::Committed {
         return Err(RepositoryError::Conflict);
     }
@@ -232,13 +250,16 @@ async fn abort_attached_intent(
     {
         return Err(RepositoryError::Conflict);
     }
-    enqueue_attached_intent_cleanup(transaction, upload, &intent, now).await?;
-    if !matches!(intent.state(), UploadIntentState::Aborted | UploadIntentState::Expired) {
+    enqueue_attached_intent_cleanup(transaction, upload, intent, now).await?;
+    if !matches!(
+        intent.state(),
+        UploadIntentState::Aborted | UploadIntentState::Expired
+    ) {
         let changed = sqlx::query(
             "UPDATE s3_upload_intents SET state = 'aborted', lease_token = NULL, \
              lease_until = NULL, updated_at = $2 WHERE id = $1 AND state <> 'committed'",
         )
-        .bind(intent_id.as_uuid())
+        .bind(intent.id().as_uuid())
         .bind(now)
         .execute(&mut **transaction)
         .await
@@ -250,9 +271,37 @@ async fn abort_attached_intent(
     Ok(())
 }
 
-async fn abort_upload_and_enqueue_cleanup(
+async fn abort_attached_intent(
     transaction: &mut Transaction<'_, Postgres>,
     upload: &S3MultipartUpload,
+    completion_token: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    let intent = lock_attached_upload_intent(transaction, upload).await?;
+    abort_locked_attached_intent(transaction, upload, intent.as_ref(), completion_token, now).await
+}
+
+pub(crate) async fn abort_upload_and_enqueue_cleanup(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    completion_token: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    let intent = lock_attached_upload_intent(transaction, upload).await?;
+    abort_upload_and_enqueue_cleanup_with_locked_intent(
+        transaction,
+        upload,
+        intent.as_ref(),
+        completion_token,
+        now,
+    )
+    .await
+}
+
+pub(crate) async fn abort_upload_and_enqueue_cleanup_with_locked_intent(
+    transaction: &mut Transaction<'_, Postgres>,
+    upload: &S3MultipartUpload,
+    locked_intent: Option<&UploadIntent>,
     completion_token: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<(), RepositoryError> {
@@ -262,7 +311,7 @@ async fn abort_upload_and_enqueue_cleanup(
     ) {
         return Err(RepositoryError::Conflict);
     }
-    abort_attached_intent(transaction, upload, completion_token, now).await?;
+    abort_locked_attached_intent(transaction, upload, locked_intent, completion_token, now).await?;
     let storage_keys = list_storage_keys(transaction, &upload.upload_id).await?;
     enqueue_multipart_storage_keys(transaction, upload, None, storage_keys, now).await?;
     mark_aborted(transaction, &upload.upload_id, now).await
@@ -313,7 +362,7 @@ fn selected_total_size(parts: &[S3MultipartPart]) -> Result<u64, RepositoryError
     })
 }
 
-fn row_to_multipart_upload(row: PgRow) -> Result<S3MultipartUpload, RepositoryError> {
+pub(crate) fn row_to_multipart_upload(row: PgRow) -> Result<S3MultipartUpload, RepositoryError> {
     let final_etag = row
         .try_get::<Option<String>, _>("final_etag")
         .map_err(database_error)?

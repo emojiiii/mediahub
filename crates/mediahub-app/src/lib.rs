@@ -17,6 +17,7 @@ mod memory_s3;
 #[doc(hidden)]
 pub mod object_store_contract;
 mod ports;
+mod s3_lifecycle;
 mod s3_multipart;
 mod s3_object_service;
 mod s3_repository;
@@ -61,6 +62,17 @@ pub use ports::{
     UploadSessionCancellation, UploadSessionCompletion, UploadSessionExpiration,
     UploadSessionRepository, UploadSessionStorage, WebhookDelivery, WebhookDeliveryEndpoint,
     WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
+};
+pub use s3_lifecycle::{
+    DEFAULT_S3_LIFECYCLE_BATCH_SIZE, DEFAULT_S3_LIFECYCLE_GC_MAX_ATTEMPTS,
+    ExecuteS3LifecycleCommand, MAX_S3_LIFECYCLE_BATCH_SIZE, S3CurrentExpirationCandidate,
+    S3ExpiredDeleteMarkerCandidate, S3LifecycleBatchCursor, S3LifecycleBatchReceipt,
+    S3LifecycleExecutionOutcome, S3LifecycleRepository, S3LifecycleService, S3LifecycleTarget,
+    S3LifecycleTargetIdentity, S3MultipartLifecycleCandidate, S3NoncurrentExpirationCandidate,
+    lifecycle_action_time, lifecycle_days_cutoff, lifecycle_prefix,
+    lifecycle_rule_aborts_multipart, lifecycle_rule_is_current_due,
+    lifecycle_rule_is_noncurrent_due, lifecycle_rule_removes_expired_marker,
+    lifecycle_rule_removes_expired_marker_at,
 };
 pub use s3_multipart::{
     CompletedS3MultipartPart, DEFAULT_S3_MULTIPART_GC_MAX_ATTEMPTS,

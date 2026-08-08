@@ -11,9 +11,10 @@ use mediahub_core::{
     DefaultRetentionPeriod, EntityTag, NewStorageGcTask, ObjectId, ObjectRetention,
     ObjectRetentionUpdateError, ObjectVersion, ObjectVersionId, ObjectVersionPayload,
     ObjectVersionState, PersistedBucketS3Configuration, PersistedS3Bucket, PersistedS3Object,
-    PersistedUploadIntent, RetentionMode, S3Bucket, S3LifecycleConfiguration, S3Object,
-    S3ObjectTag, S3ObjectTagSet, S3VersionId, SourceProtocol, StorageGcReason, StoredObjectVersion,
-    UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
+    PersistedUploadIntent, RetentionMode, S3Bucket, S3LifecycleConfiguration, S3LifecycleFilter,
+    S3LifecycleRule, S3LifecycleRuleStatus, S3Object, S3ObjectTag, S3ObjectTagSet, S3VersionId,
+    SourceProtocol, StorageGcReason, StorageGcTaskId, StoredObjectVersion, UploadIntent,
+    UploadIntentId, UploadIntentState, VersioningStatus,
 };
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
@@ -21,14 +22,19 @@ use time::{Duration, OffsetDateTime};
 use crate::{
     BeginPutObjectReceipt, BeginPutObjectRequest, CompletePutObjectRequest, ComposedObject,
     DeleteObjectRequest, DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion,
-    FixedClock, InMemoryObjectStore, ListObjectVersionsRequest, NewS3ObjectLock, ObjectMetadata,
-    ObjectPage, ObjectStore, ObjectStoreError, PutObjectLegalHoldRequest,
-    PutObjectRetentionRequest, PutObjectTaggingRequest, PutS3ObjectLockCommand,
-    PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository, S3DeleteLockReason,
-    S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectLockMutation, S3ObjectPage,
-    S3ObjectRepository, S3ObjectRequest, S3ObjectService, S3ObjectServiceError,
-    S3ObjectTaggingCommand, S3ObjectTaggingOutcome, S3ObjectVersionCommit, S3ObjectVersionRead,
-    S3UploadIntentRepository, StreamedObject,
+    ExecuteS3LifecycleCommand, FixedClock, InMemoryObjectStore, ListObjectVersionsRequest,
+    NewS3ObjectLock, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError,
+    PutObjectLegalHoldRequest, PutObjectRetentionRequest, PutObjectTaggingRequest,
+    PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository,
+    S3CurrentExpirationCandidate, S3DeleteLockReason, S3ExpiredDeleteMarkerCandidate,
+    S3LifecycleBatchCursor, S3LifecycleExecutionOutcome, S3LifecycleRepository, S3LifecycleService,
+    S3LifecycleTarget, S3MultipartLifecycleCandidate, S3MultipartUpload, S3MultipartUploadState,
+    S3NoncurrentExpirationCandidate, S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery,
+    S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectRequest, S3ObjectService,
+    S3ObjectServiceError, S3ObjectTaggingCommand, S3ObjectTaggingOutcome, S3ObjectVersionCommit,
+    S3ObjectVersionRead, S3UploadIntentRepository, StreamedObject, lifecycle_action_time,
+    lifecycle_rule_aborts_multipart, lifecycle_rule_is_current_due,
+    lifecycle_rule_is_noncurrent_due, lifecycle_rule_removes_expired_marker_at,
 };
 
 #[derive(Default)]
@@ -40,6 +46,8 @@ struct State {
     tags: HashMap<ObjectVersionId, S3ObjectTagSet>,
     superseded_versions: HashSet<ObjectVersionId>,
     deleted_versions: HashSet<ObjectVersionId>,
+    multipart_uploads: HashMap<String, S3MultipartUpload>,
+    multipart_storage_keys: HashMap<String, Vec<String>>,
     gc_tasks: Vec<NewStorageGcTask>,
     fail_commit: bool,
 }
@@ -88,6 +96,16 @@ impl MemoryS3Repository {
         let mut state = self.state();
         state.versions.insert(object.id(), versions);
         state.objects.insert(object.id(), object);
+    }
+
+    fn seed_multipart_upload(&self, upload: S3MultipartUpload, storage_keys: Vec<String>) {
+        let mut state = self.state();
+        state
+            .multipart_storage_keys
+            .insert(upload.upload_id.clone(), storage_keys);
+        state
+            .multipart_uploads
+            .insert(upload.upload_id.clone(), upload);
     }
 }
 
@@ -244,12 +262,321 @@ impl S3BucketRepository for MemoryS3Repository {
 
     async fn replace_s3_bucket_lifecycle(
         &self,
-        _application_id: ApplicationId,
-        _name: &str,
-        _lifecycle_configuration: Option<S3LifecycleConfiguration>,
-        _updated_at: OffsetDateTime,
+        application_id: ApplicationId,
+        name: &str,
+        lifecycle_configuration: Option<S3LifecycleConfiguration>,
+        updated_at: OffsetDateTime,
     ) -> Result<BucketS3Configuration, RepositoryError> {
-        unreachable!("not used by ObjectService tests")
+        let mut state = self.state();
+        let bucket = state
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.application_id() == application_id && bucket.name() == name)
+            .ok_or(RepositoryError::NotFound)?;
+        let mut configuration = bucket.configuration().clone();
+        configuration
+            .replace_lifecycle_configuration(lifecycle_configuration, updated_at)
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        *bucket = rebuild_memory_bucket(bucket, &configuration)?;
+        Ok(configuration)
+    }
+}
+
+#[async_trait]
+impl S3LifecycleRepository for MemoryS3Repository {
+    async fn list_s3_lifecycle_buckets(
+        &self,
+        after_bucket_id: Option<BucketId>,
+        limit: usize,
+    ) -> Result<Vec<S3Bucket>, RepositoryError> {
+        let mut buckets = self
+            .state()
+            .buckets
+            .iter()
+            .filter(|bucket| {
+                bucket.configuration().lifecycle_configuration().is_some()
+                    && after_bucket_id.is_none_or(|after| bucket.id() > after)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        buckets.sort_by_key(S3Bucket::id);
+        buckets.truncate(limit);
+        Ok(buckets)
+    }
+
+    async fn list_s3_current_expiration_candidates(
+        &self,
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        prefix: &str,
+        created_before: Option<OffsetDateTime>,
+        _evaluated_at: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<S3CurrentExpirationCandidate>, RepositoryError> {
+        let state = self.state();
+        let mut candidates = state
+            .objects
+            .values()
+            .filter(|object| {
+                object.application_id() == application_id
+                    && object.bucket_id() == bucket_id
+                    && object.key().starts_with(prefix)
+            })
+            .filter_map(|object| {
+                let current_id = object.current_version_id()?;
+                let version = memory_active_versions(&state, object.id())
+                    .find(|version| version.id() == current_id)?;
+                if version.is_delete_marker()
+                    || created_before.is_some_and(|cutoff| version.created_at() >= cutoff)
+                {
+                    return None;
+                }
+                Some(S3CurrentExpirationCandidate {
+                    object_id: object.id(),
+                    object_key: object.key().to_owned(),
+                    current_version_id: current_id,
+                    version_created_at: version.created_at(),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.version_created_at, candidate.object_id));
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
+    async fn list_s3_noncurrent_expiration_candidates(
+        &self,
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        prefix: &str,
+        became_noncurrent_before: OffsetDateTime,
+        evaluated_at: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<S3NoncurrentExpirationCandidate>, RepositoryError> {
+        let state = self.state();
+        let mut candidates = Vec::new();
+        for object in state.objects.values().filter(|object| {
+            object.application_id() == application_id
+                && object.bucket_id() == bucket_id
+                && object.key().starts_with(prefix)
+        }) {
+            for version in memory_active_versions(&state, object.id()) {
+                let Some(became_noncurrent_at) = version.became_noncurrent_at() else {
+                    continue;
+                };
+                if object.current_version_id() == Some(version.id())
+                    || version.is_delete_marker()
+                    || became_noncurrent_at >= became_noncurrent_before
+                    || delete_lock_reason_at(version, evaluated_at, false).is_some()
+                {
+                    continue;
+                }
+                candidates.push(S3NoncurrentExpirationCandidate {
+                    object_id: object.id(),
+                    object_key: object.key().to_owned(),
+                    version_id: version.id(),
+                    became_noncurrent_at,
+                });
+            }
+        }
+        candidates.sort_by_key(|candidate| (candidate.became_noncurrent_at, candidate.version_id));
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
+    async fn list_s3_expired_delete_marker_candidates(
+        &self,
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<S3ExpiredDeleteMarkerCandidate>, RepositoryError> {
+        let state = self.state();
+        let mut candidates = state
+            .objects
+            .values()
+            .filter(|object| {
+                object.application_id() == application_id
+                    && object.bucket_id() == bucket_id
+                    && object.key().starts_with(prefix)
+            })
+            .filter_map(|object| {
+                let current_id = object.current_version_id()?;
+                let active = memory_active_versions(&state, object.id()).collect::<Vec<_>>();
+                let marker = active
+                    .iter()
+                    .find(|version| version.id() == current_id && version.is_delete_marker())?;
+                (active.len() == 1).then_some(S3ExpiredDeleteMarkerCandidate {
+                    object_id: object.id(),
+                    object_key: object.key().to_owned(),
+                    marker_version_id: marker.id(),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.object_key.clone(), candidate.object_id));
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
+    async fn list_s3_expiration_delete_marker_candidates(
+        &self,
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        rule: &S3LifecycleRule,
+        evaluated_at: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<S3ExpiredDeleteMarkerCandidate>, RepositoryError> {
+        let state = self.state();
+        let mut candidates = state
+            .objects
+            .values()
+            .filter(|object| {
+                object.application_id() == application_id && object.bucket_id() == bucket_id
+            })
+            .filter_map(|object| {
+                let current_id = object.current_version_id()?;
+                let active = memory_active_versions(&state, object.id()).collect::<Vec<_>>();
+                let marker = active
+                    .iter()
+                    .find(|version| version.id() == current_id && version.is_delete_marker())?;
+                (active.len() == 1
+                    && lifecycle_rule_removes_expired_marker_at(
+                        rule,
+                        object.key(),
+                        marker.created_at(),
+                        evaluated_at,
+                    ))
+                .then_some(S3ExpiredDeleteMarkerCandidate {
+                    object_id: object.id(),
+                    object_key: object.key().to_owned(),
+                    marker_version_id: marker.id(),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.object_key.clone(), candidate.object_id));
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
+    async fn list_s3_multipart_lifecycle_candidates(
+        &self,
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        prefix: &str,
+        initiated_before: OffsetDateTime,
+        evaluated_at: OffsetDateTime,
+        limit: usize,
+    ) -> Result<Vec<S3MultipartLifecycleCandidate>, RepositoryError> {
+        let state = self.state();
+        let mut candidates = state
+            .multipart_uploads
+            .values()
+            .filter(|upload| {
+                upload.application_id == application_id
+                    && upload.bucket_id == bucket_id
+                    && upload.object_key.starts_with(prefix)
+                    && upload.created_at < initiated_before
+                    && matches!(
+                        upload.state,
+                        S3MultipartUploadState::Pending | S3MultipartUploadState::Completing
+                    )
+                    && (upload.state == S3MultipartUploadState::Pending
+                        || upload
+                            .completion_lease_until
+                            .is_some_and(|lease_until| lease_until <= evaluated_at))
+            })
+            .map(|upload| S3MultipartLifecycleCandidate {
+                upload_id: upload.upload_id.clone(),
+                object_key: upload.object_key.clone(),
+                initiated_at: upload.created_at,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.initiated_at, candidate.upload_id.clone()));
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
+    async fn execute_s3_lifecycle(
+        &self,
+        command: &ExecuteS3LifecycleCommand,
+    ) -> Result<S3LifecycleExecutionOutcome, RepositoryError> {
+        if command.gc_max_attempts == 0 {
+            return Err(RepositoryError::Invariant(
+                "S3 lifecycle GC attempts must be positive".into(),
+            ));
+        }
+        let mut state = self.state();
+        let Some(bucket) = state
+            .buckets
+            .iter()
+            .find(|bucket| {
+                bucket.application_id() == command.application_id
+                    && bucket.id() == command.bucket_id
+            })
+            .cloned()
+        else {
+            return Ok(S3LifecycleExecutionOutcome::ConfigurationChanged);
+        };
+        let configuration = bucket.configuration();
+        if configuration.revision() != command.expected_configuration_revision
+            || configuration
+                .lifecycle_configuration()
+                .is_none_or(|lifecycle| !lifecycle.rules.contains(&command.rule))
+        {
+            return Ok(S3LifecycleExecutionOutcome::ConfigurationChanged);
+        }
+
+        match &command.target {
+            S3LifecycleTarget::ExpireCurrent {
+                object_id,
+                object_key,
+                expected_current_version_id,
+                version_created_at,
+            } => execute_memory_current_expiration(
+                &mut state,
+                &bucket,
+                *object_id,
+                object_key,
+                *expected_current_version_id,
+                *version_created_at,
+                command,
+            ),
+            S3LifecycleTarget::ExpireNoncurrent {
+                object_id,
+                object_key,
+                version_id,
+                expected_became_noncurrent_at,
+            } => execute_memory_noncurrent_expiration(
+                &mut state,
+                *object_id,
+                object_key,
+                *version_id,
+                *expected_became_noncurrent_at,
+                command,
+            ),
+            S3LifecycleTarget::RemoveExpiredDeleteMarker {
+                object_id,
+                object_key,
+                marker_version_id,
+            } => execute_memory_expired_marker(
+                &mut state,
+                *object_id,
+                object_key,
+                *marker_version_id,
+                command,
+            ),
+            S3LifecycleTarget::AbortMultipart {
+                upload_id,
+                object_key,
+                expected_initiated_at,
+            } => execute_memory_multipart_abort(
+                &mut state,
+                upload_id,
+                object_key,
+                *expected_initiated_at,
+                command,
+            ),
+        }
     }
 }
 
@@ -894,20 +1221,463 @@ fn resolve_memory_object_tagging(
     })
 }
 
+fn rebuild_memory_bucket(
+    bucket: &S3Bucket,
+    configuration: &BucketS3Configuration,
+) -> Result<S3Bucket, RepositoryError> {
+    S3Bucket::from_persistence(PersistedS3Bucket {
+        id: bucket.id(),
+        application_id: bucket.application_id(),
+        name: bucket.name().to_owned(),
+        configuration: PersistedBucketS3Configuration {
+            region: configuration.region().to_owned(),
+            versioning_status: configuration.versioning_status(),
+            object_lock_enabled: configuration.object_lock_enabled(),
+            default_retention: configuration.default_retention(),
+            lifecycle_configuration: configuration.lifecycle_configuration().cloned(),
+            revision: configuration.revision(),
+            updated_at: configuration.updated_at(),
+        },
+        created_at: bucket.created_at(),
+    })
+    .map_err(|error| RepositoryError::Invariant(error.to_string()))
+}
+
+fn memory_active_versions<'a>(
+    state: &'a State,
+    object_id: ObjectId,
+) -> impl Iterator<Item = &'a ObjectVersion> + 'a {
+    state
+        .versions
+        .get(&object_id)
+        .into_iter()
+        .flatten()
+        .filter(|version| {
+            version.state() == ObjectVersionState::Committed
+                && !state.superseded_versions.contains(&version.id())
+                && !state.deleted_versions.contains(&version.id())
+        })
+}
+
+fn execute_memory_current_expiration(
+    state: &mut State,
+    bucket: &S3Bucket,
+    object_id: ObjectId,
+    object_key: &str,
+    expected_current_version_id: ObjectVersionId,
+    expected_created_at: OffsetDateTime,
+    command: &ExecuteS3LifecycleCommand,
+) -> Result<S3LifecycleExecutionOutcome, RepositoryError> {
+    let Some(object) = state.objects.get(&object_id).cloned() else {
+        return Ok(S3LifecycleExecutionOutcome::AlreadyApplied);
+    };
+    if object.application_id() != command.application_id
+        || object.bucket_id() != command.bucket_id
+        || object.key() != object_key
+        || object.current_version_id() != Some(expected_current_version_id)
+    {
+        return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+    }
+    let active_versions = memory_active_versions(state, object_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(target) = active_versions
+        .iter()
+        .find(|version| version.id() == expected_current_version_id)
+        .cloned()
+    else {
+        return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+    };
+    if target.created_at() != expected_created_at
+        || target.is_delete_marker()
+        || !lifecycle_rule_is_current_due(
+            &command.rule,
+            object_key,
+            target.created_at(),
+            command.evaluated_at,
+        )
+    {
+        return Ok(S3LifecycleExecutionOutcome::NotEligible);
+    }
+    let action_at = lifecycle_action_time(command.evaluated_at);
+    match bucket.configuration().versioning_status() {
+        VersioningStatus::Enabled => {
+            mark_memory_version_noncurrent(state, object_id, target.id(), action_at)?;
+            let marker = lifecycle_delete_marker(&object, false, command)?;
+            let advanced = object
+                .advanced_to(&marker, action_at)
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+            state.versions.entry(object_id).or_default().push(marker);
+            state.objects.insert(object_id, advanced);
+        }
+        VersioningStatus::Suspended => {
+            let active_null = active_versions
+                .iter()
+                .find(|version| version.is_null_version())
+                .cloned();
+            if active_null.as_ref().is_some_and(|version| {
+                delete_lock_reason_at(version, command.evaluated_at, false).is_some()
+            }) {
+                return Ok(S3LifecycleExecutionOutcome::Locked);
+            }
+            mark_memory_version_noncurrent(state, object_id, target.id(), action_at)?;
+            if let Some(version) = active_null {
+                if let Some(task) = lifecycle_object_gc_task(&version, command) {
+                    enqueue_memory_gc_task(state, task)?;
+                }
+                state.superseded_versions.insert(version.id());
+            }
+            let marker = lifecycle_delete_marker(&object, true, command)?;
+            let advanced = object
+                .advanced_to(&marker, action_at)
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+            state.versions.entry(object_id).or_default().push(marker);
+            state.objects.insert(object_id, advanced);
+        }
+        VersioningStatus::Unversioned => {
+            if !target.is_null_version() {
+                return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+            }
+            if delete_lock_reason_at(&target, command.evaluated_at, false).is_some() {
+                return Ok(S3LifecycleExecutionOutcome::Locked);
+            }
+            mark_memory_version_noncurrent(state, object_id, target.id(), action_at)?;
+            if let Some(task) = lifecycle_object_gc_task(&target, command) {
+                enqueue_memory_gc_task(state, task)?;
+            }
+            state.superseded_versions.insert(target.id());
+            state
+                .objects
+                .insert(object_id, rebuild_object_head(&object, None, action_at)?);
+        }
+    }
+    Ok(S3LifecycleExecutionOutcome::Applied)
+}
+
+fn execute_memory_noncurrent_expiration(
+    state: &mut State,
+    object_id: ObjectId,
+    object_key: &str,
+    version_id: ObjectVersionId,
+    expected_became_noncurrent_at: OffsetDateTime,
+    command: &ExecuteS3LifecycleCommand,
+) -> Result<S3LifecycleExecutionOutcome, RepositoryError> {
+    let Some(object) = state.objects.get(&object_id).cloned() else {
+        return Ok(S3LifecycleExecutionOutcome::AlreadyApplied);
+    };
+    if object.application_id() != command.application_id
+        || object.bucket_id() != command.bucket_id
+        || object.key() != object_key
+        || object.current_version_id() == Some(version_id)
+    {
+        return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+    }
+    let Some(version) = memory_active_versions(state, object_id)
+        .find(|version| version.id() == version_id)
+        .cloned()
+    else {
+        return Ok(S3LifecycleExecutionOutcome::AlreadyApplied);
+    };
+    if version.is_delete_marker()
+        || version.became_noncurrent_at() != Some(expected_became_noncurrent_at)
+        || !lifecycle_rule_is_noncurrent_due(
+            &command.rule,
+            object_key,
+            expected_became_noncurrent_at,
+            command.evaluated_at,
+        )
+    {
+        return Ok(S3LifecycleExecutionOutcome::NotEligible);
+    }
+    if delete_lock_reason_at(&version, command.evaluated_at, false).is_some() {
+        return Ok(S3LifecycleExecutionOutcome::Locked);
+    }
+    if let Some(task) = lifecycle_object_gc_task(&version, command) {
+        enqueue_memory_gc_task(state, task)?;
+    }
+    if version.is_null_version() {
+        state.superseded_versions.insert(version.id());
+    } else {
+        state.deleted_versions.insert(version.id());
+    }
+    Ok(S3LifecycleExecutionOutcome::Applied)
+}
+
+fn execute_memory_expired_marker(
+    state: &mut State,
+    object_id: ObjectId,
+    object_key: &str,
+    marker_version_id: ObjectVersionId,
+    command: &ExecuteS3LifecycleCommand,
+) -> Result<S3LifecycleExecutionOutcome, RepositoryError> {
+    let Some(object) = state.objects.get(&object_id).cloned() else {
+        return Ok(S3LifecycleExecutionOutcome::AlreadyApplied);
+    };
+    if object.application_id() != command.application_id
+        || object.bucket_id() != command.bucket_id
+        || object.key() != object_key
+        || object.current_version_id() != Some(marker_version_id)
+    {
+        return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+    }
+    let active = memory_active_versions(state, object_id).collect::<Vec<_>>();
+    if active.len() != 1 || active[0].id() != marker_version_id || !active[0].is_delete_marker() {
+        return Ok(S3LifecycleExecutionOutcome::NotEligible);
+    }
+    if !lifecycle_rule_removes_expired_marker_at(
+        &command.rule,
+        object_key,
+        active[0].created_at(),
+        command.evaluated_at,
+    ) {
+        return Ok(S3LifecycleExecutionOutcome::NotEligible);
+    }
+    if active[0].is_null_version() {
+        state.superseded_versions.insert(marker_version_id);
+    } else {
+        state.deleted_versions.insert(marker_version_id);
+    }
+    state.objects.insert(
+        object_id,
+        rebuild_object_head(&object, None, command.evaluated_at)?,
+    );
+    Ok(S3LifecycleExecutionOutcome::Applied)
+}
+
+fn execute_memory_multipart_abort(
+    state: &mut State,
+    upload_id: &str,
+    object_key: &str,
+    expected_initiated_at: OffsetDateTime,
+    command: &ExecuteS3LifecycleCommand,
+) -> Result<S3LifecycleExecutionOutcome, RepositoryError> {
+    let Some(upload) = state.multipart_uploads.get(upload_id).cloned() else {
+        return Ok(S3LifecycleExecutionOutcome::AlreadyApplied);
+    };
+    if upload.application_id != command.application_id
+        || upload.bucket_id != command.bucket_id
+        || upload.object_key != object_key
+        || upload.created_at != expected_initiated_at
+        || !lifecycle_rule_aborts_multipart(
+            &command.rule,
+            object_key,
+            upload.created_at,
+            command.evaluated_at,
+        )
+    {
+        return Ok(S3LifecycleExecutionOutcome::NotEligible);
+    }
+    match upload.state {
+        S3MultipartUploadState::Aborted => {
+            return Ok(S3LifecycleExecutionOutcome::AlreadyApplied);
+        }
+        S3MultipartUploadState::Completed => {
+            return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+        }
+        S3MultipartUploadState::Completing
+            if upload
+                .completion_lease_until
+                .is_some_and(|lease_until| lease_until > command.evaluated_at) =>
+        {
+            return Ok(S3LifecycleExecutionOutcome::Busy);
+        }
+        S3MultipartUploadState::Pending | S3MultipartUploadState::Completing => {}
+    }
+    if let Some(intent_id) = upload.upload_intent_id {
+        let Some(intent) = state.intents.get(&intent_id).cloned() else {
+            return Err(RepositoryError::Conflict);
+        };
+        if intent.state() == UploadIntentState::Committed {
+            return Ok(S3LifecycleExecutionOutcome::TargetChanged);
+        }
+        if intent.application_id() != upload.application_id
+            || intent.bucket_id() != upload.bucket_id
+            || intent.object_key() != upload.object_key
+            || intent.storage_backend() != upload.storage_backend
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        for storage_key in [
+            intent.temporary_storage_key().to_owned(),
+            intent.final_storage_key().to_owned(),
+        ] {
+            enqueue_memory_gc_task(
+                state,
+                NewStorageGcTask {
+                    id: StorageGcTaskId::new(),
+                    application_id: upload.application_id,
+                    bucket_id: upload.bucket_id,
+                    object_version_id: None,
+                    upload_intent_id: Some(intent.id()),
+                    multipart_upload_id: Some(upload.upload_id.clone()),
+                    storage_backend: upload.storage_backend.clone(),
+                    storage_key,
+                    reason: StorageGcReason::MultipartTemporary,
+                    not_before: command.gc_not_before,
+                    max_attempts: command.gc_max_attempts,
+                    created_at: command.evaluated_at,
+                },
+            )?;
+        }
+        let aborted = UploadIntent::from_persistence(PersistedUploadIntent {
+            id: intent.id(),
+            application_id: intent.application_id(),
+            bucket_id: intent.bucket_id(),
+            object_key: intent.object_key().to_owned(),
+            proposed_version_id: intent.proposed_version_id(),
+            state: UploadIntentState::Aborted,
+            storage_backend: intent.storage_backend().to_owned(),
+            temporary_storage_key: intent.temporary_storage_key().to_owned(),
+            final_storage_key: intent.final_storage_key().to_owned(),
+            entity_tag: intent.entity_tag().cloned(),
+            checksum: intent.checksum().cloned(),
+            expected_size_bytes: intent.expected_size_bytes(),
+            size_bytes: intent.size_bytes(),
+            content_type: intent.content_type().map(str::to_owned),
+            user_metadata: intent.user_metadata().clone(),
+            object_tags: intent.object_tags().clone(),
+            lease_token: None,
+            lease_until: None,
+            committed_object_id: None,
+            committed_version_id: None,
+            expires_at: intent.expires_at(),
+            created_at: intent.created_at(),
+            updated_at: command.evaluated_at,
+        })
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        state.intents.insert(intent_id, aborted);
+    }
+    let storage_keys = state
+        .multipart_storage_keys
+        .get(upload_id)
+        .cloned()
+        .unwrap_or_default();
+    for storage_key in storage_keys {
+        enqueue_memory_gc_task(
+            state,
+            NewStorageGcTask {
+                id: StorageGcTaskId::new(),
+                application_id: upload.application_id,
+                bucket_id: upload.bucket_id,
+                object_version_id: None,
+                upload_intent_id: None,
+                multipart_upload_id: Some(upload.upload_id.clone()),
+                storage_backend: upload.storage_backend.clone(),
+                storage_key,
+                reason: StorageGcReason::MultipartTemporary,
+                not_before: command.gc_not_before,
+                max_attempts: command.gc_max_attempts,
+                created_at: command.evaluated_at,
+            },
+        )?;
+    }
+    let persisted = state
+        .multipart_uploads
+        .get_mut(upload_id)
+        .ok_or(RepositoryError::Conflict)?;
+    persisted.state = S3MultipartUploadState::Aborted;
+    persisted.completion_lease_until = None;
+    persisted.aborted_at = Some(command.evaluated_at);
+    persisted.updated_at = command.evaluated_at;
+    Ok(S3LifecycleExecutionOutcome::Applied)
+}
+
+fn mark_memory_version_noncurrent(
+    state: &mut State,
+    object_id: ObjectId,
+    version_id: ObjectVersionId,
+    changed_at: OffsetDateTime,
+) -> Result<(), RepositoryError> {
+    let version = state
+        .versions
+        .get_mut(&object_id)
+        .and_then(|versions| {
+            versions
+                .iter_mut()
+                .find(|version| version.id() == version_id)
+        })
+        .ok_or(RepositoryError::Conflict)?;
+    *version = version
+        .with_became_noncurrent_at(Some(changed_at))
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+    Ok(())
+}
+
+fn lifecycle_delete_marker(
+    object: &S3Object,
+    null_version: bool,
+    command: &ExecuteS3LifecycleCommand,
+) -> Result<ObjectVersion, RepositoryError> {
+    let generation = object
+        .generation()
+        .checked_add(1)
+        .ok_or_else(|| RepositoryError::Invariant("object generation overflow".into()))?;
+    let version_id = if null_version {
+        S3VersionId::new("null")
+    } else {
+        Ok(command.delete_marker_version_id.clone())
+    }
+    .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+    ObjectVersion::new_delete_marker(
+        command.delete_marker_id,
+        object.id(),
+        command.application_id,
+        command.bucket_id,
+        version_id,
+        generation,
+        null_version,
+        "lifecycle",
+        SourceProtocol::S3,
+        lifecycle_action_time(command.evaluated_at),
+    )
+    .map_err(|error| RepositoryError::Invariant(error.to_string()))
+}
+
+fn lifecycle_object_gc_task(
+    version: &ObjectVersion,
+    command: &ExecuteS3LifecycleCommand,
+) -> Option<NewStorageGcTask> {
+    let ObjectVersionPayload::Object(payload) = version.payload() else {
+        return None;
+    };
+    Some(NewStorageGcTask {
+        id: command.gc_task_id,
+        application_id: version.application_id(),
+        bucket_id: version.bucket_id(),
+        object_version_id: Some(version.id()),
+        upload_intent_id: None,
+        multipart_upload_id: None,
+        storage_backend: payload.storage_backend().to_owned(),
+        storage_key: payload.storage_key().to_owned(),
+        reason: StorageGcReason::LifecycleExpiration,
+        not_before: command.gc_not_before,
+        max_attempts: command.gc_max_attempts,
+        created_at: command.evaluated_at,
+    })
+}
+
 fn delete_lock_reason(
     version: &ObjectVersion,
     command: &DeleteS3ObjectCommand,
+) -> Option<S3DeleteLockReason> {
+    delete_lock_reason_at(version, command.deleted_at, command.bypass_governance)
+}
+
+fn delete_lock_reason_at(
+    version: &ObjectVersion,
+    deleted_at: OffsetDateTime,
+    bypass_governance: bool,
 ) -> Option<S3DeleteLockReason> {
     if version.legal_hold() {
         return Some(S3DeleteLockReason::LegalHold);
     }
     let retention = version.retention()?;
-    if retention.retain_until() <= command.deleted_at {
+    if retention.retain_until() <= deleted_at {
         return None;
     }
     match retention.mode() {
         RetentionMode::Compliance => Some(S3DeleteLockReason::ComplianceRetention),
-        RetentionMode::Governance if !command.bypass_governance => {
+        RetentionMode::Governance if !bypass_governance => {
             Some(S3DeleteLockReason::GovernanceRetention)
         }
         RetentionMode::Governance => None,
@@ -951,11 +1721,11 @@ fn enqueue_memory_gc_task(
         let exact_target = existing.application_id == task.application_id
             && existing.bucket_id == task.bucket_id
             && existing.object_version_id == task.object_version_id
-            && existing.upload_intent_id.is_none()
-            && existing.multipart_upload_id.is_none()
+            && existing.upload_intent_id == task.upload_intent_id
+            && existing.multipart_upload_id == task.multipart_upload_id
             && existing.storage_backend == task.storage_backend
             && existing.storage_key == task.storage_key
-            && existing.reason == StorageGcReason::ExplicitDelete;
+            && existing.reason == task.reason;
         return if exact_target {
             Ok(())
         } else {
@@ -2045,6 +2815,308 @@ fn memory_list_current_objects_matches_v2_prefix_delimiter_cursor_and_limit_sema
             Err(RepositoryError::Invariant(_))
         ));
     });
+}
+
+#[test]
+fn memory_lifecycle_executes_versioned_expiration_and_multipart_cleanup() {
+    block_on(async {
+        let (application_id, bucket_id, repository, _, _) = setup(VersioningStatus::Enabled);
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::days(10) + Duration::hours(12);
+        let rule = S3LifecycleRule {
+            id: Some("expire-assets".into()),
+            status: S3LifecycleRuleStatus::Enabled,
+            filter: S3LifecycleFilter::Prefix("folder/".into()),
+            expiration: Some(mediahub_core::S3Expiration::Days(1)),
+            noncurrent_version_expiration: None,
+            abort_incomplete_multipart_upload: Some(
+                mediahub_core::S3AbortIncompleteMultipartUpload {
+                    days_after_initiation: 1,
+                },
+            ),
+        };
+        repository
+            .replace_s3_bucket_lifecycle(
+                application_id,
+                "assets",
+                Some(S3LifecycleConfiguration::new(vec![rule]).expect("lifecycle")),
+                now,
+            )
+            .await
+            .expect("configure lifecycle");
+
+        let (object, version) =
+            list_data_head(application_id, bucket_id, "folder/lifecycle-current.bin");
+        let object_id = object.id();
+        let version_id = version.id();
+        repository.seed_object(object, vec![version]);
+
+        let attached_intent_id = UploadIntentId::new();
+        repository.state().intents.insert(
+            attached_intent_id,
+            UploadIntent::from_persistence(PersistedUploadIntent {
+                id: attached_intent_id,
+                application_id,
+                bucket_id,
+                object_key: "folder/incomplete.bin".into(),
+                proposed_version_id: ObjectVersionId::new(),
+                state: UploadIntentState::Committing,
+                storage_backend: "filesystem".into(),
+                temporary_storage_key: "multipart/attached-staging".into(),
+                final_storage_key: "multipart/attached-final".into(),
+                entity_tag: Some(EntityTag::new("attached-etag").expect("etag")),
+                checksum: Some(Checksum::sha256_hex("1".repeat(64)).expect("checksum")),
+                expected_size_bytes: 4,
+                size_bytes: Some(4),
+                content_type: Some("application/octet-stream".into()),
+                user_metadata: serde_json::json!({}),
+                object_tags: S3ObjectTagSet::empty(),
+                lease_token: Some("expired-completion".into()),
+                lease_until: Some(OffsetDateTime::UNIX_EPOCH + Duration::days(1)),
+                committed_object_id: None,
+                committed_version_id: None,
+                expires_at: now + Duration::days(30),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("attached intent"),
+        );
+        repository.seed_multipart_upload(
+            S3MultipartUpload {
+                upload_id: "lifecycle-upload".into(),
+                application_id,
+                bucket_id,
+                object_key: "folder/incomplete.bin".into(),
+                content_type: "application/octet-stream".into(),
+                user_metadata: serde_json::json!({}),
+                object_tags: S3ObjectTagSet::empty(),
+                storage_backend: "filesystem".into(),
+                state: S3MultipartUploadState::Completing,
+                expires_at: now + Duration::days(30),
+                completion_lease_until: Some(OffsetDateTime::UNIX_EPOCH + Duration::days(1)),
+                upload_intent_id: Some(attached_intent_id),
+                object_id: None,
+                object_version_id: None,
+                final_etag: None,
+                final_checksum: None,
+                completed_at: None,
+                aborted_at: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            vec!["multipart/lifecycle-part-1".into()],
+        );
+
+        let receipt = S3LifecycleService::new(repository.clone(), FixedClock::new(now))
+            .run_batch(S3LifecycleBatchCursor::default(), 10)
+            .await
+            .expect("run lifecycle");
+        assert_eq!(receipt.applied, 2);
+        let state = repository.state();
+        let current_id = state
+            .objects
+            .get(&object_id)
+            .expect("object")
+            .current_version_id()
+            .expect("delete marker head");
+        assert_ne!(current_id, version_id);
+        let versions = state.versions.get(&object_id).expect("versions");
+        let action_at = lifecycle_action_time(now);
+        assert!(
+            versions
+                .iter()
+                .find(|version| version.id() == version_id)
+                .expect("original version")
+                .became_noncurrent_at()
+                .is_some_and(|changed_at| changed_at == action_at)
+        );
+        let marker = versions
+            .iter()
+            .find(|version| version.id() == current_id && version.is_delete_marker())
+            .expect("lifecycle marker");
+        assert_eq!(marker.created_at(), action_at);
+        assert_eq!(
+            state
+                .multipart_uploads
+                .get("lifecycle-upload")
+                .expect("multipart upload")
+                .state,
+            S3MultipartUploadState::Aborted
+        );
+        assert!(state.gc_tasks.iter().any(|task| {
+            task.reason == StorageGcReason::MultipartTemporary
+                && task.multipart_upload_id.as_deref() == Some("lifecycle-upload")
+                && task.storage_key == "multipart/lifecycle-part-1"
+        }));
+        assert_eq!(
+            state
+                .intents
+                .get(&attached_intent_id)
+                .expect("attached intent")
+                .state(),
+            UploadIntentState::Aborted
+        );
+        for storage_key in ["multipart/attached-staging", "multipart/attached-final"] {
+            assert!(state.gc_tasks.iter().any(|task| {
+                task.reason == StorageGcReason::MultipartTemporary
+                    && task.upload_intent_id == Some(attached_intent_id)
+                    && task.multipart_upload_id.as_deref() == Some("lifecycle-upload")
+                    && task.storage_key == storage_key
+            }));
+        }
+        assert!(state.gc_tasks.iter().all(|task| {
+            task.object_version_id.is_none() || task.reason == StorageGcReason::LifecycleExpiration
+        }));
+    });
+}
+
+#[test]
+fn memory_lifecycle_regular_expiration_removes_due_sole_delete_marker() {
+    for expiration in [
+        mediahub_core::S3Expiration::Days(1),
+        mediahub_core::S3Expiration::Date(OffsetDateTime::UNIX_EPOCH + Duration::days(10)),
+    ] {
+        block_on(async move {
+            let (application_id, bucket_id, repository, _, _) = setup(VersioningStatus::Enabled);
+            let now = OffsetDateTime::UNIX_EPOCH + Duration::days(10) + Duration::hours(12);
+            repository
+                .replace_s3_bucket_lifecycle(
+                    application_id,
+                    "assets",
+                    Some(
+                        S3LifecycleConfiguration::new(vec![S3LifecycleRule {
+                            id: Some("regular-expiration-cleans-marker".into()),
+                            status: S3LifecycleRuleStatus::Enabled,
+                            filter: S3LifecycleFilter::Prefix("folder/".into()),
+                            expiration: Some(expiration),
+                            noncurrent_version_expiration: Some(
+                                mediahub_core::S3NoncurrentVersionExpiration { noncurrent_days: 1 },
+                            ),
+                            abort_incomplete_multipart_upload: None,
+                        }])
+                        .expect("lifecycle"),
+                    ),
+                    now,
+                )
+                .await
+                .expect("configure lifecycle");
+
+            let (object, version) =
+                list_data_head(application_id, bucket_id, "folder/regular-eodm.bin");
+            let object_id = object.id();
+            let data_version_id = version.id();
+            repository.seed_object(object, vec![version]);
+
+            let first = S3LifecycleService::new(repository.clone(), FixedClock::new(now))
+                .run_batch(S3LifecycleBatchCursor::default(), 3)
+                .await
+                .expect("create lifecycle marker");
+            assert_eq!(first.applied, 1);
+            let marker_id = repository
+                .state()
+                .objects
+                .get(&object_id)
+                .expect("object")
+                .current_version_id()
+                .expect("marker head");
+
+            let later = now + Duration::days(2);
+            let second = S3LifecycleService::new(repository.clone(), FixedClock::new(later))
+                .run_batch(S3LifecycleBatchCursor::default(), 6)
+                .await
+                .expect("expire noncurrent data and sole marker");
+            assert_eq!(second.applied, 2);
+
+            let state = repository.state();
+            assert_eq!(
+                state
+                    .objects
+                    .get(&object_id)
+                    .expect("logical object")
+                    .current_version_id(),
+                None
+            );
+            assert!(state.deleted_versions.contains(&data_version_id));
+            assert!(state.deleted_versions.contains(&marker_id));
+        });
+    }
+}
+
+#[test]
+fn memory_lifecycle_preserves_unversioned_and_suspended_delete_semantics() {
+    for status in [VersioningStatus::Unversioned, VersioningStatus::Suspended] {
+        block_on(async move {
+            let (application_id, _, repository, store, service) = setup(status);
+            let content = b"null-version";
+            let begun = begin_and_stage(application_id, &service, &store, content).await;
+            let completed = service
+                .complete_put(&complete_request(
+                    application_id,
+                    begun.intent.id(),
+                    content,
+                ))
+                .await
+                .expect("complete null version");
+            assert!(completed.version.is_null_version());
+
+            let now = OffsetDateTime::UNIX_EPOCH + Duration::days(10) + Duration::hours(12);
+            repository
+                .replace_s3_bucket_lifecycle(
+                    application_id,
+                    "assets",
+                    Some(
+                        S3LifecycleConfiguration::new(vec![S3LifecycleRule {
+                            id: Some("expire-null".into()),
+                            status: S3LifecycleRuleStatus::Enabled,
+                            filter: S3LifecycleFilter::Prefix("folder/".into()),
+                            expiration: Some(mediahub_core::S3Expiration::Days(1)),
+                            noncurrent_version_expiration: None,
+                            abort_incomplete_multipart_upload: None,
+                        }])
+                        .expect("lifecycle"),
+                    ),
+                    now,
+                )
+                .await
+                .expect("configure lifecycle");
+            let receipt = S3LifecycleService::new(repository.clone(), FixedClock::new(now))
+                .run_batch(S3LifecycleBatchCursor::default(), 10)
+                .await
+                .expect("run lifecycle");
+            assert_eq!(receipt.applied, 1);
+
+            let state = repository.state();
+            let object = state
+                .objects
+                .get(&completed.object.id())
+                .expect("logical object");
+            match status {
+                VersioningStatus::Unversioned => {
+                    assert_eq!(object.current_version_id(), None);
+                }
+                VersioningStatus::Suspended => {
+                    let marker_id = object.current_version_id().expect("null marker head");
+                    let marker = state
+                        .versions
+                        .get(&object.id())
+                        .expect("versions")
+                        .iter()
+                        .find(|version| {
+                            version.id() == marker_id
+                                && version.is_delete_marker()
+                                && version.is_null_version()
+                        })
+                        .expect("null lifecycle marker");
+                    assert_eq!(marker.created_at(), lifecycle_action_time(now));
+                }
+                VersioningStatus::Enabled => unreachable!(),
+            }
+            assert!(state.superseded_versions.contains(&completed.version.id()));
+            assert!(state.gc_tasks.iter().any(|task| {
+                task.object_version_id == Some(completed.version.id())
+                    && task.reason == StorageGcReason::LifecycleExpiration
+            }));
+        });
+    }
 }
 
 #[test]

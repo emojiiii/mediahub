@@ -640,6 +640,7 @@ function Write-CompatibilityReports {
     return [pscustomobject]@{ Json = $jsonPath; Markdown = $markdownPath; Failures = [int]$counts.FAIL }
 }
 
+. (Join-Path $PSScriptRoot 'S3Compat.RawSigV4.ps1')
 . (Join-Path $PSScriptRoot 'S3Compat.Clients.ps1')
 
 $detectedClients = @{}

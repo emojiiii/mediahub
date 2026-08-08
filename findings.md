@@ -98,7 +98,7 @@
 - ListObjectsV2 只从当前 committed ObjectVersion 读取，prefix/delimiter/cursor 使用同一排序窗口。
 - DeleteObject/DeleteObjects 在同一事务中处理版本语义、Object Lock 检查与持久化 GC；Governance bypass 必须是被 SigV4 签名的严格布尔 header。
 - Multipart 已使用 Part MD5、标准 multipart ETag、恢复/重放与持久化 GC；Complete 不再创建 Media。
-- 当前仍不能宣称完整 S3：缺 CopyObject/UploadPartCopy、ListObjectVersions、Policy、Tagging、Object Lock 修改 API、完整 Lifecycle 执行器、Notification/CORS/SSE 和广泛客户端互操作验证。
+- 该阶段仍不能宣称完整 S3；此后 CopyObject/UploadPartCopy、ListObjectVersions、Object Tagging、Object Lock 核心 API 和 Lifecycle 核心执行器已经补齐，当前主要差距转为 Policy、Notification、Bucket Tagging、CORS/SSE、virtual-host style 和广泛客户端互操作验证。
 - WebDAV 作为产品兼容层已保留，但内部仍待迁移到统一 ObjectService；Preview/Variant 也仍需绑定不可变 object_version_id。
 
 ## Docker 真实后端验证结论（2026-08-08）
@@ -163,3 +163,43 @@
 - 对象级 `?tagging` classifier 位于普通 GET/PUT/Copy/Multipart 之前，GET/HEAD 仅在标签非空时返回 `x-amz-tagging-count`。
 - AWS CLI 能严格覆盖 Tagging 正向语义，但 invalid/duplicate/超过 10 个标签与坏 percent-encoding 可能在客户端模型层先失败；没有可审计 raw SigV4 发包器时必须记为 SKIP，不能冒充服务端 PASS。
 - 连续预览应以当前可见文件集合为导航边界，并在 item id/revision 变化时重建预览状态；否则旧签名 URL、Variant 或缩放状态会跨对象泄漏。
+
+## 标准 S3 Lifecycle 执行器初始审计（2026-08-08）
+
+- 当前工作树干净且 HEAD 为用户指定的 `2d512fd`；该提交已经包含上一轮 Tagging、预览和兼容矩阵结果。
+- Core 已有严格的 `S3LifecycleConfiguration` 模型与 PUT 阶段解析拒绝；执行器应消费规范化配置，不重新解释 XML。
+- `ObjectVersion` 已持久化 `became_noncurrent_at`，数据库已有 bucket/time/id 索引，可作为 NoncurrentVersionExpiration 的扫描事实。
+- `StorageGcReason` 已包含 `LifecycleExpiration`，但现有对象删除路径当前固定使用 `ExplicitDelete`；Lifecycle 不能直接冒充普通 DeleteObject 调用。
+- PostgreSQL 已有 `delete_s3_object_in_transaction` 与 Object Lock 检查，后续设计必须提取/参数化事务内删除语义，而不是在 worker 中直接删行或扫描对象存储。
+- `run_lifecycle_worker` 目前只处理旧 Media 生命周期、上传会话和全局 `expires_at` Multipart；标准 S3 Lifecycle 尚未接入，物理对象删除应继续交给独立 `run_s3_storage_cleanup_worker` 消费持久 GC task。
+- Bucket S3 configuration 已有单调 `revision`，Lifecycle PUT、Versioning 与 Object Lock 配置变更都会推进 revision，正好可作为“扫描后执行前”事务 fencing token。
+- 现有 Multipart `abort_upload_and_enqueue_cleanup` 会在事务内把 upload 设为 aborted，并为 part/attached intent 写持久 GC；Lifecycle 应复用这一终止语义并增加 bucket/prefix/config-revision/initiated-at 条件重检。
+- 现有 `expire_multipart_uploads` 只按 upload 自身 `expires_at` 扫描，不能表达 bucket Lifecycle Rule 的 prefix 与 DaysAfterInitiation；标准执行器需要独立候选端口，不能拿全局 TTL 冒充 Lifecycle。
+- Core Lifecycle 模型当前仅包含 Empty/Prefix filter、Expiration、NoncurrentVersionExpiration 与 AbortIncompleteMultipartUpload；transition/tag/size filter 不进入模型，符合 PUT 阶段显式拒绝要求。
+- 普通 `DeleteS3ObjectCommand` 同时承载外部 DeleteObject 的 marker ID、bypass flag 和 `ExplicitDelete` GC reason，直接复用该命令会破坏 Lifecycle 的 expected-current/config-revision fence 与 reason；需要 Lifecycle 专用执行命令和 outcome。
+- Lifecycle current expiration 在 Enabled bucket 必须锁定扫描时的 `current_version_id`，重检后才创建 marker；Suspended/Unversioned 也要带 expected-current，随后复用对应 null-version 删除语义。
+- Noncurrent/Expired-marker 应以内部 `ObjectVersionId` 精确定位；前者删除后不能把旧版本提升为 current，后者仅允许 current marker 且确认除 marker 外无 active version。
+- Object Lock 判定函数已经满足“legal hold 优先、未到期 Governance/Compliance 均阻止；bypass=false 时 Governance 不可删除”。Lifecycle 专用路径应始终以 bypass=false 调用同一判定逻辑。
+- 持久 GC 对同一 storage key 已具备幂等约束；需将 helper 的 reason 参数化并把 Lifecycle task identity 纳入精确重复判断。
+- App 层已适合承载生命周期编排：`Clock` 可注入 Fake Clock，Repository 只负责元数据候选与事务执行；UTC Days 截止采用“今天 00:00 UTC 减去 days”，并用候选时间严格 `< cutoff`，从而实现 S3 的次日午夜边界。
+- 最终 batch 以“一次 bucket/action 候选查询”为预算单位，空结果同样消费预算且查询固定 `LIMIT 1`；cursor 的 action round 在 current、ordinary/EODM marker、noncurrent、multipart 与后续 bucket 间轮转，事务 fencing/幂等检查仍是最终保障。
+- Memory repository 原先把 Lifecycle replacement 留为 `unreachable!`，本切片必须补成真实 revision 更新，否则无法验证配置竞争场景。
+- PostgreSQL 执行器必须与 Multipart 用户请求保持同一锁序，并只锁定 action 所需的 current/exact/null/marker 版本；不能在单个 key 上无界锁定全部活跃版本。配置 revision/rule、expected current 或 exact version、noncurrent timestamp、Object Lock 都要在变更前重检。
+- current expiration 在 Enabled 只创建 marker、不回收旧 data；Suspended 只回收 active null 并创建 null marker；Unversioned 回收 null data 并清空 head，均沿用现有删除语义。
+- expired marker 路径要求 current pointer 命中且 active version 数量恰为 1；Noncurrent 路径不会提升旧版本为 head。
+- Lifecycle Multipart scanner 排除仍持有 completion lease 的上传；执行时再次锁 upload 并检查 lease，过期 completing 可复用现有 attached-intent/parts 持久清理原语。
+- 现有 PG contract 统一使用专用 `MEDIAHUB_TEST_POSTGRES_URL`、迁移后 `TRUNCATE users CASCADE`、真实 S3ObjectService 写版本；Lifecycle contract 可复用同一模式验证元数据、GC reason 和事务竞争，而无需访问真实对象存储。
+- 最终实现没有新增对象存储枚举/扫描：Lifecycle worker 只分页读取 bucket/config 与 PostgreSQL metadata 候选，物理 blob 仍由既有持久 GC lease/retry worker 清理。
+- 实际竞争验证覆盖 scan→execute 窗口：配置 revision 变化返回 `ConfigurationChanged`、current head 被新 PUT 替换返回 `TargetChanged`；Enabled current Expiration 只创建 marker，不受现有 data version Retention 阻止，而受保护 noncurrent exact version 的永久回收返回 `Locked`。
+- PG17 合同证明对象过期 GC reason 为 `lifecycle_expiration`，Multipart part 仍使用其专属 `multipart_temporary`，没有冒充 `explicit_delete`。
+- Enabled current expiration 只新增 delete marker；随后 NoncurrentVersionExpiration 精确回收 data version，最后只有 current marker 时 ExpiredObjectDeleteMarker 才移除 marker。Memory 另行验证 Unversioned 清空 head、Suspended 创建 null marker。
+- Memory adapter 现也完整模拟过期 `Completing` Multipart 的 attached UploadIntent 清理：intent 转为 Aborted，temporary/final 与 part keys 都写入 `MultipartTemporary` GC；与 PostgreSQL 生产实现一致，不再长期返回 Busy。
+
+## PostgreSQL Lifecycle 事务安全复审（2026-08-08）
+
+- 现实现对所有 Lifecycle action 都先 `buckets FOR SHARE`；Multipart Complete 则先锁 upload，再进入 bucket/object 提交边界，因此 Lifecycle Abort 的 `bucket -> upload` 与用户 Complete 的 `upload -> bucket` 构成 ABBA。修复方向是仅 Multipart Lifecycle 改为 `upload -> bucket`，并在 bucket 锁下重做 revision/rule fence。
+- `lock_active_versions` 对同一 object 的全部 active committed versions 执行无 LIMIT `FOR UPDATE + fetch_all`。Object row 已先锁，按 action 精确锁 current/exact/null/marker 足以保持 head fence；EODM 只需再做 active sibling 存在性确认。
+- PostgreSQL S3 路径目前没有任何 `applications.used_bytes/reserved_bytes` 更新：普通 Put/Multipart 建立和提交都不记账，普通 S3 delete 也不减账。现阶段若 Lifecycle 单方面扣减会破坏账本；安全目标应是 contract 证明 Lifecycle 不使 quota 漂移，并把“先统一接入全部 S3 写入/删除 quota”记录为独立阻塞。
+- 现有 Lifecycle 候选 SQL 使用 `LEFT(key, length(prefix))`，current/marker join 缺 joined-version bucket predicate；0013 索引列序和查询 ORDER BY 不完全一致。可用转义后的 `LIKE prefix% ESCAPE '\\'` 配合 `text_pattern_ops`，并让 partial index 与固定状态谓词和排序列一致。
+- App 已新增普通 Expiration 对 sole delete marker 的调度入口。PG 必须显式 override：Days 只扫描 `marker.created_at < UTC-days-cutoff`，Date 仅在配置日期到达后扫描，显式 EODM 无时间门槛；执行期必须在锁 marker 后以 marker 时间调用 `_at` helper。
+- 完整 Multipart 顺序现在统一为 `upload -> attached intent -> bucket`。虽然同一 upload 的排他行锁已能序列化 Complete/Lifecycle，显式 prelock intent 仍可消除未来 helper/旁路造成的 intent/bucket 逆序，并让锁顺序成为代码结构不变量。
