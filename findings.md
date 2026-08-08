@@ -203,3 +203,19 @@
 - 现有 Lifecycle 候选 SQL 使用 `LEFT(key, length(prefix))`，current/marker join 缺 joined-version bucket predicate；0013 索引列序和查询 ORDER BY 不完全一致。可用转义后的 `LIKE prefix% ESCAPE '\\'` 配合 `text_pattern_ops`，并让 partial index 与固定状态谓词和排序列一致。
 - App 已新增普通 Expiration 对 sole delete marker 的调度入口。PG 必须显式 override：Days 只扫描 `marker.created_at < UTC-days-cutoff`，Date 仅在配置日期到达后扫描，显式 EODM 无时间门槛；执行期必须在锁 marker 后以 marker 时间调用 `_at` helper。
 - 完整 Multipart 顺序现在统一为 `upload -> attached intent -> bucket`。虽然同一 upload 的排他行锁已能序列化 Complete/Lifecycle，显式 prelock intent 仍可消除未来 helper/旁路造成的 intent/bucket 逆序，并让锁顺序成为代码结构不变量。
+# 2026-08-08 S3 quota / policy implementation findings
+
+- PrismArk 的 S3 ObjectVersion 写入统一经过 `S3ObjectService::begin_put`：PutObject、CopyObject、CompleteMultipartUpload 和 WebDAV ObjectVersion 写入均可复用同一 intent reservation，因此配额不需要在 HTTP handler 各自实现。
+- PostgreSQL 配额锁序应保持 intent/upload（若存在）→ bucket → object/version（若存在）→ application；创建新 intent/multipart 时从 bucket → application 开始。当前切片没有发现 application → bucket 的反向获取。
+- Silo 的 hard bucket quota 在数据面超额时同样返回 S3 `EntityTooLarge`；PrismArk 将 `RepositoryError::QuotaExceeded` 映射为 `EntityTooLarge` 与该参考行为一致，不需要另造非标准错误码。
+- 生命周期和普通永久删除只有在 data ObjectVersion 进入逻辑永久删除时才释放 used bytes；delete marker 为 0 字节，Enabled 下仅创建 marker 不释放历史 data，null replacement 则在同一事务按 `new - old` 转移。
+- Bucket Policy 持久化切片采用数据库 identity 生成稳定 12 位账户 ID，并用不可变 trigger 防止重写；bucket 名从 tenant 内唯一提升为全局唯一，符合匿名 path-style 先按 bucket 定位 owner/policy 的前置要求。
+- 现有 PostgreSQL unique violation 已统一映射为 `RepositoryError::Conflict`，因此全局 `buckets_name_key` 不需要在 create bucket 路径增加基于旧 constraint 名称的兼容分支。
+- Policy persistence 的 UPDATE 直接锁 bucket 行并从 applications 只读 owner account，不取得 application 行锁；这保持 bucket-first，不会和 S3 quota 的 application-last 形成 ABBA。
+- 当前 Access Key 的 9 项 permissions 同时服务 PrismArk JSON API/WebDAV/S3；直接删除字段会破坏非 S3 产品能力。S3 对齐应新增标准 identity-policy 语义并让 S3 授权器消费它，现有 permissions 继续作为 JSON/WebDAV 的独立权限模型，而不是作为 Bucket Policy 的 fallback。
+- 当前 `load_s3_authentication` 把“解析 SigV4、查 key、验签、构造 ApplicationAuth”绑定在一起，并且所有 S3 路径随后直接调用 `ApplicationAuth::authorize`。支持匿名 Bucket Policy 需要拆成可选 principal 认证与统一 S3 policy authorization；存在 Authorization 但签名无效时必须失败，绝不能降级匿名。
+- AWS 官方 API：PutBucketPolicy 的规范 Response Syntax 是 200 empty（旧示例仍展示 204），DeleteBucketPolicy 明确为 204，GetBucketPolicy 为 200 JSON policy；本实现采用规范表定义的 200/204。
+- AWS 官方 REST `GetBucketPolicyStatus` 返回 XML `PolicyStatus/IsPublic`；Boto3 文档展示的 JSON 是 SDK 反序列化结构，HTTP handler 不能误做 JSON。
+- Bucket Policy 管理要求调用身份属于 bucket owner account；权限不足为 403，权限正确但跨 owner 为 405。`x-amz-expected-bucket-owner` 不匹配始终为 403。
+- 参考：AWS PutBucketPolicy https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketPolicy.html ，GetBucketPolicy https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicy.html ，DeleteBucketPolicy https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteBucketPolicy.html ，GetBucketPolicyStatus https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketPolicyStatus.html 。
+- README 与 `docs/s3-compatibility.md` 仍把完整 S3 quota 和 Bucket Policy 标为未实现；Policy HTTP/授权接线通过后必须更新能力矩阵与兼容测试边界，不能让产品文档继续低估或误报当前状态。

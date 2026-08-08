@@ -531,6 +531,16 @@ impl S3ApiError {
         )
     }
 
+    fn bucket_already_exists(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "BucketAlreadyExists",
+            "The requested bucket name is not available.",
+            resource,
+            request_id,
+        )
+    }
+
     fn bucket_not_empty(resource: &str, request_id: &str) -> Self {
         Self::new(
             StatusCode::CONFLICT,
@@ -596,6 +606,36 @@ impl S3ApiError {
             StatusCode::NOT_FOUND,
             "NoSuchLifecycleConfiguration",
             "The lifecycle configuration does not exist.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn no_such_bucket_policy(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucketPolicy",
+            "The bucket policy does not exist.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn policy_too_large(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "PolicyTooLarge",
+            "Policy exceeds the maximum allowed size of 20 KiB.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn malformed_policy(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "MalformedPolicy",
+            "Policy has invalid resource, action, principal, or condition syntax.",
             resource,
             request_id,
         )

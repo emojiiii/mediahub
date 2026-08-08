@@ -1706,6 +1706,12 @@ async fn delete_s3_object_in_transaction(
             )
             .await?;
         }
+        release_s3_used_bytes(
+            transaction,
+            target.application_id(),
+            object_version_size_bytes(target),
+        )
+        .await?;
         return Ok(DeleteS3ObjectOutcome::Deleted(DeletedS3ObjectVersion {
             version_id: Some(target.external_version_id().clone()),
             delete_marker: target.is_delete_marker(),
@@ -1774,6 +1780,12 @@ async fn delete_s3_object_in_transaction(
                 }
                 supersede_active_null_version(transaction, Some(version), command.deleted_at)
                     .await?;
+                release_s3_used_bytes(
+                    transaction,
+                    version.application_id(),
+                    object_version_size_bytes(version),
+                )
+                .await?;
             }
             insert_object_version(transaction, &marker).await?;
             advance_object_to_delete_marker(transaction, &object, &marker, command.deleted_at)
@@ -1800,6 +1812,12 @@ async fn delete_s3_object_in_transaction(
             supersede_active_null_version(transaction, Some(active_null), command.deleted_at)
                 .await?;
             update_deleted_object_head(transaction, &object, None, command.deleted_at).await?;
+            release_s3_used_bytes(
+                transaction,
+                active_null.application_id(),
+                object_version_size_bytes(active_null),
+            )
+            .await?;
             Ok(DeleteS3ObjectOutcome::Deleted(DeletedS3ObjectVersion {
                 version_id: None,
                 delete_marker: false,
@@ -1816,6 +1834,14 @@ impl S3UploadIntentRepository for PostgresRepository {
                 "a new upload intent must be in staging state".into(),
             ));
         }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        lock_s3_quota_bucket(
+            &mut transaction,
+            intent.application_id(),
+            intent.bucket_id(),
+        )
+        .await?;
+        reserve_s3_upload_intent_quota(&mut transaction, intent).await?;
         sqlx::query(
             "INSERT INTO s3_upload_intents (
                 id, application_id, bucket_id, object_key, proposed_version_id, state,
@@ -1845,9 +1871,10 @@ impl S3UploadIntentRepository for PostgresRepository {
         .bind(postgres_time(intent.expires_at()))
         .bind(postgres_time(intent.created_at()))
         .bind(postgres_time(intent.updated_at()))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
         Ok(())
     }
 
@@ -1981,13 +2008,16 @@ impl S3UploadIntentRepository for PostgresRepository {
             bucket_id: intent.bucket_id(),
             object_key: intent.object_key(),
         };
-        let object = commit_object_version_in_transaction(
+        let committed = commit_object_version_in_transaction(
             &mut transaction,
             &commit,
             intent.object_tags(),
             expected,
         )
         .await?;
+        transfer_s3_upload_intent_quota(&mut transaction, &intent, committed.released_used_bytes)
+            .await?;
+        let object = committed.object;
 
         let result = sqlx::query(
             "UPDATE s3_upload_intents
@@ -2028,10 +2058,16 @@ impl S3UploadIntentRepository for PostgresRepository {
             return Err(RepositoryError::Conflict);
         }
         validate_upload_intent_gc_template(&intent, &gc_task)?;
+        lock_s3_quota_bucket(
+            &mut transaction,
+            intent.application_id(),
+            intent.bucket_id(),
+        )
+        .await?;
         enqueue_upload_intent_cleanup(&mut transaction, &intent, &gc_task).await?;
 
-        let aborted = match intent.state() {
-            UploadIntentState::Aborted | UploadIntentState::Expired => intent,
+        let (aborted, released_reservation) = match intent.state() {
+            UploadIntentState::Aborted | UploadIntentState::Expired => (intent.clone(), false),
             UploadIntentState::Staging
             | UploadIntentState::Ready
             | UploadIntentState::Committing => {
@@ -2046,10 +2082,13 @@ impl S3UploadIntentRepository for PostgresRepository {
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-                row_to_upload_intent(row)?
+                (row_to_upload_intent(row)?, true)
             }
             UploadIntentState::Committed => unreachable!("handled above"),
         };
+        if released_reservation {
+            release_s3_upload_intent_quota(&mut transaction, &intent).await?;
+        }
 
         transaction.commit().await.map_err(database_error)?;
         Ok(aborted)
@@ -2075,7 +2114,7 @@ impl S3UploadIntentRepository for PostgresRepository {
              WHERE expires_at <= $1
                AND (state IN ('staging', 'ready')
                  OR (state = 'committing' AND lease_until <= $1))
-             ORDER BY expires_at, id
+             ORDER BY application_id, bucket_id, expires_at, id
              FOR UPDATE SKIP LOCKED
              LIMIT $2",
         )
@@ -2090,6 +2129,12 @@ impl S3UploadIntentRepository for PostgresRepository {
             .collect::<Result<Vec<_>, _>>()?;
 
         for intent in &intents {
+            lock_s3_quota_bucket(
+                &mut transaction,
+                intent.application_id(),
+                intent.bucket_id(),
+            )
+            .await?;
             enqueue_expired_upload_intent_cleanup(&mut transaction, intent, gc_max_attempts, now)
                 .await?;
             let result = sqlx::query(
@@ -2107,6 +2152,7 @@ impl S3UploadIntentRepository for PostgresRepository {
             if result.rows_affected() != 1 {
                 return Err(RepositoryError::Conflict);
             }
+            release_s3_upload_intent_quota(&mut transaction, intent).await?;
         }
 
         transaction.commit().await.map_err(database_error)?;
@@ -2288,13 +2334,16 @@ impl S3UploadIntentRepository for PostgresRepository {
 
         freeze_postgres_object_lock(&mut transaction, &mut commit).await?;
 
-        let object = commit_object_version_in_transaction(
+        let committed = commit_object_version_in_transaction(
             &mut transaction,
             &commit,
             intent.object_tags(),
             expected,
         )
         .await?;
+        transfer_s3_upload_intent_quota(&mut transaction, &intent, committed.released_used_bytes)
+            .await?;
+        let object = committed.object;
         let intent_updated = sqlx::query(
             "UPDATE s3_upload_intents
              SET state = 'committed', lease_token = NULL, lease_until = NULL,
@@ -2929,6 +2978,150 @@ pub(crate) async fn supersede_active_null_version(
     }
 }
 
+/// Locks the tenant bucket before any S3 quota ledger row is touched. S3
+/// mutation paths deliberately acquire the Application row last to avoid a
+/// bucket/application ABBA with object commits and deletes.
+pub(crate) async fn lock_s3_quota_bucket(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    application_id: ApplicationId,
+    bucket_id: BucketId,
+) -> Result<(), RepositoryError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT TRUE FROM buckets
+         WHERE id = $1 AND application_id = $2
+         FOR SHARE",
+    )
+    .bind(bucket_id.as_uuid())
+    .bind(application_id.as_uuid())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .unwrap_or(false);
+    if exists {
+        Ok(())
+    } else {
+        Err(RepositoryError::NotFound)
+    }
+}
+
+async fn reserve_s3_upload_intent_quota(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    intent: &UploadIntent,
+) -> Result<(), RepositoryError> {
+    let bytes = as_i64(intent.expected_size_bytes())?;
+    let reserved = sqlx::query(
+        "UPDATE applications
+         SET reserved_bytes = reserved_bytes + $1
+         WHERE id = $2 AND quota_bytes - used_bytes - reserved_bytes >= $1",
+    )
+    .bind(bytes)
+    .bind(intent.application_id().as_uuid())
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if reserved.rows_affected() == 1 {
+        return Ok(());
+    }
+    let exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM applications WHERE id = $1)")
+            .bind(intent.application_id().as_uuid())
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+    Err(if exists {
+        RepositoryError::QuotaExceeded
+    } else {
+        RepositoryError::NotFound
+    })
+}
+
+pub(crate) async fn release_s3_upload_intent_quota(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    intent: &UploadIntent,
+) -> Result<(), RepositoryError> {
+    let bytes = as_i64(intent.expected_size_bytes())?;
+    let released = sqlx::query(
+        "UPDATE applications
+         SET reserved_bytes = reserved_bytes - $1
+         WHERE id = $2 AND reserved_bytes >= $1",
+    )
+    .bind(bytes)
+    .bind(intent.application_id().as_uuid())
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if released.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(RepositoryError::Invariant(
+            "S3 upload intent has no matching quota reservation".into(),
+        ))
+    }
+}
+
+async fn transfer_s3_upload_intent_quota(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    intent: &UploadIntent,
+    released_used_bytes: u64,
+) -> Result<(), RepositoryError> {
+    let committed_bytes = as_i64(intent.expected_size_bytes())?;
+    let released_used_bytes = as_i64(released_used_bytes)?;
+    let transferred = sqlx::query(
+        "UPDATE applications
+         SET reserved_bytes = reserved_bytes - $1,
+             used_bytes = used_bytes + $1 - $2
+         WHERE id = $3 AND reserved_bytes >= $1 AND used_bytes >= $2",
+    )
+    .bind(committed_bytes)
+    .bind(released_used_bytes)
+    .bind(intent.application_id().as_uuid())
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if transferred.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(RepositoryError::Invariant(
+            "S3 upload intent quota transfer is missing or would underflow".into(),
+        ))
+    }
+}
+
+pub(crate) async fn release_s3_used_bytes(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    application_id: ApplicationId,
+    bytes: u64,
+) -> Result<(), RepositoryError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let bytes = as_i64(bytes)?;
+    let released = sqlx::query(
+        "UPDATE applications
+         SET used_bytes = used_bytes - $1
+         WHERE id = $2 AND used_bytes >= $1",
+    )
+    .bind(bytes)
+    .bind(application_id.as_uuid())
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if released.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(RepositoryError::Invariant(
+            "S3 committed object quota release is missing or would underflow".into(),
+        ))
+    }
+}
+
+pub(crate) fn object_version_size_bytes(version: &ObjectVersion) -> u64 {
+    match version.payload() {
+        ObjectVersionPayload::Object(payload) => payload.size_bytes(),
+        ObjectVersionPayload::DeleteMarker => 0,
+    }
+}
+
 async fn freeze_postgres_object_lock(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     commit: &mut S3ObjectVersionCommit,
@@ -2971,13 +3164,19 @@ async fn freeze_postgres_object_lock(
     Ok(())
 }
 
+struct CommittedS3ObjectVersion {
+    object: S3Object,
+    released_used_bytes: u64,
+}
+
 async fn commit_object_version_in_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     commit: &S3ObjectVersionCommit,
     object_tags: &S3ObjectTagSet,
     expected: ExpectedObjectIdentity<'_>,
-) -> Result<S3Object, RepositoryError> {
+) -> Result<CommittedS3ObjectVersion, RepositoryError> {
     commit.validate()?;
+    let mut released_used_bytes = 0;
     let advanced = match &commit.target {
         S3ObjectCommitTarget::Create(object) => {
             validate_expected_object_identity(object, &expected)?;
@@ -3040,6 +3239,10 @@ async fn commit_object_version_in_transaction(
                 None
             };
             validate_null_version_replacement(commit, active_null.as_ref())?;
+            released_used_bytes = active_null
+                .as_ref()
+                .map(object_version_size_bytes)
+                .unwrap_or(0);
 
             let advanced = object
                 .advanced_to(&commit.version, commit.committed_at)
@@ -3100,7 +3303,10 @@ async fn commit_object_version_in_transaction(
             ensure_persisted_null_replacement_gc_task(transaction, task).await?;
         }
     }
-    Ok(advanced)
+    Ok(CommittedS3ObjectVersion {
+        object: advanced,
+        released_used_bytes,
+    })
 }
 
 fn validate_upload_intent_gc_template(

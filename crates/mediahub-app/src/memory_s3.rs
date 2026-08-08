@@ -20,26 +20,28 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    BeginPutObjectReceipt, BeginPutObjectRequest, CompletePutObjectRequest, ComposedObject,
-    DeleteObjectRequest, DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion,
-    ExecuteS3LifecycleCommand, FixedClock, InMemoryObjectStore, ListObjectVersionsRequest,
-    NewS3ObjectLock, ObjectMetadata, ObjectPage, ObjectStore, ObjectStoreError,
-    PutObjectLegalHoldRequest, PutObjectRetentionRequest, PutObjectTaggingRequest,
-    PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository,
-    S3CurrentExpirationCandidate, S3DeleteLockReason, S3ExpiredDeleteMarkerCandidate,
-    S3LifecycleBatchCursor, S3LifecycleExecutionOutcome, S3LifecycleRepository, S3LifecycleService,
-    S3LifecycleTarget, S3MultipartLifecycleCandidate, S3MultipartUpload, S3MultipartUploadState,
-    S3NoncurrentExpirationCandidate, S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery,
-    S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectRequest, S3ObjectService,
-    S3ObjectServiceError, S3ObjectTaggingCommand, S3ObjectTaggingOutcome, S3ObjectVersionCommit,
-    S3ObjectVersionRead, S3UploadIntentRepository, StreamedObject, lifecycle_action_time,
+    AbortStagedPutRequest, BeginPutObjectReceipt, BeginPutObjectRequest, CompletePutObjectRequest,
+    ComposedObject, DeleteObjectRequest, DeleteS3ObjectCommand, DeleteS3ObjectOutcome,
+    DeletedS3ObjectVersion, ExecuteS3LifecycleCommand, FixedClock, InMemoryObjectStore,
+    ListObjectVersionsRequest, NewS3ObjectLock, ObjectMetadata, ObjectPage, ObjectStore,
+    ObjectStoreError, PutObjectLegalHoldRequest, PutObjectRetentionRequest,
+    PutObjectTaggingRequest, PutS3ObjectLockCommand, PutS3ObjectLockOutcome, QuotaSnapshot,
+    RepositoryError, S3BucketRepository, S3CurrentExpirationCandidate, S3DeleteLockReason,
+    S3ExpiredDeleteMarkerCandidate, S3LifecycleBatchCursor, S3LifecycleExecutionOutcome,
+    S3LifecycleRepository, S3LifecycleService, S3LifecycleTarget, S3MultipartLifecycleCandidate,
+    S3MultipartUpload, S3MultipartUploadState, S3NoncurrentExpirationCandidate,
+    S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectLockMutation, S3ObjectPage,
+    S3ObjectRepository, S3ObjectRequest, S3ObjectService, S3ObjectServiceError,
+    S3ObjectTaggingCommand, S3ObjectTaggingOutcome, S3ObjectVersionCommit, S3ObjectVersionRead,
+    S3UploadIntentRepository, StreamedObject, lifecycle_action_time,
     lifecycle_rule_aborts_multipart, lifecycle_rule_is_current_due,
     lifecycle_rule_is_noncurrent_due, lifecycle_rule_removes_expired_marker_at,
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     buckets: Vec<S3Bucket>,
+    quotas: HashMap<ApplicationId, QuotaSnapshot>,
     intents: HashMap<UploadIntentId, UploadIntent>,
     objects: HashMap<ObjectId, S3Object>,
     versions: HashMap<ObjectId, Vec<ObjectVersion>>,
@@ -60,9 +62,18 @@ struct MemoryS3Repository {
 
 impl MemoryS3Repository {
     fn new(bucket: S3Bucket, events: Arc<Mutex<Vec<String>>>) -> Self {
+        let application_id = bucket.application_id();
         Self {
             state: Arc::new(Mutex::new(State {
                 buckets: vec![bucket],
+                quotas: HashMap::from([(
+                    application_id,
+                    QuotaSnapshot {
+                        quota_bytes: 1_u64 << 40,
+                        used_bytes: 0,
+                        reserved_bytes: 0,
+                    },
+                )]),
                 ..State::default()
             })),
             events,
@@ -92,8 +103,49 @@ impl MemoryS3Repository {
         self.state().fail_commit = true;
     }
 
+    fn set_quota_bytes(
+        &self,
+        application_id: ApplicationId,
+        quota_bytes: u64,
+    ) -> Result<(), RepositoryError> {
+        let mut state = self.state();
+        let quota = state
+            .quotas
+            .get_mut(&application_id)
+            .ok_or(RepositoryError::NotFound)?;
+        if quota.used_bytes.saturating_add(quota.reserved_bytes) > quota_bytes {
+            return Err(RepositoryError::QuotaExceeded);
+        }
+        quota.quota_bytes = quota_bytes;
+        Ok(())
+    }
+
+    fn quota(&self, application_id: ApplicationId) -> QuotaSnapshot {
+        self.state()
+            .quotas
+            .get(&application_id)
+            .copied()
+            .expect("memory S3 quota exists")
+    }
+
     fn seed_object(&self, object: S3Object, versions: Vec<ObjectVersion>) {
         let mut state = self.state();
+        let seeded_bytes = versions
+            .iter()
+            .filter(|version| version.state() == ObjectVersionState::Committed)
+            .try_fold(0_u64, |total, version| {
+                total.checked_add(memory_object_version_size(version))
+            })
+            .expect("seeded S3 object bytes fit u64");
+        let quota = state
+            .quotas
+            .get_mut(&object.application_id())
+            .expect("seeded S3 application quota exists");
+        quota.used_bytes = quota
+            .used_bytes
+            .checked_add(seeded_bytes)
+            .expect("seeded S3 used bytes fit u64");
+        assert!(quota.used_bytes + quota.reserved_bytes <= quota.quota_bytes);
         state.versions.insert(object.id(), versions);
         state.objects.insert(object.id(), object);
     }
@@ -106,6 +158,20 @@ impl MemoryS3Repository {
         state
             .multipart_uploads
             .insert(upload.upload_id.clone(), upload);
+    }
+
+    fn seed_upload_intent(&self, intent: UploadIntent) {
+        let mut state = self.state();
+        let quota = state
+            .quotas
+            .get_mut(&intent.application_id())
+            .expect("seeded S3 application quota exists");
+        quota.reserved_bytes = quota
+            .reserved_bytes
+            .checked_add(intent.expected_size_bytes())
+            .expect("seeded S3 reservation fits u64");
+        assert!(quota.used_bytes + quota.reserved_bytes <= quota.quota_bytes);
+        state.intents.insert(intent.id(), intent);
     }
 }
 
@@ -138,7 +204,16 @@ impl S3BucketRepository for MemoryS3Repository {
     }
 
     async fn create_s3_bucket(&self, bucket: &S3Bucket) -> Result<(), RepositoryError> {
-        self.state().buckets.push(bucket.clone());
+        let mut state = self.state();
+        state
+            .quotas
+            .entry(bucket.application_id())
+            .or_insert(QuotaSnapshot {
+                quota_bytes: 1_u64 << 40,
+                used_bytes: 0,
+                reserved_bytes: 0,
+            });
+        state.buckets.push(bucket.clone());
         Ok(())
     }
 
@@ -506,7 +581,8 @@ impl S3LifecycleRepository for MemoryS3Repository {
             ));
         }
         let mut state = self.state();
-        let Some(bucket) = state
+        let mut staged = state.clone();
+        let Some(bucket) = staged
             .buckets
             .iter()
             .find(|bucket| {
@@ -526,14 +602,14 @@ impl S3LifecycleRepository for MemoryS3Repository {
             return Ok(S3LifecycleExecutionOutcome::ConfigurationChanged);
         }
 
-        match &command.target {
+        let outcome = match &command.target {
             S3LifecycleTarget::ExpireCurrent {
                 object_id,
                 object_key,
                 expected_current_version_id,
                 version_created_at,
             } => execute_memory_current_expiration(
-                &mut state,
+                &mut staged,
                 &bucket,
                 *object_id,
                 object_key,
@@ -547,7 +623,7 @@ impl S3LifecycleRepository for MemoryS3Repository {
                 version_id,
                 expected_became_noncurrent_at,
             } => execute_memory_noncurrent_expiration(
-                &mut state,
+                &mut staged,
                 *object_id,
                 object_key,
                 *version_id,
@@ -559,7 +635,7 @@ impl S3LifecycleRepository for MemoryS3Repository {
                 object_key,
                 marker_version_id,
             } => execute_memory_expired_marker(
-                &mut state,
+                &mut staged,
                 *object_id,
                 object_key,
                 *marker_version_id,
@@ -570,13 +646,15 @@ impl S3LifecycleRepository for MemoryS3Repository {
                 object_key,
                 expected_initiated_at,
             } => execute_memory_multipart_abort(
-                &mut state,
+                &mut staged,
                 upload_id,
                 object_key,
                 *expected_initiated_at,
                 command,
             ),
-        }
+        }?;
+        *state = staged;
+        Ok(outcome)
     }
 }
 
@@ -903,6 +981,11 @@ impl S3ObjectRepository for MemoryS3Repository {
             if let Some(reason) = delete_lock_reason(&target, command) {
                 return Ok(DeleteS3ObjectOutcome::Locked(reason));
             }
+            let released_quota = memory_s3_quota_after_used_release(
+                &state,
+                target.application_id(),
+                memory_object_version_size(&target),
+            )?;
             if let Some(task) = explicit_delete_gc_task(&target, command) {
                 enqueue_memory_gc_task(&mut state, task)?;
             }
@@ -923,6 +1006,7 @@ impl S3ObjectRepository for MemoryS3Repository {
                     rebuild_object_head(&object, next_current, command.deleted_at)?,
                 );
             }
+            state.quotas.insert(target.application_id(), released_quota);
             return Ok(DeleteS3ObjectOutcome::Deleted(DeletedS3ObjectVersion {
                 version_id: Some(target.external_version_id().clone()),
                 delete_marker: target.is_delete_marker(),
@@ -968,6 +1052,16 @@ impl S3ObjectRepository for MemoryS3Repository {
                 {
                     return Ok(DeleteS3ObjectOutcome::Locked(reason));
                 }
+                let released_quota = active_null
+                    .as_ref()
+                    .map(|version| {
+                        memory_s3_quota_after_used_release(
+                            &state,
+                            version.application_id(),
+                            memory_object_version_size(version),
+                        )
+                    })
+                    .transpose()?;
                 let generation = object.generation().checked_add(1).ok_or_else(|| {
                     RepositoryError::Invariant("object generation overflow".into())
                 })?;
@@ -1000,6 +1094,9 @@ impl S3ObjectRepository for MemoryS3Repository {
                 }
                 state.versions.entry(object.id()).or_default().push(marker);
                 state.objects.insert(object.id(), advanced);
+                if let Some(quota) = released_quota {
+                    state.quotas.insert(command.application_id, quota);
+                }
                 Ok(DeleteS3ObjectOutcome::Deleted(DeletedS3ObjectVersion {
                     version_id: Some(null_version_id),
                     delete_marker: true,
@@ -1016,6 +1113,11 @@ impl S3ObjectRepository for MemoryS3Repository {
                 if let Some(reason) = delete_lock_reason(&active_null, command) {
                     return Ok(DeleteS3ObjectOutcome::Locked(reason));
                 }
+                let released_quota = memory_s3_quota_after_used_release(
+                    &state,
+                    active_null.application_id(),
+                    memory_object_version_size(&active_null),
+                )?;
                 if let Some(task) = explicit_delete_gc_task(&active_null, command) {
                     enqueue_memory_gc_task(&mut state, task)?;
                 }
@@ -1024,6 +1126,9 @@ impl S3ObjectRepository for MemoryS3Repository {
                     object.id(),
                     rebuild_object_head(&object, None, command.deleted_at)?,
                 );
+                state
+                    .quotas
+                    .insert(active_null.application_id(), released_quota);
                 Ok(DeleteS3ObjectOutcome::Deleted(DeletedS3ObjectVersion {
                     version_id: None,
                     delete_marker: false,
@@ -1320,9 +1425,19 @@ fn execute_memory_current_expiration(
             }) {
                 return Ok(S3LifecycleExecutionOutcome::Locked);
             }
+            let released_quota = active_null
+                .as_ref()
+                .map(|version| {
+                    memory_s3_quota_after_used_release(
+                        state,
+                        version.application_id(),
+                        memory_object_version_size(version),
+                    )
+                })
+                .transpose()?;
             mark_memory_version_noncurrent(state, object_id, target.id(), action_at)?;
-            if let Some(version) = active_null {
-                if let Some(task) = lifecycle_object_gc_task(&version, command) {
+            if let Some(version) = active_null.as_ref() {
+                if let Some(task) = lifecycle_object_gc_task(version, command) {
                     enqueue_memory_gc_task(state, task)?;
                 }
                 state.superseded_versions.insert(version.id());
@@ -1333,6 +1448,9 @@ fn execute_memory_current_expiration(
                 .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
             state.versions.entry(object_id).or_default().push(marker);
             state.objects.insert(object_id, advanced);
+            if let Some(quota) = released_quota {
+                state.quotas.insert(command.application_id, quota);
+            }
         }
         VersioningStatus::Unversioned => {
             if !target.is_null_version() {
@@ -1341,6 +1459,11 @@ fn execute_memory_current_expiration(
             if delete_lock_reason_at(&target, command.evaluated_at, false).is_some() {
                 return Ok(S3LifecycleExecutionOutcome::Locked);
             }
+            let released_quota = memory_s3_quota_after_used_release(
+                state,
+                target.application_id(),
+                memory_object_version_size(&target),
+            )?;
             mark_memory_version_noncurrent(state, object_id, target.id(), action_at)?;
             if let Some(task) = lifecycle_object_gc_task(&target, command) {
                 enqueue_memory_gc_task(state, task)?;
@@ -1349,6 +1472,7 @@ fn execute_memory_current_expiration(
             state
                 .objects
                 .insert(object_id, rebuild_object_head(&object, None, action_at)?);
+            state.quotas.insert(target.application_id(), released_quota);
         }
     }
     Ok(S3LifecycleExecutionOutcome::Applied)
@@ -1392,6 +1516,11 @@ fn execute_memory_noncurrent_expiration(
     if delete_lock_reason_at(&version, command.evaluated_at, false).is_some() {
         return Ok(S3LifecycleExecutionOutcome::Locked);
     }
+    let released_quota = memory_s3_quota_after_used_release(
+        state,
+        version.application_id(),
+        memory_object_version_size(&version),
+    )?;
     if let Some(task) = lifecycle_object_gc_task(&version, command) {
         enqueue_memory_gc_task(state, task)?;
     }
@@ -1400,6 +1529,9 @@ fn execute_memory_noncurrent_expiration(
     } else {
         state.deleted_versions.insert(version.id());
     }
+    state
+        .quotas
+        .insert(version.application_id(), released_quota);
     Ok(S3LifecycleExecutionOutcome::Applied)
 }
 
@@ -1483,6 +1615,7 @@ fn execute_memory_multipart_abort(
         }
         S3MultipartUploadState::Pending | S3MultipartUploadState::Completing => {}
     }
+    let mut released_intent_quota = None;
     if let Some(intent_id) = upload.upload_intent_id {
         let Some(intent) = state.intents.get(&intent_id).cloned() else {
             return Err(RepositoryError::Conflict);
@@ -1496,6 +1629,16 @@ fn execute_memory_multipart_abort(
             || intent.storage_backend() != upload.storage_backend
         {
             return Err(RepositoryError::Conflict);
+        }
+        let release_reservation = !matches!(
+            intent.state(),
+            UploadIntentState::Aborted | UploadIntentState::Expired
+        );
+        if release_reservation {
+            released_intent_quota = Some((
+                intent.application_id(),
+                memory_s3_quota_after_reservation_release(state, &intent)?,
+            ));
         }
         for storage_key in [
             intent.temporary_storage_key().to_owned(),
@@ -1519,33 +1662,35 @@ fn execute_memory_multipart_abort(
                 },
             )?;
         }
-        let aborted = UploadIntent::from_persistence(PersistedUploadIntent {
-            id: intent.id(),
-            application_id: intent.application_id(),
-            bucket_id: intent.bucket_id(),
-            object_key: intent.object_key().to_owned(),
-            proposed_version_id: intent.proposed_version_id(),
-            state: UploadIntentState::Aborted,
-            storage_backend: intent.storage_backend().to_owned(),
-            temporary_storage_key: intent.temporary_storage_key().to_owned(),
-            final_storage_key: intent.final_storage_key().to_owned(),
-            entity_tag: intent.entity_tag().cloned(),
-            checksum: intent.checksum().cloned(),
-            expected_size_bytes: intent.expected_size_bytes(),
-            size_bytes: intent.size_bytes(),
-            content_type: intent.content_type().map(str::to_owned),
-            user_metadata: intent.user_metadata().clone(),
-            object_tags: intent.object_tags().clone(),
-            lease_token: None,
-            lease_until: None,
-            committed_object_id: None,
-            committed_version_id: None,
-            expires_at: intent.expires_at(),
-            created_at: intent.created_at(),
-            updated_at: command.evaluated_at,
-        })
-        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
-        state.intents.insert(intent_id, aborted);
+        if release_reservation {
+            let aborted = UploadIntent::from_persistence(PersistedUploadIntent {
+                id: intent.id(),
+                application_id: intent.application_id(),
+                bucket_id: intent.bucket_id(),
+                object_key: intent.object_key().to_owned(),
+                proposed_version_id: intent.proposed_version_id(),
+                state: UploadIntentState::Aborted,
+                storage_backend: intent.storage_backend().to_owned(),
+                temporary_storage_key: intent.temporary_storage_key().to_owned(),
+                final_storage_key: intent.final_storage_key().to_owned(),
+                entity_tag: intent.entity_tag().cloned(),
+                checksum: intent.checksum().cloned(),
+                expected_size_bytes: intent.expected_size_bytes(),
+                size_bytes: intent.size_bytes(),
+                content_type: intent.content_type().map(str::to_owned),
+                user_metadata: intent.user_metadata().clone(),
+                object_tags: intent.object_tags().clone(),
+                lease_token: None,
+                lease_until: None,
+                committed_object_id: None,
+                committed_version_id: None,
+                expires_at: intent.expires_at(),
+                created_at: intent.created_at(),
+                updated_at: command.evaluated_at,
+            })
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+            state.intents.insert(intent_id, aborted);
+        }
     }
     let storage_keys = state
         .multipart_storage_keys
@@ -1579,6 +1724,9 @@ fn execute_memory_multipart_abort(
     persisted.completion_lease_until = None;
     persisted.aborted_at = Some(command.evaluated_at);
     persisted.updated_at = command.evaluated_at;
+    if let Some((application_id, quota)) = released_intent_quota {
+        state.quotas.insert(application_id, quota);
+    }
     Ok(S3LifecycleExecutionOutcome::Applied)
 }
 
@@ -1794,18 +1942,253 @@ fn rebuild_object_head(
     .map_err(|error| RepositoryError::Invariant(error.to_string()))
 }
 
+fn memory_object_version_size(version: &ObjectVersion) -> u64 {
+    match version.payload() {
+        ObjectVersionPayload::Object(payload) => payload.size_bytes(),
+        ObjectVersionPayload::DeleteMarker => 0,
+    }
+}
+
+fn memory_s3_quota_after_used_release(
+    state: &State,
+    application_id: ApplicationId,
+    bytes: u64,
+) -> Result<QuotaSnapshot, RepositoryError> {
+    let quota = state
+        .quotas
+        .get(&application_id)
+        .copied()
+        .ok_or(RepositoryError::NotFound)?;
+    let used_bytes = quota.used_bytes.checked_sub(bytes).ok_or_else(|| {
+        RepositoryError::Invariant(
+            "memory S3 committed object quota release would underflow".into(),
+        )
+    })?;
+    Ok(QuotaSnapshot {
+        quota_bytes: quota.quota_bytes,
+        used_bytes,
+        reserved_bytes: quota.reserved_bytes,
+    })
+}
+
+fn memory_s3_quota_after_reservation_release(
+    state: &State,
+    intent: &UploadIntent,
+) -> Result<QuotaSnapshot, RepositoryError> {
+    let quota = state
+        .quotas
+        .get(&intent.application_id())
+        .copied()
+        .ok_or(RepositoryError::NotFound)?;
+    let reserved_bytes = quota
+        .reserved_bytes
+        .checked_sub(intent.expected_size_bytes())
+        .ok_or_else(|| {
+            RepositoryError::Invariant("memory S3 upload intent reservation would underflow".into())
+        })?;
+    Ok(QuotaSnapshot {
+        quota_bytes: quota.quota_bytes,
+        used_bytes: quota.used_bytes,
+        reserved_bytes,
+    })
+}
+
+fn memory_s3_commit_quota(
+    state: &mut State,
+    intent: &UploadIntent,
+    released_used_bytes: u64,
+) -> Result<QuotaSnapshot, RepositoryError> {
+    let quota = state
+        .quotas
+        .get(&intent.application_id())
+        .copied()
+        .ok_or(RepositoryError::NotFound)?;
+    let reserved_bytes = quota
+        .reserved_bytes
+        .checked_sub(intent.expected_size_bytes())
+        .ok_or_else(|| {
+            RepositoryError::Invariant("memory S3 upload intent reservation would underflow".into())
+        })?;
+    let used_bytes = quota
+        .used_bytes
+        .checked_add(intent.expected_size_bytes())
+        .and_then(|bytes| bytes.checked_sub(released_used_bytes))
+        .ok_or_else(|| {
+            RepositoryError::Invariant("memory S3 used quota transfer would underflow".into())
+        })?;
+    if used_bytes.saturating_add(reserved_bytes) > quota.quota_bytes {
+        return Err(RepositoryError::Invariant(
+            "memory S3 quota transfer exceeds configured quota".into(),
+        ));
+    }
+    Ok(QuotaSnapshot {
+        quota_bytes: quota.quota_bytes,
+        used_bytes,
+        reserved_bytes,
+    })
+}
+
+fn commit_memory_upload_intent(
+    state: &mut State,
+    intent_id: UploadIntentId,
+    lease_token: &str,
+    mut commit: S3ObjectVersionCommit,
+) -> Result<S3Object, RepositoryError> {
+    commit.validate()?;
+    let intent = state
+        .intents
+        .get(&intent_id)
+        .cloned()
+        .ok_or(RepositoryError::NotFound)?;
+    if intent.state() != UploadIntentState::Committing
+        || intent.lease_token() != Some(lease_token)
+        || intent.proposed_version_id() != commit.version.id()
+        || intent.application_id() != commit.version.application_id()
+        || intent.bucket_id() != commit.version.bucket_id()
+        || intent
+            .lease_until()
+            .is_none_or(|lease_until| lease_until <= commit.committed_at)
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    let ObjectVersionPayload::Object(payload) = commit.version.payload() else {
+        return Err(RepositoryError::Invariant(
+            "an upload cannot commit a delete marker".into(),
+        ));
+    };
+    if payload.storage_backend() != intent.storage_backend()
+        || payload.storage_key() != intent.final_storage_key()
+        || Some(payload.etag()) != intent.entity_tag()
+        || payload.checksum() != intent.checksum()
+        || Some(payload.size_bytes()) != intent.size_bytes()
+        || payload.size_bytes() != intent.expected_size_bytes()
+        || payload.content_type() != intent.content_type()
+        || payload.user_metadata() != intent.user_metadata()
+    {
+        return Err(RepositoryError::Conflict);
+    }
+    if state.fail_commit {
+        state.fail_commit = false;
+        return Err(RepositoryError::Unavailable(
+            "injected DB commit failure".into(),
+        ));
+    }
+
+    freeze_memory_object_lock(&state.buckets, &mut commit)?;
+    let active_null = if commit.version.is_null_version() {
+        state
+            .versions
+            .get(&commit.version.object_id())
+            .into_iter()
+            .flatten()
+            .find(|version| {
+                version.is_null_version()
+                    && !state.superseded_versions.contains(&version.id())
+                    && !state.deleted_versions.contains(&version.id())
+                    && version.state() == ObjectVersionState::Committed
+            })
+            .cloned()
+    } else {
+        None
+    };
+    if active_null.as_ref().map(ObjectVersion::id) != commit.replaced_null_version_id {
+        return Err(RepositoryError::Conflict);
+    }
+    let replacement_tasks = commit
+        .gc_tasks
+        .iter()
+        .filter(|task| task.reason == StorageGcReason::ReplacedNullVersion)
+        .collect::<Vec<_>>();
+    match active_null.as_ref().map(ObjectVersion::payload) {
+        None | Some(ObjectVersionPayload::DeleteMarker) if replacement_tasks.is_empty() => {}
+        Some(ObjectVersionPayload::Object(payload)) if replacement_tasks.len() == 1 => {
+            let task = replacement_tasks[0];
+            if task.object_version_id != active_null.as_ref().map(ObjectVersion::id)
+                || task.storage_backend != payload.storage_backend()
+                || task.storage_key != payload.storage_key()
+            {
+                return Err(RepositoryError::Conflict);
+            }
+        }
+        _ => return Err(RepositoryError::Conflict),
+    }
+    let released_used_bytes = active_null
+        .as_ref()
+        .map(memory_object_version_size)
+        .unwrap_or(0);
+    let committed_quota = memory_s3_commit_quota(state, &intent, released_used_bytes)?;
+
+    let version = commit.version.clone();
+    let object =
+        match commit.target {
+            S3ObjectCommitTarget::Create(object) => object
+                .advanced_to(&version, commit.committed_at)
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?,
+            S3ObjectCommitTarget::Append {
+                object_id,
+                expected_generation,
+            } => {
+                let current = state
+                    .objects
+                    .get(&object_id)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)?;
+                if current.generation() != expected_generation {
+                    return Err(RepositoryError::Conflict);
+                }
+                current
+                    .advanced_to(&version, commit.committed_at)
+                    .map_err(|error| RepositoryError::Invariant(error.to_string()))?
+            }
+        };
+    if let Some(previous) = &active_null {
+        state.superseded_versions.insert(previous.id());
+    }
+    state
+        .versions
+        .entry(object.id())
+        .or_default()
+        .push(version.clone());
+    state
+        .tags
+        .insert(version.id(), intent.object_tags().clone());
+    state.objects.insert(object.id(), object.clone());
+    state.gc_tasks.extend(commit.gc_tasks);
+    let committed = rebuild_intent(
+        &intent,
+        UploadIntentState::Committed,
+        facts(&intent),
+        None,
+        Some((object.id(), version.id())),
+        commit.committed_at,
+    );
+    state.intents.insert(intent_id, committed);
+    state
+        .quotas
+        .insert(intent.application_id(), committed_quota);
+    Ok(object)
+}
+
 #[async_trait]
 impl S3UploadIntentRepository for MemoryS3Repository {
     async fn create_upload_intent(&self, intent: &UploadIntent) -> Result<(), RepositoryError> {
         self.record("intent.create");
-        if self
-            .state()
-            .intents
-            .insert(intent.id(), intent.clone())
-            .is_some()
-        {
+        let mut state = self.state();
+        if state.intents.contains_key(&intent.id()) {
             return Err(RepositoryError::Conflict);
         }
+        let quota = state
+            .quotas
+            .get_mut(&intent.application_id())
+            .ok_or(RepositoryError::NotFound)?;
+        if quota.available_bytes() < intent.expected_size_bytes() {
+            return Err(RepositoryError::QuotaExceeded);
+        }
+        quota.reserved_bytes = quota
+            .reserved_bytes
+            .checked_add(intent.expected_size_bytes())
+            .ok_or_else(|| RepositoryError::Invariant("reserved quota overflow".into()))?;
+        state.intents.insert(intent.id(), intent.clone());
         Ok(())
     }
 
@@ -1914,112 +2297,9 @@ impl S3UploadIntentRepository for MemoryS3Repository {
         lease_token: &str,
         commit: S3ObjectVersionCommit,
     ) -> Result<S3Object, RepositoryError> {
-        commit.validate()?;
         self.record("intent.commit");
         let mut state = self.state();
-        let mut commit = commit;
-        let intent = state
-            .intents
-            .get(&intent_id)
-            .cloned()
-            .ok_or(RepositoryError::NotFound)?;
-        if intent.state() != UploadIntentState::Committing
-            || intent.lease_token() != Some(lease_token)
-        {
-            return Err(RepositoryError::Conflict);
-        }
-        if state.fail_commit {
-            state.fail_commit = false;
-            return Err(RepositoryError::Unavailable(
-                "injected DB commit failure".into(),
-            ));
-        }
-
-        freeze_memory_object_lock(&state.buckets, &mut commit)?;
-
-        let active_null = if commit.version.is_null_version() {
-            state
-                .versions
-                .get(&commit.version.object_id())
-                .into_iter()
-                .flatten()
-                .find(|version| {
-                    version.is_null_version()
-                        && !state.superseded_versions.contains(&version.id())
-                        && !state.deleted_versions.contains(&version.id())
-                        && version.state() == ObjectVersionState::Committed
-                })
-                .cloned()
-        } else {
-            None
-        };
-        if active_null.as_ref().map(ObjectVersion::id) != commit.replaced_null_version_id {
-            return Err(RepositoryError::Conflict);
-        }
-        let replacement_tasks = commit
-            .gc_tasks
-            .iter()
-            .filter(|task| task.reason == StorageGcReason::ReplacedNullVersion)
-            .collect::<Vec<_>>();
-        match active_null.as_ref().map(ObjectVersion::payload) {
-            None | Some(ObjectVersionPayload::DeleteMarker) if replacement_tasks.is_empty() => {}
-            Some(ObjectVersionPayload::Object(payload)) if replacement_tasks.len() == 1 => {
-                let task = replacement_tasks[0];
-                if task.object_version_id != active_null.as_ref().map(ObjectVersion::id)
-                    || task.storage_backend != payload.storage_backend()
-                    || task.storage_key != payload.storage_key()
-                {
-                    return Err(RepositoryError::Conflict);
-                }
-            }
-            _ => return Err(RepositoryError::Conflict),
-        }
-        if let Some(previous) = &active_null {
-            state.superseded_versions.insert(previous.id());
-        }
-
-        let version = commit.version.clone();
-        let object = match commit.target {
-            S3ObjectCommitTarget::Create(object) => object
-                .advanced_to(&version, commit.committed_at)
-                .map_err(|error| RepositoryError::Invariant(error.to_string()))?,
-            S3ObjectCommitTarget::Append {
-                object_id,
-                expected_generation,
-            } => {
-                let current = state
-                    .objects
-                    .get(&object_id)
-                    .cloned()
-                    .ok_or(RepositoryError::NotFound)?;
-                if current.generation() != expected_generation {
-                    return Err(RepositoryError::Conflict);
-                }
-                current
-                    .advanced_to(&version, commit.committed_at)
-                    .map_err(|error| RepositoryError::Invariant(error.to_string()))?
-            }
-        };
-        state
-            .versions
-            .entry(object.id())
-            .or_default()
-            .push(version.clone());
-        state
-            .tags
-            .insert(version.id(), intent.object_tags().clone());
-        state.objects.insert(object.id(), object.clone());
-        state.gc_tasks.extend(commit.gc_tasks.clone());
-        let committed = rebuild_intent(
-            &intent,
-            UploadIntentState::Committed,
-            facts(&intent),
-            None,
-            Some((object.id(), version.id())),
-            commit.committed_at,
-        );
-        state.intents.insert(intent_id, committed);
-        Ok(object)
+        commit_memory_upload_intent(&mut state, intent_id, lease_token, commit)
     }
 
     async fn abort_upload_intent_and_enqueue_gc(
@@ -2048,6 +2328,7 @@ impl S3UploadIntentRepository for MemoryS3Repository {
         {
             return Err(RepositoryError::Conflict);
         }
+        let released_quota = memory_s3_quota_after_reservation_release(&state, &intent)?;
         state.gc_tasks.push(gc_task);
         let aborted = rebuild_intent(
             &intent,
@@ -2058,27 +2339,151 @@ impl S3UploadIntentRepository for MemoryS3Repository {
             now,
         );
         state.intents.insert(intent_id, aborted.clone());
+        state.quotas.insert(intent.application_id(), released_quota);
         Ok(aborted)
     }
 
     async fn expire_upload_intents(
         &self,
-        _now: OffsetDateTime,
-        _limit: usize,
-        _gc_max_attempts: u32,
+        now: OffsetDateTime,
+        limit: usize,
+        gc_max_attempts: u32,
     ) -> Result<usize, RepositoryError> {
-        unreachable!("not used by ObjectService tests")
+        if limit == 0 || limit > crate::MAX_UPLOAD_INTENT_EXPIRY_LIMIT || gc_max_attempts == 0 {
+            return Err(RepositoryError::Invariant(
+                "upload intent expiry limit and GC max attempts are invalid".into(),
+            ));
+        }
+        let mut state = self.state();
+        let mut staged = state.clone();
+        let mut intent_ids = staged
+            .intents
+            .values()
+            .filter(|intent| {
+                intent.expires_at() <= now
+                    && (matches!(
+                        intent.state(),
+                        UploadIntentState::Staging | UploadIntentState::Ready
+                    ) || (intent.state() == UploadIntentState::Committing
+                        && intent.lease_until().is_some_and(|until| until <= now)))
+            })
+            .map(|intent| intent.id())
+            .collect::<Vec<_>>();
+        intent_ids.sort_by_key(ToString::to_string);
+        intent_ids.truncate(limit);
+        for intent_id in &intent_ids {
+            let intent = staged
+                .intents
+                .get(intent_id)
+                .cloned()
+                .ok_or(RepositoryError::Conflict)?;
+            let released_quota = memory_s3_quota_after_reservation_release(&staged, &intent)?;
+            for storage_key in [
+                intent.temporary_storage_key().to_owned(),
+                intent.final_storage_key().to_owned(),
+            ] {
+                enqueue_memory_gc_task(
+                    &mut staged,
+                    NewStorageGcTask {
+                        id: StorageGcTaskId::new(),
+                        application_id: intent.application_id(),
+                        bucket_id: intent.bucket_id(),
+                        object_version_id: None,
+                        upload_intent_id: Some(intent.id()),
+                        multipart_upload_id: None,
+                        storage_backend: intent.storage_backend().to_owned(),
+                        storage_key,
+                        reason: StorageGcReason::AbortedUploadIntent,
+                        not_before: now,
+                        max_attempts: gc_max_attempts,
+                        created_at: now,
+                    },
+                )?;
+            }
+            let expired = rebuild_intent(
+                &intent,
+                UploadIntentState::Expired,
+                facts(&intent),
+                None,
+                None,
+                now,
+            );
+            staged.intents.insert(*intent_id, expired);
+            staged
+                .quotas
+                .insert(intent.application_id(), released_quota);
+        }
+        *state = staged;
+        Ok(intent_ids.len())
     }
 
     async fn commit_multipart_object_version(
         &self,
-        _upload_id: &str,
-        _completion_token: &str,
-        _commit: S3ObjectVersionCommit,
-        _final_entity_tag: &EntityTag,
-        _final_checksum: &Checksum,
+        upload_id: &str,
+        completion_token: &str,
+        commit: S3ObjectVersionCommit,
+        final_entity_tag: &EntityTag,
+        final_checksum: &Checksum,
     ) -> Result<S3Object, RepositoryError> {
-        unreachable!("not used by ObjectService tests")
+        commit.validate()?;
+        let ObjectVersionPayload::Object(payload) = commit.version.payload() else {
+            return Err(RepositoryError::Invariant(
+                "multipart completion cannot commit a delete marker".into(),
+            ));
+        };
+        if payload.etag() != final_entity_tag || payload.checksum() != Some(final_checksum) {
+            return Err(RepositoryError::Conflict);
+        }
+
+        let mut state = self.state();
+        let mut staged = state.clone();
+        let upload = staged
+            .multipart_uploads
+            .get(upload_id)
+            .cloned()
+            .ok_or(RepositoryError::NotFound)?;
+        if upload.state == S3MultipartUploadState::Completed {
+            if upload.object_version_id != Some(commit.version.id())
+                || upload.final_etag.as_ref() != Some(final_entity_tag)
+                || upload.final_checksum.as_ref() != Some(final_checksum)
+            {
+                return Err(RepositoryError::Conflict);
+            }
+            return staged
+                .objects
+                .get(&commit.version.object_id())
+                .cloned()
+                .ok_or(RepositoryError::NotFound);
+        }
+        let intent_id = upload.upload_intent_id.ok_or(RepositoryError::Conflict)?;
+        if upload.state != S3MultipartUploadState::Completing
+            || upload.application_id != commit.version.application_id()
+            || upload.bucket_id != commit.version.bucket_id()
+            || upload.object_key
+                != staged
+                    .intents
+                    .get(&intent_id)
+                    .ok_or(RepositoryError::NotFound)?
+                    .object_key()
+        {
+            return Err(RepositoryError::Conflict);
+        }
+        let object =
+            commit_memory_upload_intent(&mut staged, intent_id, completion_token, commit.clone())?;
+        let completed = staged
+            .multipart_uploads
+            .get_mut(upload_id)
+            .ok_or(RepositoryError::NotFound)?;
+        completed.state = S3MultipartUploadState::Completed;
+        completed.completion_lease_until = None;
+        completed.object_id = Some(object.id());
+        completed.object_version_id = Some(commit.version.id());
+        completed.final_etag = Some(final_entity_tag.clone());
+        completed.final_checksum = Some(final_checksum.clone());
+        completed.completed_at = Some(commit.committed_at);
+        completed.updated_at = commit.committed_at;
+        *state = staged;
+        Ok(object)
     }
 }
 
@@ -2299,6 +2704,156 @@ fn setup(
         FixedClock::new(OffsetDateTime::UNIX_EPOCH),
     );
     (application_id, bucket_id, repository, store, service)
+}
+
+#[test]
+fn memory_s3_quota_reserves_transfers_releases_and_replays_once() {
+    block_on(async {
+        let (application_id, _, repository, store, service) = setup(VersioningStatus::Enabled);
+        repository
+            .set_quota_bytes(application_id, 32)
+            .expect("set quota");
+
+        let first_content = b"prismark";
+        let first = begin_and_stage(application_id, &service, &store, first_content).await;
+        assert_eq!(
+            repository.quota(application_id),
+            QuotaSnapshot {
+                quota_bytes: 32,
+                used_bytes: 0,
+                reserved_bytes: first_content.len() as u64,
+            }
+        );
+        let first_request = complete_request(application_id, first.intent.id(), first_content);
+        let first = service
+            .complete_put(&first_request)
+            .await
+            .expect("complete first version");
+        assert_eq!(repository.quota(application_id).used_bytes, 8);
+        assert_eq!(repository.quota(application_id).reserved_bytes, 0);
+        service
+            .complete_put(&first_request)
+            .await
+            .expect("replay committed put");
+        assert_eq!(repository.quota(application_id).used_bytes, 8);
+
+        let second_content = b"retry";
+        let second = begin_and_stage(application_id, &service, &store, second_content).await;
+        service
+            .complete_put(&complete_request(
+                application_id,
+                second.intent.id(),
+                second_content,
+            ))
+            .await
+            .expect("complete second enabled version");
+        assert_eq!(repository.quota(application_id).used_bytes, 13);
+
+        let aborted = service
+            .begin_put(&begin_request(application_id, b"reconcile".len() as u64))
+            .await
+            .expect("reserve aborted upload");
+        assert_eq!(repository.quota(application_id).reserved_bytes, 9);
+        let abort = AbortStagedPutRequest {
+            application_id,
+            intent_id: aborted.intent.id(),
+        };
+        service
+            .abort_staged_put(&abort)
+            .await
+            .expect("abort upload");
+        service
+            .abort_staged_put(&abort)
+            .await
+            .expect("replay abort");
+        assert_eq!(repository.quota(application_id).reserved_bytes, 0);
+
+        let mut expiring = begin_request(application_id, b"idempotent".len() as u64);
+        expiring.expires_at = Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(1));
+        service
+            .begin_put(&expiring)
+            .await
+            .expect("reserve expiring upload");
+        assert_eq!(repository.quota(application_id).reserved_bytes, 10);
+        assert_eq!(
+            repository
+                .expire_upload_intents(OffsetDateTime::UNIX_EPOCH + Duration::seconds(2), 10, 3,)
+                .await
+                .expect("expire intent"),
+            1
+        );
+        assert_eq!(
+            repository
+                .expire_upload_intents(OffsetDateTime::UNIX_EPOCH + Duration::seconds(2), 10, 3,)
+                .await
+                .expect("replay expiry"),
+            0
+        );
+        assert_eq!(repository.quota(application_id).reserved_bytes, 0);
+
+        let too_large = service.begin_put(&begin_request(application_id, 20)).await;
+        assert!(matches!(
+            too_large,
+            Err(S3ObjectServiceError::Repository(
+                RepositoryError::QuotaExceeded
+            ))
+        ));
+        assert_eq!(repository.quota(application_id).used_bytes, 13);
+
+        service
+            .delete(&DeleteObjectRequest {
+                application_id,
+                bucket_name: "assets".into(),
+                object_key: "folder/example.txt".into(),
+                version_id: Some(first.version.external_version_id().clone()),
+                bypass_governance: false,
+                deleted_by: "test-access-key".into(),
+            })
+            .await
+            .expect("delete exact data version");
+        assert_eq!(repository.quota(application_id).used_bytes, 5);
+        service
+            .delete(&DeleteObjectRequest {
+                application_id,
+                bucket_name: "assets".into(),
+                object_key: "folder/example.txt".into(),
+                version_id: None,
+                bypass_governance: false,
+                deleted_by: "test-access-key".into(),
+            })
+            .await
+            .expect("create delete marker");
+        assert_eq!(repository.quota(application_id).used_bytes, 5);
+    });
+}
+
+#[test]
+fn memory_s3_suspended_null_replacement_charges_only_active_data() {
+    block_on(async {
+        let (application_id, _, repository, store, service) = setup(VersioningStatus::Suspended);
+        repository
+            .set_quota_bytes(application_id, 64)
+            .expect("set quota");
+        for content in [b"first-null".as_slice(), b"second-null".as_slice()] {
+            let begun = begin_and_stage(application_id, &service, &store, content).await;
+            service
+                .complete_put(&complete_request(
+                    application_id,
+                    begun.intent.id(),
+                    content,
+                ))
+                .await
+                .expect("complete null version");
+        }
+        assert_eq!(
+            repository.quota(application_id),
+            QuotaSnapshot {
+                quota_bytes: 64,
+                used_bytes: b"second-null".len() as u64,
+                reserved_bytes: 0,
+            }
+        );
+    });
 }
 
 #[test]
@@ -2851,8 +3406,7 @@ fn memory_lifecycle_executes_versioned_expiration_and_multipart_cleanup() {
         repository.seed_object(object, vec![version]);
 
         let attached_intent_id = UploadIntentId::new();
-        repository.state().intents.insert(
-            attached_intent_id,
+        repository.seed_upload_intent(
             UploadIntent::from_persistence(PersistedUploadIntent {
                 id: attached_intent_id,
                 application_id,
@@ -2911,6 +3465,14 @@ fn memory_lifecycle_executes_versioned_expiration_and_multipart_cleanup() {
             .await
             .expect("run lifecycle");
         assert_eq!(receipt.applied, 2);
+        assert_eq!(
+            repository.quota(application_id),
+            QuotaSnapshot {
+                quota_bytes: 1_u64 << 40,
+                used_bytes: 4,
+                reserved_bytes: 0,
+            }
+        );
         let state = repository.state();
         let current_id = state
             .objects

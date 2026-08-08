@@ -156,7 +156,7 @@ async fn postgres_s3_object_tagging_contract() {
     let other_bucket = S3Bucket::new(
         BucketId::new(),
         other_application,
-        bucket.name(),
+        "other-tagged-assets",
         "us-east-1",
         false,
         None,
@@ -178,7 +178,7 @@ async fn postgres_s3_object_tagging_contract() {
         service
             .get_object_tags(&S3ObjectRequest {
                 application_id: other_application,
-                bucket_name: bucket.name().to_owned(),
+                bucket_name: other_bucket.name().to_owned(),
                 object_key: "docs/tagged.txt".into(),
                 version_id: Some(first.version.external_version_id().clone()),
             })

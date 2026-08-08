@@ -25,8 +25,8 @@ use crate::{
     s3_repository::{
         advance_object_to_delete_marker, delete_lock_reason_at, enqueue_object_version_gc_task,
         hide_exact_deleted_version, insert_object_version, mark_current_version_noncurrent,
-        row_to_object_version, row_to_s3_bucket, row_to_s3_object, supersede_active_null_version,
-        update_deleted_object_head,
+        object_version_size_bytes, release_s3_used_bytes, row_to_object_version, row_to_s3_bucket,
+        row_to_s3_object, supersede_active_null_version, update_deleted_object_head,
     },
 };
 
@@ -389,6 +389,12 @@ async fn execute_current_expiration(
                 enqueue_lifecycle_gc(transaction, version, command).await?;
                 supersede_active_null_version(transaction, Some(version), command.evaluated_at)
                     .await?;
+                release_s3_used_bytes(
+                    transaction,
+                    version.application_id(),
+                    object_version_size_bytes(version),
+                )
+                .await?;
             }
             insert_object_version(transaction, &marker).await?;
             advance_object_to_delete_marker(transaction, &object, &marker, action_time).await?;
@@ -404,6 +410,12 @@ async fn execute_current_expiration(
             enqueue_lifecycle_gc(transaction, &target, command).await?;
             supersede_active_null_version(transaction, Some(&target), command.evaluated_at).await?;
             update_deleted_object_head(transaction, &object, None, command.evaluated_at).await?;
+            release_s3_used_bytes(
+                transaction,
+                target.application_id(),
+                object_version_size_bytes(&target),
+            )
+            .await?;
         }
     }
     Ok(S3LifecycleExecutionOutcome::Applied)
@@ -450,6 +462,12 @@ async fn execute_noncurrent_expiration(
     }
     hide_exact_deleted_version(transaction, &version, command.evaluated_at).await?;
     enqueue_lifecycle_gc(transaction, &version, command).await?;
+    release_s3_used_bytes(
+        transaction,
+        version.application_id(),
+        object_version_size_bytes(&version),
+    )
+    .await?;
     Ok(S3LifecycleExecutionOutcome::Applied)
 }
 

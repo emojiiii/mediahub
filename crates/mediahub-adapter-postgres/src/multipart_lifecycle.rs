@@ -8,6 +8,18 @@ impl S3MultipartRepository for PostgresRepository {
     ) -> Result<S3MultipartUpload, RepositoryError> {
         upload.validate()?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
+        let bucket_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT TRUE FROM buckets WHERE id = $1 AND application_id = $2 FOR SHARE",
+        )
+        .bind(upload.bucket_id.as_uuid())
+        .bind(upload.application_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .unwrap_or(false);
+        if !bucket_exists {
+            return Err(RepositoryError::NotFound);
+        }
         let application_exists = sqlx::query_scalar::<_, uuid::Uuid>(
             "SELECT id FROM applications WHERE id = $1 FOR UPDATE",
         )
@@ -27,23 +39,12 @@ impl S3MultipartRepository for PostgresRepository {
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let active_limit = i64::try_from(MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION)
-            .map_err(|_| {
+        let active_limit =
+            i64::try_from(MAX_S3_MULTIPART_ACTIVE_UPLOADS_PER_APPLICATION).map_err(|_| {
                 RepositoryError::Invariant("multipart active upload limit is too large".into())
             })?;
         if active_uploads >= active_limit {
             return Err(RepositoryError::QuotaExceeded);
-        }
-        let bucket_exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM buckets WHERE id = $1 AND application_id = $2)",
-        )
-        .bind(upload.bucket_id.as_uuid())
-        .bind(upload.application_id.as_uuid())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if !bucket_exists {
-            return Err(RepositoryError::NotFound);
         }
         let created_at = postgres_time(upload.created_at);
         let expires_at = postgres_time(upload.expires_at);
@@ -136,17 +137,11 @@ impl S3MultipartRepository for PostgresRepository {
         if new_total > as_i64(maximum_upload_size)? {
             return Err(RepositoryError::QuotaExceeded);
         }
-        if let Some(replaced_key) = previous_storage_key
-            .filter(|storage_key| storage_key != &part.storage_key)
+        if let Some(replaced_key) =
+            previous_storage_key.filter(|storage_key| storage_key != &part.storage_key)
         {
-            enqueue_multipart_storage_keys(
-                &mut transaction,
-                &upload,
-                None,
-                [replaced_key],
-                now,
-            )
-            .await?;
+            enqueue_multipart_storage_keys(&mut transaction, &upload, None, [replaced_key], now)
+                .await?;
         }
         let row = sqlx::query(
             "INSERT INTO s3_multipart_parts (upload_id, part_number, size_bytes, sha256, md5, etag, \
@@ -400,7 +395,8 @@ impl S3MultipartRepository for PostgresRepository {
         let rows = sqlx::query(
             "SELECT upload_id FROM s3_multipart_uploads WHERE expires_at <= $1 \
              AND (state = 'pending' OR (state = 'completing' AND completion_lease_until <= $1)) \
-             ORDER BY expires_at, upload_id FOR UPDATE SKIP LOCKED LIMIT $2",
+             ORDER BY application_id, bucket_id, expires_at, upload_id \
+             FOR UPDATE SKIP LOCKED LIMIT $2",
         )
         .bind(now)
         .bind(limit)

@@ -17,6 +17,8 @@ mod memory_s3;
 #[doc(hidden)]
 pub mod object_store_contract;
 mod ports;
+mod s3_authorization;
+mod s3_bucket_policy;
 mod s3_lifecycle;
 mod s3_multipart;
 mod s3_object_service;
@@ -62,6 +64,14 @@ pub use ports::{
     UploadSessionCancellation, UploadSessionCompletion, UploadSessionExpiration,
     UploadSessionRepository, UploadSessionStorage, WebhookDelivery, WebhookDeliveryEndpoint,
     WebhookDeliveryFailureDisposition, WebhookDeliveryRepository,
+};
+pub use s3_authorization::{
+    S3AuthorizationOutcome, S3AuthorizationPrincipal, S3AuthorizationRequest,
+    S3AuthorizationService, S3PrincipalValidationError, S3SignedPrincipal,
+};
+pub use s3_bucket_policy::{
+    S3_ACCOUNT_ID_DIGITS, S3AccountId, S3BucketIdentity, S3BucketPolicyDocument,
+    S3BucketPolicyRepository, S3BucketPolicySnapshot,
 };
 pub use s3_lifecycle::{
     DEFAULT_S3_LIFECYCLE_BATCH_SIZE, DEFAULT_S3_LIFECYCLE_GC_MAX_ATTEMPTS,

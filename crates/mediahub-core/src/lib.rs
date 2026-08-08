@@ -13,6 +13,7 @@ mod metadata;
 mod object_version;
 mod s3_bucket;
 mod s3_lifecycle;
+mod s3_policy;
 mod s3_storage;
 mod s3_tagging;
 mod upload_session;
@@ -50,6 +51,18 @@ pub use s3_lifecycle::{
     MAX_S3_LIFECYCLE_RULES, S3AbortIncompleteMultipartUpload, S3Expiration,
     S3LifecycleConfiguration, S3LifecycleFilter, S3LifecycleRule, S3LifecycleRuleStatus,
     S3NoncurrentVersionExpiration,
+};
+pub use s3_policy::{
+    MAX_S3_POLICY_ACTIONS, MAX_S3_POLICY_BYTES, MAX_S3_POLICY_CONDITION_KEYS,
+    MAX_S3_POLICY_CONDITION_OPERATORS, MAX_S3_POLICY_CONDITION_VALUES, MAX_S3_POLICY_DEPTH,
+    MAX_S3_POLICY_PRINCIPALS, MAX_S3_POLICY_RESOURCES, MAX_S3_POLICY_RUNTIME_KEY_BYTES,
+    MAX_S3_POLICY_SID_BYTES, MAX_S3_POLICY_STATEMENTS, MAX_S3_POLICY_STRING_BYTES,
+    S3_POLICY_LEGACY_VERSION, S3_POLICY_VERSION, S3ActionClause, S3AwsPrincipal, S3BucketPolicy,
+    S3BucketPolicyStatus, S3ConditionKey, S3ConditionOperator, S3IdentityPolicy,
+    S3IdentityPolicyRequest, S3IdentityPolicyResource, S3IdentityPolicyStatement, S3PolicyAction,
+    S3PolicyCondition, S3PolicyDecision, S3PolicyEffect, S3PolicyError, S3PolicyErrorCode,
+    S3PolicyErrorKind, S3PolicyPrincipal, S3PolicyQuery, S3PolicyRequest, S3PolicyResourceScope,
+    S3PolicyStatement, S3PrincipalClause, S3ResourceClause,
 };
 pub use s3_storage::{
     Checksum, ChecksumAlgorithm, EntityTag, NewStorageGcTask, PersistedUploadIntent,

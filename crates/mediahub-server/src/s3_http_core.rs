@@ -94,6 +94,8 @@ enum S3BucketGetOperation {
     GetVersioning,
     GetLifecycle,
     GetObjectLock,
+    GetPolicy,
+    GetPolicyStatus,
 }
 
 fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOperation, S3ApiError> {
@@ -103,12 +105,16 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
     let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
     let versions = s3_query_flag(uri, "versions", request_id)?;
     let uploads = s3_query_flag(uri, "uploads", request_id)?;
+    let policy = s3_query_flag(uri, "policy", request_id)?;
+    let policy_status = s3_query_flag(uri, "policyStatus", request_id)?;
     if usize::from(location)
         + usize::from(versioning)
         + usize::from(lifecycle)
         + usize::from(object_lock)
         + usize::from(versions)
         + usize::from(uploads)
+        + usize::from(policy)
+        + usize::from(policy_status)
         > 1
     {
         return Err(S3ApiError::invalid_request(
@@ -118,7 +124,11 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         ));
     }
 
-    let operation = if location {
+    let operation = if policy {
+        S3BucketGetOperation::GetPolicy
+    } else if policy_status {
+        S3BucketGetOperation::GetPolicyStatus
+    } else if location {
         S3BucketGetOperation::GetLocation
     } else if versioning {
         S3BucketGetOperation::GetVersioning
@@ -154,7 +164,9 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         S3BucketGetOperation::GetLocation
         | S3BucketGetOperation::GetVersioning
         | S3BucketGetOperation::GetLifecycle
-        | S3BucketGetOperation::GetObjectLock => {
+        | S3BucketGetOperation::GetObjectLock
+        | S3BucketGetOperation::GetPolicy
+        | S3BucketGetOperation::GetPolicyStatus => {
             for name in ALL_LIST_QUERY_PARAMETERS {
                 if s3_query_value(uri, name, request_id)?.is_some() {
                     return Err(S3ApiError::invalid_request(
@@ -432,17 +444,18 @@ pub(super) async fn s3_create_bucket(
         }
     })?;
 
-    if state
+    if let Some(existing) = state
         .repository
-        .find_bucket_by_name(auth.application.id, &bucket_name)
+        .resolve_s3_bucket_identity(&bucket_name)
         .await
         .map_err(|error| {
-            warn!(error = %error, "S3 CreateBucket preflight lookup failed");
+            warn!(error = %error, "S3 CreateBucket global-name preflight lookup failed");
             S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
         })?
-        .is_some()
     {
-        return Err(S3ApiError::bucket_already_owned_by_you(
+        return Err(s3_create_bucket_name_conflict(
+            &existing,
+            auth.application.id,
             uri.path(),
             &request_id.0.0,
         ));
@@ -462,9 +475,30 @@ pub(super) async fn s3_create_bucket(
     match state.repository.create_s3_bucket(&bucket).await {
         Ok(()) => {}
         Err(mediahub_app::RepositoryError::Conflict) => {
-            return Err(S3ApiError::bucket_already_owned_by_you(
-                uri.path(),
-                &request_id.0.0,
+            let existing = state
+                .repository
+                .resolve_s3_bucket_identity(&bucket_name)
+                .await
+                .map_err(|error| {
+                    warn!(error = %error, "S3 CreateBucket conflict lookup failed");
+                    S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
+                })?;
+            return Err(existing.map_or_else(
+                || {
+                    S3ApiError::operation_aborted(
+                        "A conflicting conditional operation is currently in progress against this resource.",
+                        uri.path(),
+                        &request_id.0.0,
+                    )
+                },
+                |existing| {
+                    s3_create_bucket_name_conflict(
+                        &existing,
+                        auth.application.id,
+                        uri.path(),
+                        &request_id.0.0,
+                    )
+                },
             ));
         }
         Err(error) => {
@@ -497,6 +531,19 @@ pub(super) async fn s3_create_bucket(
             .unwrap_or_else(|_| HeaderValue::from_static("/")),
     );
     Ok(response)
+}
+
+fn s3_create_bucket_name_conflict(
+    existing: &S3BucketIdentity,
+    requesting_application_id: ApplicationId,
+    resource: &str,
+    request_id: &str,
+) -> S3ApiError {
+    if existing.application_id == requesting_application_id {
+        S3ApiError::bucket_already_owned_by_you(resource, request_id)
+    } else {
+        S3ApiError::bucket_already_exists(resource, request_id)
+    }
 }
 
 pub(super) async fn s3_list_objects(

@@ -76,7 +76,7 @@ fn s3_bucket_put_and_delete_classifiers_preserve_plain_bucket_operations() {
     assert_eq!(
         classify_s3_bucket_delete(&Uri::from_static("/s3/prismark-bucket"), request_id)
             .expect("delete bucket"),
-        S3BucketDeleteOperation::DeleteBucket,
+        S3BucketDeleteOperation::Bucket,
     );
     assert_eq!(
         classify_s3_bucket_delete(
@@ -84,7 +84,7 @@ fn s3_bucket_put_and_delete_classifiers_preserve_plain_bucket_operations() {
             request_id,
         )
         .expect("delete lifecycle"),
-        S3BucketDeleteOperation::DeleteLifecycle,
+        S3BucketDeleteOperation::Lifecycle,
     );
 }
 

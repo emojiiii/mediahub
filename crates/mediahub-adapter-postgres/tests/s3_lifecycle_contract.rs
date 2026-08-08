@@ -43,7 +43,6 @@ async fn postgres_standard_s3_lifecycle_contract() {
         .execute(repository.pool())
         .await
         .expect("seed quota sentinel values");
-    let quota_baseline = quota_snapshot(&repository, application_id).await;
     let bucket = S3Bucket::new(
         BucketId::new(),
         application_id,
@@ -128,10 +127,7 @@ async fn postgres_standard_s3_lifecycle_contract() {
         .await
         .expect("run first lifecycle batch");
     assert_eq!(first_batch.applied, 3);
-    assert_eq!(
-        quota_snapshot(&repository, application_id).await,
-        quota_baseline
-    );
+    assert_s3_quota_ledger(&repository, application_id, 12345, 6789).await;
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT state FROM object_versions WHERE id = $1")
             .bind(first.version.id().as_uuid())
@@ -247,10 +243,7 @@ async fn postgres_standard_s3_lifecycle_contract() {
         .await
         .expect("idempotent lifecycle rerun");
     assert_eq!(idempotent.applied, 0);
-    assert_eq!(
-        quota_snapshot(&repository, application_id).await,
-        quota_baseline
-    );
+    assert_s3_quota_ledger(&repository, application_id, 12345, 6789).await;
 
     configuration_revision_fence(
         &repository,
@@ -330,10 +323,7 @@ async fn postgres_standard_s3_lifecycle_contract() {
         later,
     )
     .await;
-    assert_eq!(
-        quota_snapshot(&repository, application_id).await,
-        quota_baseline
-    );
+    assert_s3_quota_ledger(&repository, application_id, 12345, 6789).await;
 }
 
 async fn multipart_abort_lock_order_contract(
@@ -476,6 +466,11 @@ async fn multipart_intent_bucket_lock_order_contract(
     .execute(repository.pool())
     .await
     .expect("insert attached upload intent fixture");
+    sqlx::query("UPDATE applications SET reserved_bytes = reserved_bytes + 4 WHERE id = $1")
+        .bind(application_id.as_uuid())
+        .execute(repository.pool())
+        .await
+        .expect("seed attached upload intent reservation");
     sqlx::query("UPDATE s3_multipart_uploads SET upload_intent_id = $1 WHERE upload_id = $2")
         .bind(intent_id)
         .bind(upload_id)
@@ -958,6 +953,40 @@ async fn quota_snapshot(
     .fetch_one(repository.pool())
     .await
     .expect("read lifecycle quota snapshot")
+}
+
+async fn assert_s3_quota_ledger(
+    repository: &PostgresRepository,
+    application_id: ApplicationId,
+    non_s3_used_bytes: i64,
+    non_s3_reserved_bytes: i64,
+) {
+    let active_s3_bytes = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
+         FROM object_versions
+         WHERE application_id = $1 AND state = 'committed'
+           AND superseded_at IS NULL AND NOT is_delete_marker",
+    )
+    .bind(application_id.as_uuid())
+    .fetch_one(repository.pool())
+    .await
+    .expect("sum active lifecycle S3 bytes");
+    let active_reservations = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(expected_size_bytes), 0)::BIGINT
+         FROM s3_upload_intents
+         WHERE application_id = $1 AND state IN ('staging', 'ready', 'committing')",
+    )
+    .bind(application_id.as_uuid())
+    .fetch_one(repository.pool())
+    .await
+    .expect("sum active lifecycle S3 reservations");
+    assert_eq!(
+        quota_snapshot(repository, application_id).await,
+        (
+            non_s3_used_bytes + active_s3_bytes,
+            non_s3_reserved_bytes + active_reservations,
+        )
+    );
 }
 
 async fn configuration_revision_fence(

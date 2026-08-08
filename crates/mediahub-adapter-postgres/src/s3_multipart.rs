@@ -21,7 +21,10 @@ use sqlx::{Postgres, Row, Transaction, postgres::PgRow, types::Json};
 use crate::{
     PostgresRepository,
     codec::{as_i64, as_u64, database_error, postgres_time},
-    s3_repository::{insert_storage_gc_task, lock_upload_intent},
+    s3_repository::{
+        insert_storage_gc_task, lock_s3_quota_bucket, lock_upload_intent,
+        release_s3_upload_intent_quota,
+    },
 };
 
 include!("multipart_lifecycle.rs");

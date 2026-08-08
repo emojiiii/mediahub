@@ -225,11 +225,19 @@ JSON 的 `schema_version` 当前为 1，主要字段包括：
 - Object Tagging，包括 PutObject 标签、精确版本 Get/Put/Delete、版本隔离、CopyObject COPY/REPLACE，以及 invalid key、duplicate key、超过 10 个标签、坏 percent-encoding 四项 Raw SigV4 服务端负例；TagCount 只对安装的 AWS CLI 实际暴露字段作断言。
 - Bucket/Object Object Lock，包括默认 GOVERNANCE retention、显式对象 retention/legal hold、精确 VersionId 查询以及 governance bypass 的拒绝与允许路径。
 
+仓库内还有以下不由 PowerShell native-client 矩阵执行、但属于当前兼容结论的自动化合同：
+
+| 能力 | 当前实现 | 自动化证据 | 尚未覆盖 |
+| --- | --- | --- | --- |
+| Application quota | S3 Put/Copy/Multipart 的 reservation/commit/abort/expiry、Unversioned/Suspended null replacement、永久删除与 Lifecycle 均更新同一 `used_bytes/reserved_bytes` 账本；delete marker 不计容量 | Memory repository 测试与 PostgreSQL 17 `s3_quota_contract` 通过 | 独立真实 HTTP Copy 并发/故障注入 soak |
+| Bucket Policy 管理 API | 严格 Core parser/evaluator、稳定 JSON、PolicyStatus；`0014` 提供稳定 12 位 account ID、全局 Bucket namespace 与 policy persistence；signed owner 支持 GET/PUT/DELETE `?policy` 和 GET `?policyStatus` | Core 单测、PostgreSQL 17 persistence contract，以及 PostgreSQL 17 SQLx HTTP 7/7 通过 | native-client Policy operation 尚未加入本 PowerShell 矩阵 |
+| 数据面 Policy enforcement | App unified resource-policy authorization service 已完成 | App 层组合语义与 fail-closed 单测 | Server 数据操作尚未消费该服务；Access Key Identity Policy persistence/decision 与 anonymous GetObject/ListBucket 尚未接线，当前 signed handler 仍暂时使用旧 `permissions` |
+
 Tagging 的 invalid key、duplicate key、超过 10 个标签和坏 percent-encoding 是四个独立、必须 `PASS` 的负例 operation。前三项绕过 AWS CLI 本地模型校验，发送符合 [PutObjectTagging API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectTagging.html) 结构且 Content-MD5 正确的 XML；第四项直接保留畸形 percent-encoding 原文。四项都断言服务端真实返回 4xx 标准 S3 XML `InvalidTag`，不再用 CLI 本地拒绝或 `SKIP` 代替服务端协议结果。AWS CLI 缺失时，由于 bucket 和精确 seed version 无法建立，整组 AWS operation 仍按客户端缺失语义记为 `SKIP`；可单独运行 `Test-S3Compat.RawSigV4.ps1` 完成无网络离线校验。
 
 Raw signer 的签名计算以 AWS 官方 [S3 SigV4 header authentication 示例](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html) 为离线 golden，使用系统 .NET 的 SHA-256、HMAC-SHA256、MD5 与 `HttpWebRequest`，不加载 AWS SDK、第三方模块或外部 HTTP 命令。它按 UTF-8 字节生成 canonical URI，按编码后的 Name/Value 排序 canonical query，签入 host、Content-MD5、Content-Type、x-amz-content-sha256、x-amz-date 和测试附加头；请求固定为 path-style，禁止重定向。
 
-Object Lock 矩阵只创建 GOVERNANCE retention，不创建测试时间内无法安全清理的 COMPLIANCE retention。矩阵暂不覆盖 Bucket Policy、CORS、Notification、SSE、Lifecycle 执行效果和 virtual-host style。其他能力应在相应协议切片实现后以独立断言加入，不能以现有 `SKIP` 或其他操作的成功替代。
+Object Lock 矩阵只创建 GOVERNANCE retention，不创建测试时间内无法安全清理的 COMPLIANCE retention。PowerShell native-client 矩阵暂不覆盖 Bucket Policy/PolicyStatus、CORS、Notification、SSE、Lifecycle 执行效果和 virtual-host style；Bucket Policy/PolicyStatus 目前由上述 Core、PostgreSQL contract 与 SQLx HTTP 7/7 覆盖。anonymous/data-plane Policy enforcement 仍是待完成项，不能以 signed-owner 管理 API 成功替代。其他能力应在相应协议切片实现后以独立断言加入，不能以现有 `SKIP` 或其他操作的成功替代。
 
 ## 安全与清理
 

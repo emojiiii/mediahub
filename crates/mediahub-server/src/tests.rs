@@ -348,16 +348,33 @@ fn sign_s3_test_request(
         .build()
         .expect("S3 test signing params")
         .into();
+    let signable_body = if presign_expiry.is_some() {
+        aws_sigv4::http_request::SignableBody::UnsignedPayload
+    } else {
+        match request
+            .headers()
+            .get("x-amz-content-sha256")
+            .and_then(|value| value.to_str().ok())
+        {
+            Some("UNSIGNED-PAYLOAD") => aws_sigv4::http_request::SignableBody::UnsignedPayload,
+            Some(value) => aws_sigv4::http_request::SignableBody::Precomputed(value.to_owned()),
+            None => aws_sigv4::http_request::SignableBody::Bytes(request.body()),
+        }
+    };
+    let signing_uri = request
+        .uri()
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
     let signable = aws_sigv4::http_request::SignableRequest::new(
         request.method().as_str(),
-        request.uri().to_string(),
+        signing_uri,
         request.headers().iter().map(|(name, value)| {
             (
                 name.as_str(),
                 value.to_str().expect("S3 test request header"),
             )
         }),
-        aws_sigv4::http_request::SignableBody::UnsignedPayload,
+        signable_body,
     )
     .expect("S3 test signable request");
     aws_sigv4::http_request::sign(signable, &params)
@@ -397,6 +414,397 @@ fn s3_test_xml_value(xml: &str, element: &str) -> Option<String> {
 
 fn s3_test_content_md5(content: &[u8]) -> String {
     STANDARD.encode(<md5::Md5 as md5::Digest>::digest(content))
+}
+
+async fn create_s3_policy_test_access_key(
+    state: &AppState,
+    application_id: ApplicationId,
+    access_key_id: &str,
+    access_key_secret: &str,
+) {
+    state
+        .repository
+        .create_access_key(&NewAccessKey {
+            id: uuid::Uuid::now_v7().to_string(),
+            application_id,
+            access_key_id: access_key_id.to_owned(),
+            secret_ciphertext: state
+                .access_key_cipher
+                .encrypt(access_key_secret.as_bytes())
+                .expect("encrypt access key"),
+            secret_key_version: state.access_key_cipher.version(),
+            secret_last_four: access_key_secret
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect(),
+            name: "Bucket Policy S3".into(),
+            permissions: vec!["bucket:manage".into(), "bucket:list".into()],
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .expect("persist access key");
+}
+
+#[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
+async fn s3_bucket_policy_http_round_trip_enforces_wire_and_owner_semantics(pool: sqlx::PgPool) {
+    let state = auth_test_state(pool, true).await;
+    let (owner_user_id, _) =
+        authenticated_test_user(&state, "s3-policy-owner@example.com", "user").await;
+    let owner_application = state
+        .repository
+        .default_application_for_user(owner_user_id)
+        .await
+        .expect("owner application lookup")
+        .expect("owner application");
+    let (other_user_id, _) =
+        authenticated_test_user(&state, "s3-policy-other@example.com", "user").await;
+    let other_application = state
+        .repository
+        .default_application_for_user(other_user_id)
+        .await
+        .expect("other application lookup")
+        .expect("other application");
+    let owner_key = "mh_ak_policy_owner";
+    let owner_secret = "policy-owner-secret";
+    let other_key = "mh_ak_policy_other";
+    let other_secret = "policy-other-secret";
+    create_s3_policy_test_access_key(&state, owner_application.id, owner_key, owner_secret).await;
+    create_s3_policy_test_access_key(&state, other_application.id, other_key, other_secret).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn({
+        let application = s3_router::router(Arc::clone(&state));
+        async move {
+            axum::serve(listener, application)
+                .await
+                .expect("S3 Bucket Policy test server");
+        }
+    });
+    let client = reqwest::Client::new();
+    let bucket_url = format!("http://{address}/policy-assets");
+
+    let mut create = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&bucket_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("CreateBucket request");
+    sign_s3_test_request(&mut create, owner_key, owner_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, create).await.status(),
+        StatusCode::OK
+    );
+    let identity = mediahub_app::S3BucketPolicyRepository::resolve_s3_bucket_identity(
+        &state.repository,
+        "policy-assets",
+    )
+    .await
+    .expect("bucket identity lookup")
+    .expect("bucket identity");
+    let owner_account_id = identity.owner_account_id.as_str().to_owned();
+
+    let mut repeat_create = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&bucket_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("repeat CreateBucket request");
+    sign_s3_test_request(&mut repeat_create, owner_key, owner_secret, None);
+    let repeat_create = send_s3_test_request(&client, repeat_create).await;
+    assert_eq!(repeat_create.status(), StatusCode::CONFLICT);
+    assert!(
+        repeat_create
+            .text()
+            .await
+            .expect("repeat CreateBucket XML")
+            .contains("<Code>BucketAlreadyOwnedByYou</Code>")
+    );
+
+    let mut global_conflict = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&bucket_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("global CreateBucket conflict request");
+    sign_s3_test_request(&mut global_conflict, other_key, other_secret, None);
+    let global_conflict = send_s3_test_request(&client, global_conflict).await;
+    assert_eq!(global_conflict.status(), StatusCode::CONFLICT);
+    assert!(
+        global_conflict
+            .text()
+            .await
+            .expect("global conflict XML")
+            .contains("<Code>BucketAlreadyExists</Code>")
+    );
+
+    let mut missing_policy = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetBucketPolicy request");
+    sign_s3_test_request(&mut missing_policy, owner_key, owner_secret, None);
+    let missing_policy = send_s3_test_request(&client, missing_policy).await;
+    assert_eq!(missing_policy.status(), StatusCode::NOT_FOUND);
+    assert!(
+        missing_policy
+            .text()
+            .await
+            .expect("missing policy XML")
+            .contains("<Code>NoSuchBucketPolicy</Code>")
+    );
+
+    let mut empty_status = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policyStatus"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetBucketPolicyStatus request");
+    sign_s3_test_request(&mut empty_status, owner_key, owner_secret, None);
+    let empty_status = send_s3_test_request(&client, empty_status).await;
+    assert_eq!(empty_status.status(), StatusCode::OK);
+    assert_eq!(
+        empty_status
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("status content type"),
+        "application/xml"
+    );
+    let empty_status = empty_status.text().await.expect("empty status XML");
+    assert!(empty_status.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
+    assert!(empty_status.contains("<IsPublic>false</IsPublic>"));
+
+    let policy = br#"{"Statement":{"Resource":"arn:aws:s3:::policy-assets","Principal":"*","Action":"s3:ListBucket","Effect":"Allow"},"Version":"2012-10-17"}"#.to_vec();
+    let policy_sha256 = hex::encode(Sha256::digest(&policy));
+    let mut put = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .header(CONTENT_LENGTH, policy.len())
+        .header("content-md5", s3_test_content_md5(&policy))
+        .header("x-amz-content-sha256", policy_sha256)
+        .header("x-amz-expected-bucket-owner", &owner_account_id)
+        .body(policy.clone())
+        .expect("PutBucketPolicy request");
+    sign_s3_test_request(&mut put, owner_key, owner_secret, None);
+    let put = send_s3_test_request(&client, put).await;
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(put.text().await.expect("empty PUT response").is_empty());
+
+    let mut get = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetBucketPolicy request");
+    sign_s3_test_request(&mut get, owner_key, owner_secret, None);
+    let get = send_s3_test_request(&client, get).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(
+        get.headers()
+            .get(CONTENT_TYPE)
+            .expect("policy content type"),
+        "application/json"
+    );
+    let stable_policy = get.text().await.expect("stable policy JSON");
+    assert_eq!(
+        stable_policy,
+        "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::policy-assets\"}]}"
+    );
+
+    let mut public_status = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policyStatus"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("public GetBucketPolicyStatus request");
+    sign_s3_test_request(&mut public_status, owner_key, owner_secret, None);
+    let public_status = send_s3_test_request(&client, public_status).await;
+    assert_eq!(public_status.status(), StatusCode::OK);
+    assert!(
+        public_status
+            .text()
+            .await
+            .expect("public status XML")
+            .contains("<IsPublic>true</IsPublic>")
+    );
+
+    let wrong_owner = if owner_account_id == "999999999999" {
+        "888888888888"
+    } else {
+        "999999999999"
+    };
+    let mut owner_mismatch = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .header("x-amz-expected-bucket-owner", wrong_owner)
+        .body(Vec::new())
+        .expect("owner mismatch request");
+    sign_s3_test_request(&mut owner_mismatch, owner_key, owner_secret, None);
+    let owner_mismatch = send_s3_test_request(&client, owner_mismatch).await;
+    assert_eq!(owner_mismatch.status(), StatusCode::FORBIDDEN);
+    assert!(
+        owner_mismatch
+            .text()
+            .await
+            .expect("owner mismatch XML")
+            .contains("<Code>AccessDenied</Code>")
+    );
+
+    let mut invalid_owner = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .header("x-amz-expected-bucket-owner", "not-an-account")
+        .body(Vec::new())
+        .expect("invalid expected owner request");
+    sign_s3_test_request(&mut invalid_owner, owner_key, owner_secret, None);
+    let invalid_owner = send_s3_test_request(&client, invalid_owner).await;
+    assert_eq!(invalid_owner.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_owner
+            .text()
+            .await
+            .expect("invalid owner XML")
+            .contains("<Code>InvalidArgument</Code>")
+    );
+
+    for method in [Method::GET, Method::PUT, Method::DELETE] {
+        let mut cross_owner = http::Request::builder()
+            .method(method.clone())
+            .uri(format!("{bucket_url}?policy"))
+            .header("host", address.to_string())
+            .body(Vec::new())
+            .expect("cross-owner policy request");
+        sign_s3_test_request(&mut cross_owner, other_key, other_secret, None);
+        let cross_owner = send_s3_test_request(&client, cross_owner).await;
+        assert_eq!(
+            cross_owner.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+        assert!(
+            cross_owner
+                .text()
+                .await
+                .expect("cross-owner XML")
+                .contains("<Code>MethodNotAllowed</Code>")
+        );
+    }
+
+    let malformed = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+    let mut invalid_policy = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .header(CONTENT_LENGTH, malformed.len())
+        .body(malformed)
+        .expect("malformed policy request");
+    sign_s3_test_request(&mut invalid_policy, owner_key, owner_secret, None);
+    let invalid_policy = send_s3_test_request(&client, invalid_policy).await;
+    assert_eq!(invalid_policy.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_policy
+            .text()
+            .await
+            .expect("malformed policy XML")
+            .contains("<Code>MalformedPolicy</Code>")
+    );
+
+    let mut bad_md5 = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .header(CONTENT_LENGTH, policy.len())
+        .header("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")
+        .body(policy.clone())
+        .expect("bad MD5 policy request");
+    sign_s3_test_request(&mut bad_md5, owner_key, owner_secret, None);
+    let bad_md5 = send_s3_test_request(&client, bad_md5).await;
+    assert_eq!(bad_md5.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        bad_md5
+            .text()
+            .await
+            .expect("bad MD5 XML")
+            .contains("<Code>BadDigest</Code>")
+    );
+
+    let oversized = vec![b' '; mediahub_core::MAX_S3_POLICY_BYTES + 1];
+    let mut too_large = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?policy"))
+        .header("host", address.to_string())
+        .header(CONTENT_LENGTH, oversized.len())
+        .body(oversized)
+        .expect("oversized policy request");
+    sign_s3_test_request(&mut too_large, owner_key, owner_secret, None);
+    let too_large = send_s3_test_request(&client, too_large).await;
+    assert_eq!(too_large.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        too_large
+            .text()
+            .await
+            .expect("oversized policy XML")
+            .contains("<Code>PolicyTooLarge</Code>")
+    );
+
+    for _ in 0..2 {
+        let mut delete = http::Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("{bucket_url}?policy"))
+            .header("host", address.to_string())
+            .header("x-amz-expected-bucket-owner", &owner_account_id)
+            .body(Vec::new())
+            .expect("DeleteBucketPolicy request");
+        sign_s3_test_request(&mut delete, owner_key, owner_secret, None);
+        let delete = send_s3_test_request(&client, delete).await;
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    }
+
+    let mut deleted_status = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?policyStatus"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("deleted GetBucketPolicyStatus request");
+    sign_s3_test_request(&mut deleted_status, owner_key, owner_secret, None);
+    let deleted_status = send_s3_test_request(&client, deleted_status).await;
+    assert_eq!(deleted_status.status(), StatusCode::OK);
+    assert!(
+        deleted_status
+            .text()
+            .await
+            .expect("deleted status XML")
+            .contains("<IsPublic>false</IsPublic>")
+    );
+
+    let missing_url = format!("http://{address}/missing-policy-bucket?policy");
+    let mut missing_bucket = http::Request::builder()
+        .method(Method::GET)
+        .uri(missing_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("missing bucket policy request");
+    sign_s3_test_request(&mut missing_bucket, owner_key, owner_secret, None);
+    let missing_bucket = send_s3_test_request(&client, missing_bucket).await;
+    assert_eq!(missing_bucket.status(), StatusCode::NOT_FOUND);
+    assert!(
+        missing_bucket
+            .text()
+            .await
+            .expect("missing bucket XML")
+            .contains("<Code>NoSuchBucket</Code>")
+    );
+
+    server.abort();
 }
 
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
@@ -1241,8 +1649,25 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
         access_key_secret,
         Some(StdDuration::from_secs(24 * 60 * 60)),
     );
+    let parsed_get = crate::s3_gateway::ParsedSigV4::parse(
+        get.method(),
+        get.uri(),
+        get.headers(),
+        std::time::SystemTime::now(),
+    )
+    .expect("parse locally signed presigned GET");
+    parsed_get
+        .verify(access_key_secret, &[])
+        .expect("verify locally signed presigned GET");
     let get_response = send_s3_test_request(&client, get).await;
-    assert_eq!(get_response.status(), StatusCode::OK);
+    if get_response.status() != StatusCode::OK {
+        let status = get_response.status();
+        let body = get_response
+            .text()
+            .await
+            .expect("failed presigned GET response body");
+        panic!("presigned GET failed with {status}: {body}");
+    }
     assert_eq!(get_response.headers()[CONTENT_TYPE], "image/png");
     assert_eq!(
         get_response.bytes().await.expect("GET body").as_ref(),
@@ -2705,7 +3130,7 @@ async fn canonical_object_paths_enforce_visibility_and_preserve_http_reads(pool:
     let other_bucket = Bucket::new(
         BucketId::new(),
         other_application_id,
-        "assets",
+        "other-assets",
         BucketPolicy::unrestricted(Visibility::Public),
         OffsetDateTime::now_utc(),
     )
@@ -2861,7 +3286,7 @@ async fn canonical_object_paths_enforce_visibility_and_preserve_http_reads(pool:
         .get(
             "http://".to_owned()
                 + &address.to_string()
-                + "/app_public_path_other/assets/nested/path.bin",
+                + "/app_public_path_other/other-assets/nested/path.bin",
         )
         .send()
         .await

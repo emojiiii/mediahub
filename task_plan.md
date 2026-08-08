@@ -295,3 +295,48 @@ Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata o
 - `EXPLAIN` 在禁用顺序扫描时确认 current、noncurrent、marker、multipart 与 lifecycle bucket 查询均使用 0013 索引；prefix 改为 Unicode 安全的 C-collation 半开区间后，current/marker 计划不再出现 LIMIT 前 Sort。
 - 最终验证：App Lifecycle 4/4、PG adapter lib 28/28、PG17 Lifecycle contract 1/1、Server binary check、adapter all-target strict Clippy、workspace fmt check、git diff check 全部通过。
 - 临时 PostgreSQL 17 容器使用 tmpfs、无 volume，已按精确名称删除；本轮未 commit、未 push。
+
+---
+
+# S3 Quota 与 Bucket Policy 并行纵向切片（2026-08-08）
+
+## 目标
+
+基于本地提交 `f004443`，把 S3 Put/Copy/Multipart/版本永久删除/Lifecycle 全链路接入 Application quota，并并行建立标准 Bucket Policy 的严格 Core 模型与 evaluator；不保留旧兼容路径，不 push。
+
+## 阶段
+
+- [completed] 1. 完整审计 S3 intent reserve、commit transfer、null replacement、version delete、Multipart 与 Lifecycle 账本边界
+- [completed] 2. 实现 PostgreSQL/Memory quota 原子增减、幂等、竞争与 quota-exceeded 合同
+- [completed] 3. 实现标准 Bucket Policy Core parser/validator/evaluator、稳定序列化、PolicyStatus 与表驱动测试
+- [completed] 4. 对照 Silo 梳理 Bucket Policy classifier、handler、错误顺序、匿名访问与持久化接线清单
+- [completed] 5. 集成审计、fresh PG17、workspace、Clippy/fmt/diff 回归
+- [in_progress] 6. Bucket Policy 持久化/API/SigV4/anonymous 授权纵向接线
+
+## 不变量
+
+- quota 在 begin intent 时 reserve，commit 时只转移一次，abort/expire 时只释放一次；底层 Multipart parts 不重复收费。
+- Enabled 保留的历史 data version 继续占用 used；仅逻辑永久删除 data version 才释放，delete marker 永远不计容量。
+- Unversioned/Suspended null replacement 在同一事务处理新版本入账与旧 null data 释放；失败、重放和竞争不能漂移。
+- Lifecycle 复用同一 quota 释放原语，不得建立第二套单边账本。
+- Bucket Policy 必须显式 Deny 优先、默认拒绝、资源绑定目标 bucket；未知条件/operator 在 PUT 期拒绝。
+
+## 错误记录
+
+| 错误 | 尝试 | 处理 |
+|---|---:|---|
+| 并发代理派发文本内的反引号被 JavaScript 模板字符串误解析，调度脚本在执行前失败 | 1 | 未启动代理、未改源码；改用不含反引号的纯文本提示重新派发 |
+| 配额聚合检索包含不存在的旧文件名 `s3_objects.rs`，导致并行包装器返回失败并丢弃其余输出 | 1 | 改用 `rg --files` 已确认的 `s3_object_service.rs`，后续聚合使用可独立返回结果的调用 |
+| Windows PowerShell 未展开传给 `rg` 的 `crates/mediahub-server/src/s3*` 路径通配符 | 1 | 改为目录参数配合 `-g 's3*.rs'`，不再传路径 glob |
+| 查看可选 cargo/rustc 进程时 `Get-Process` 无匹配返回非零，包装器将已有文件时间输出标为失败 | 1 | 已取得文件稳定时间；后续可选进程查询显式使用 `try/catch` 或省略，不重复该命令 |
+| 内存配额测试首次使用 `--exact` 但未包含模块全名，两个命令均为 0 tests | 1 | 编译已通过；改用唯一测试名子串且去掉 `--exact` 重新执行 |
+| 共享开发期间 Lifecycle contract 将尚未定稿的 `0014` 应用到临时库，迁移文件随后被 Policy 代理完善，SQLx 正确报告 migration 14 checksum changed | 1 | 不篡改迁移历史；在同一临时 PG17 创建新的独立数据库，从 0001 到定稿 0014 做 fresh migration 复验 |
+| 检查尚未创建的并发输出文件时 `Get-ChildItem -ErrorAction SilentlyContinue` 仍使包装命令返回非零 | 1 | status 已正常取得；后续用 `Test-Path` 后再读取，不把“文件尚未产生”作为错误查询 |
+| SigV4 审查沿用了不存在的 `s3_sigv4.rs` 文件名，实际实现位于 `s3_gateway.rs` | 1 | `rg` 已给出真实路径；改读 `s3_gateway.rs`，不重复旧路径 |
+| 创建最终 fresh DB 时，对数据库不存在所产生的空 `psql` 输出直接调用 PowerShell `.Trim()` | 1 | 后续 `createdb` 和存在性查询均成功；后续检查不再对可能为空的输出调用实例方法 |
+| 全工作区回归中旧 Object Tagging 合约让两个应用创建同名 Bucket，与 `0014` 的 S3 全局 Bucket namespace 冲突 | 1 | 保留跨应用版本隔离语义，但为另一应用使用不同的全局 Bucket 名称；这是测试假设更新，不放宽生产唯一约束 |
+| Server 公共路径隔离测试同样依赖不同应用可创建同名 `assets` Bucket | 1 | 将另一应用测试桶改为 `other-assets` 并同步请求路径，继续验证应用路径隔离而不违反全局 Bucket namespace |
+| 预签名 GET 集成测试的签名 helper 将绝对 URL 直接作为 SigV4 canonical URI，而生产验签使用 HTTP origin-form | 1 | helper 改为签署 `path_and_query`，并新增发送前本地 parse/verify 断言；生产验签器无需放宽 |
+| 修正 canonical URI 后预签名 helper 本地自验仍失败：它仍按空 body 摘要签名，而验签器按 S3 预签名规则使用 `UNSIGNED-PAYLOAD` | 1 | query presign 明确使用 `SignableBody::UnsignedPayload`；保留本地自验和真实 HTTP 回归双重断言 |
+| Workspace strict Clippy 报告 `S3BucketDeleteOperation` 三个变体重复 `Delete` 前缀 | 1 | 变体简化为 `Bucket`、`Policy`、`Lifecycle`，不添加 lint 豁免，协议行为不变 |
+| 修复签名 helper 的首个补丁误把 `task_plan.md` 表格上下文放在 `tests.rs` 文件段内 | 1 | 拆分为带显式文件切换的补丁后成功应用，未产生部分源码改动 |

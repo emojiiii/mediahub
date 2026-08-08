@@ -7,6 +7,7 @@ const MAX_S3_LIFECYCLE_ID_BYTES: usize = 255;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3BucketPutOperation {
     CreateBucket,
+    PutPolicy,
     PutVersioning,
     PutLifecycle,
     PutObjectLock,
@@ -14,22 +15,31 @@ enum S3BucketPutOperation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3BucketDeleteOperation {
-    DeleteBucket,
-    DeleteLifecycle,
+    Bucket,
+    Policy,
+    Lifecycle,
 }
 
 fn classify_s3_bucket_put(uri: &Uri, request_id: &str) -> Result<S3BucketPutOperation, S3ApiError> {
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
     let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
-    if usize::from(versioning) + usize::from(lifecycle) + usize::from(object_lock) > 1 {
+    let policy = s3_query_flag(uri, "policy", request_id)?;
+    if usize::from(versioning)
+        + usize::from(lifecycle)
+        + usize::from(object_lock)
+        + usize::from(policy)
+        > 1
+    {
         return Err(S3ApiError::invalid_request(
             "Bucket configuration subresources cannot be combined.",
             uri.path(),
             request_id,
         ));
     }
-    Ok(if versioning {
+    Ok(if policy {
+        S3BucketPutOperation::PutPolicy
+    } else if versioning {
         S3BucketPutOperation::PutVersioning
     } else if lifecycle {
         S3BucketPutOperation::PutLifecycle
@@ -47,7 +57,13 @@ fn classify_s3_bucket_delete(
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
     let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
-    if usize::from(versioning) + usize::from(lifecycle) + usize::from(object_lock) > 1 {
+    let policy = s3_query_flag(uri, "policy", request_id)?;
+    if usize::from(versioning)
+        + usize::from(lifecycle)
+        + usize::from(object_lock)
+        + usize::from(policy)
+        > 1
+    {
         return Err(S3ApiError::invalid_request(
             "Bucket configuration subresources cannot be combined.",
             uri.path(),
@@ -68,10 +84,12 @@ fn classify_s3_bucket_delete(
             request_id,
         ));
     }
-    Ok(if lifecycle {
-        S3BucketDeleteOperation::DeleteLifecycle
+    Ok(if policy {
+        S3BucketDeleteOperation::Policy
+    } else if lifecycle {
+        S3BucketDeleteOperation::Lifecycle
     } else {
-        S3BucketDeleteOperation::DeleteBucket
+        S3BucketDeleteOperation::Bucket
     })
 }
 
@@ -162,6 +180,28 @@ pub(super) async fn s3_bucket_get(
             )
             .await
         }
+        S3BucketGetOperation::GetPolicy => {
+            s3_get_bucket_policy(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+            )
+            .await
+        }
+        S3BucketGetOperation::GetPolicyStatus => {
+            s3_get_bucket_policy_status(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+            )
+            .await
+        }
     }
 }
 
@@ -172,9 +212,26 @@ pub(super) async fn s3_bucket_put(
     method: Method,
     headers: HeaderMap,
     request_id: Extension<RequestId>,
-    content: Bytes,
+    content: Body,
 ) -> Result<Response, S3ApiError> {
     let operation = classify_s3_bucket_put(&uri, &request_id.0.0)?;
+    if operation == S3BucketPutOperation::PutPolicy {
+        return s3_put_bucket_policy(
+            State(state),
+            Path(bucket_name),
+            OriginalUri(uri),
+            method,
+            headers,
+            request_id,
+            content,
+        )
+        .await;
+    }
+    let content = to_bytes(content, MAX_S3_BUCKET_CONFIGURATION_BYTES + 1)
+        .await
+        .map_err(|_| {
+            S3ApiError::entity_too_large(uri.path(), &request_id.0.0)
+        })?;
     match operation {
         S3BucketPutOperation::CreateBucket => {
             s3_create_bucket(
@@ -188,6 +245,7 @@ pub(super) async fn s3_bucket_put(
             )
             .await
         }
+        S3BucketPutOperation::PutPolicy => unreachable!("policy is dispatched before body read"),
         S3BucketPutOperation::PutVersioning => {
             s3_put_bucket_versioning(
                 State(state),
@@ -237,7 +295,7 @@ pub(super) async fn s3_bucket_delete(
 ) -> Result<Response, S3ApiError> {
     let operation = classify_s3_bucket_delete(&uri, &request_id.0.0)?;
     match operation {
-        S3BucketDeleteOperation::DeleteBucket => {
+        S3BucketDeleteOperation::Bucket => {
             s3_delete_bucket(
                 State(state),
                 Path(bucket_name),
@@ -248,8 +306,19 @@ pub(super) async fn s3_bucket_delete(
             )
             .await
         }
-        S3BucketDeleteOperation::DeleteLifecycle => {
+        S3BucketDeleteOperation::Lifecycle => {
             s3_delete_bucket_lifecycle_configuration(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+            )
+            .await
+        }
+        S3BucketDeleteOperation::Policy => {
+            s3_delete_bucket_policy(
                 State(state),
                 Path(bucket_name),
                 OriginalUri(uri),

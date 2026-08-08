@@ -187,3 +187,20 @@
 - 主代理使用全新 `postgres:17-alpine` tmpfs 容器独立复验：Lifecycle contract 1/1 通过；全 workspace 所有 targets 通过，App 52/52、Server 165/165、PG adapter 28/28，全部 PG contracts 各 1/1。
 - 主代理再次完成 `cargo clippy --workspace --all-targets -- -D warnings`、workspace fmt check、raw SigV4 offline golden 与 `git diff --check`；仅有既有 Windows linker 信息提示。
 - 主代理创建的容器 `prismark-lifecycle-pg17-main-0808b` 已按精确名称删除；使用 tmpfs、无匹配 volume。
+- 已创建本地提交 `f004443 feat: execute S3 lifecycle and harden compatibility`，分支相对 origin ahead 4；未 push。
+- 下一批已并发启动：完整 S3 Application quota、Bucket Policy Core evaluator、Silo Policy 协议/模块/测试只读对照；主代理负责事务锁序、错误映射和后续 API 集成审查。
+- 主代理独立完成 S3 quota 静态审查：Put/Copy/WebDAV 复用 begin_put reservation，Multipart completion 复用 attached intent；终态 replay 不二次释放，delete marker 不计容量，null replacement 在单事务转移 new-old，未发现 application→bucket 反向锁。
+- 内存 quota/reservation/replay 与 Suspended null replacement 针对性测试各 1/1 通过；PostgreSQL adapter tests 编译通过。
+- 主代理启动 tmpfs、无 volume 的 PostgreSQL 17 容器 `prismark-s3quota-pg17-main-0808`（随机回环端口 64727）；真实 `s3_quota_contract` 1/1 与 quota 接入后的 `s3_lifecycle_contract` 1/1 均通过。
+- Core Bucket Policy 已完成 strict parser/evaluator、稳定 JSON 与保守 PolicyStatus；主代理复验 Core 75/75 和 strict Clippy 通过。
+- Bucket Policy persistence 已完成 0014、稳定 12 位账户 ID、全局 bucket 名、JSONB/hash/revision 与 tenant fence。第一次主线复验命中并发中间版 0014 的 SQLx checksum 保护；改用全新独立数据库从 0001 fresh migrate 后 contract 1/1 通过，未篡改迁移记录。
+- 新一轮并发已启动：Server Bucket Policy/PolicyStatus HTTP 管理接口，以及 App 统一 resource-policy 授权决策服务；主代理负责 fresh PG、协议顺序、全局 bucket 冲突语义与最终集成。
+- App 统一 S3 authorization service 已完成并交接：签名 principal 与 anonymous 显式分型，identity/bucket Deny 优先，同账户 Allow 并集、跨账户双 Allow、条件传递和 invalid persisted policy fail-closed；App 63/63、strict Clippy 通过。
+- AWS 官方文档复核后已纠正 HTTP 子任务：GetBucketPolicyStatus 必须返回 XML，不是 SDK 展示的 JSON；PUT 采用 200 empty，DELETE 采用 204，跨 owner 405、expected owner mismatch 403。
+- 标准 Access Key Identity Policy Core 切片已并发启动；目标是不使用旧 permissions 作为 S3 授权 fallback。
+- Bucket Policy HTTP 管理切片已交接：GET/PUT/DELETE policy、GET policyStatus XML、20 KiB/Content-Length/MD5/stable JSON、expected owner、跨 owner 405、全局 CreateBucket 冲突均完成；focused + 真实 PG17 SQLx HTTP 7/7 通过。
+- Raw SigV4 offline golden 再次通过；HTTP 最终 strict Clippy/全量测试等待并发 Identity Policy Core 文件从中间态稳定后统一执行。
+- Identity Policy Core 已完成：显式 Account/Bucket/Object 资源域、identity-only actions、Principal 禁止、Deny 优先、稳定 JSON 与严格限制；Core 80/80、App 63/63。
+- 主线使用全新 PostgreSQL 17 数据库完成 workspace all-targets 串行回归：PG quota/policy/lifecycle/tagging/lock/listing contracts 全部通过，Server 172/172、Core 80/80、App 63/63；仅真实外部 S3 contract 按环境约定 ignored。
+- 全量回归修正了两个全局 Bucket namespace 的旧测试假设，并修复集成测试 SigV4 presigner 的 origin-form 与 `UNSIGNED-PAYLOAD` 构造；生产验签未放宽，预签名 GET 现在发送前自验与真实 HTTP 双通过。
+- Workspace strict Clippy `-D warnings`、workspace fmt 已通过；当前切片准备本地提交，不 push。下一切片继续 Identity Policy persistence/Server decision 与 anonymous 数据面授权接线。

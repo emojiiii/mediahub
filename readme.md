@@ -7,7 +7,7 @@
 
 **PrismArk（万象仓）** 是一套面向团队和 AI 应用的自托管对象存储与内容体验平台。它把对象存储、WebDAV、全格式文件预览和图片 Variant 放在同一个产品里：应用可以通过 API 或 SDK 保存对象，人在控制台中则可以像使用现代文件管理器一样浏览、预览和管理内容。
 
-PrismArk 目前处于快速迭代阶段。现有版本已经具备可靠上传、Local/S3 存储后端、WebDAV、S3 核心对象闭环、图片 Variant、多格式预览、应用隔离、访问密钥和 Webhook。S3 网关已经覆盖 Bucket、Put/Get/Head/Copy/List/Delete/DeleteObjects、Multipart、版本与上传列表、三态 Versioning、null version、delete marker、版本级 Object Tagging、Bucket/Object Object Lock、Lifecycle 核心执行器与持久化 GC；Policy 和更多扩展操作仍在按照 [S3 修改方案](docs/mediahub-s3-modification-plan.md) 推进。
+PrismArk 目前处于快速迭代阶段。现有版本已经具备可靠上传、Local/S3 存储后端、WebDAV、S3 核心对象闭环、图片 Variant、多格式预览、应用隔离、访问密钥和 Webhook。S3 网关已经覆盖 Bucket、Put/Get/Head/Copy/List/Delete/DeleteObjects、Multipart、版本与上传列表、三态 Versioning、null version、delete marker、版本级 Object Tagging、Bucket/Object Object Lock、Lifecycle 核心执行器与持久化 GC；S3 写入、覆盖、删除和 Lifecycle 也已统一接入 Application quota。Bucket Policy 的严格解析/求值、持久化和 signed-owner 管理 API 已完成，数据面统一授权与匿名访问仍在按照 [S3 修改方案](docs/mediahub-s3-modification-plan.md) 推进。
 
 > 产品品牌已经更名为 PrismArk。当前代码中的 `mediahub-*` crate、`MEDIAHUB_*` 环境变量、镜像路径和部分 API 类型仍是技术标识，尚未机械重命名。本文保留这些真实标识，确保文档与当前实现一致；没有为旧品牌增加兼容代码。
 
@@ -110,7 +110,7 @@ PrismArk 连接这两种体验：
 └─ Buckets
 
 数据保护
-├─ Policies                 依赖 S3 Policy 重构
+├─ Policies                 管理 API 可用，数据面统一授权接线中
 ├─ Versioning               S3 核心语义可用，控制台继续接入
 ├─ Lifecycle                配置 API 与 ObjectVersion 核心执行器可用
 └─ Object Lock              Bucket 配置、Retention、Legal Hold 与删除保护可用
@@ -155,11 +155,11 @@ PrismArk 连接这两种体验：
 | 原生路径对象 API | 可用 | 按 Application/Bucket/Object Key 访问 |
 | WebDAV | 可用 | ObjectVersion 上的文件客户端兼容层；GET/HEAD/PUT/DELETE/COPY 已接入，MOVE 暂时明确拒绝 |
 | S3 存储后端 | 可用 | PrismArk 可把二进制保存到外部 S3/R2/兼容服务 |
-| S3 Gateway | 核心闭环可用 | Bucket、Put/Get/Head/Copy/List/Delete/DeleteObjects、Multipart、版本/上传列表与版本级 Object Tagging；S3 写删尚未统一接入 Application quota，仍不是完整 S3 实现 |
+| S3 Gateway | 核心闭环可用 | Bucket、Put/Get/Head/Copy/List/Delete/DeleteObjects、Multipart、版本/上传列表与版本级 Object Tagging；Put/Copy/Multipart 的预留、提交、终止、过期，以及覆盖、永久删除和 Lifecycle 已统一接入 Application quota |
 | 全格式预览 | 可用 | 插件化、按需加载、浏览器 Worker 隔离 |
 | 图片 Variant | 可用 | 实时参数、缓存与并发 fencing |
 | 视频 Variant | 规划 | 后续独立服务与队列 |
-| S3 Policy | 重构中 | 尚未实现标准 Bucket Policy 评估与管理接口 |
+| S3 Policy | 控制面可用，授权接线中 | Bucket Policy 严格 Core parser/evaluator、稳定 JSON、PolicyStatus、12 位 account ID、全局 Bucket namespace 与策略持久化已完成；signed owner 可 GET/PUT/DELETE policy 和 GET policyStatus。Identity Policy Core 已完成，持久化、Server 决策、数据面统一授权与匿名 GetObject/ListBucket 仍待接线 |
 | Versioning | 核心可用 | 已支持三态、null version、delete marker、精确版本读删和 ListObjectVersions |
 | Object Tagging | 核心可用 | 当前/精确版本 GET/PUT/DELETE、PutObject、Copy COPY/REPLACE、Multipart 冻结与 TagCount |
 | 标准 S3 Lifecycle | 核心可用 | 支持 Expiration、NoncurrentVersionExpiration、ExpiredObjectDeleteMarker 与 Multipart Abort；带配置/版本 fencing、Object Lock 复检和持久化 GC |
@@ -207,7 +207,7 @@ S3 使用独立 Listener，默认地址为 `http://127.0.0.1:9000`，Bucket 和 
 /{bucket}/{object_key}
 ```
 
-SDK 请配置自定义 endpoint、`us-east-1` Region 与 Path Style 寻址。Web 控制台、JSON API、WebDAV、health 和 metrics 继续使用 3000 端口；S3 端口不提供健康检查。Versioning、Delete Marker、持久化 GC、CopyObject/UploadPartCopy、ListObjectVersions、ListMultipartUploads、Multipart、Object Tagging、Object Lock 与 Lifecycle 核心执行器已进入同一 ObjectVersion 纵向闭环；尚未支持的重点包括标准 Policy、通知、CORS、SSE、virtual-host style 以及更广泛的 SDK 兼容矩阵。
+SDK 请配置自定义 endpoint、`us-east-1` Region 与 Path Style 寻址。Web 控制台、JSON API、WebDAV、health 和 metrics 继续使用 3000 端口；S3 端口不提供健康检查。Versioning、Delete Marker、持久化 GC、Application quota、CopyObject/UploadPartCopy、ListObjectVersions、ListMultipartUploads、Multipart、Object Tagging、Object Lock 与 Lifecycle 核心执行器已进入同一 ObjectVersion 纵向闭环。Bucket Policy 管理 API 已可用，但当前 signed 数据 handler 仍暂时使用旧 `permissions`，不能视为标准 Identity + Bucket Policy 授权已经全面启用；匿名 GetObject/ListBucket、Notification、CORS、SSE、virtual-host style 和更广泛的 SDK 兼容矩阵仍待完成。
 
 ### 健康与运行状态
 
@@ -409,7 +409,7 @@ PrismArk 不复制 Silo 的 AGPL 代码，只参考其成熟的协议处理顺�
 5. 使用 UploadIntent、原子版本提交和持久化 GC 处理上传、覆盖与回收。
 6. 通过独立 9000 Listener 提供无 `/s3` 前缀的 Path Style S3 endpoint。
 
-下一阶段重点是标准 Policy、Bucket Notification，以及把控制台版本历史和 Variant 继续统一绑定到不可变 `object_version_id`。WebDAV 普通文件路径、Object Tagging、Object Lock、Lifecycle 核心执行器和预览后端已经完成 ObjectVersion 纵向闭环。
+下一阶段重点是完成 Access Key Identity Policy、让 Server 数据操作消费统一授权服务、接入匿名 GetObject/ListBucket，再推进 Bucket Notification，并把控制台版本历史和 Variant 继续统一绑定到不可变 `object_version_id`。WebDAV 普通文件路径、S3 quota、Bucket Policy 管理面、Object Tagging、Object Lock、Lifecycle 核心执行器和预览后端已经完成各自当前纵向切片。
 
 完整到文件级别的删除、新增、数据库和测试方案见：
 
@@ -433,12 +433,15 @@ PrismArk 不复制 Silo 的 AGPL 代码，只参考其成熟的协议处理顺�
 - 版本级 Object Tagging、Copy COPY/REPLACE、Multipart 标签冻结与 TagCount
 - Object Lock 与 Object Tagging 的 AWS CLI 严格兼容矩阵
 - Standard Lifecycle 核心执行器与持久化 GC
+- S3 Put/Copy/Multipart、覆盖、永久删除与 Lifecycle 的 Application quota 闭环
+- Bucket Policy 严格解析/求值、稳定 JSON、PolicyStatus、持久化与 signed-owner 管理 API
 - WebDAV 普通文件路径迁移到 ObjectVersion
 - 不可变 ObjectVersion 预览 Manifest 与内容接口
 
 ### S3 下一阶段
 
-- Policy
+- Access Key Identity Policy 持久化与 Server identity decision
+- 数据面统一 Bucket Policy enforcement 与匿名 GetObject/ListBucket
 - Lifecycle 标签/大小过滤、Transition 与大规模性能矩阵
 - CORS 与 SSE
 - Bucket Notification

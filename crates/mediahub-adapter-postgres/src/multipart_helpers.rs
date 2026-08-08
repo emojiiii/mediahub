@@ -250,6 +250,7 @@ async fn abort_locked_attached_intent(
     {
         return Err(RepositoryError::Conflict);
     }
+    lock_s3_quota_bucket(transaction, intent.application_id(), intent.bucket_id()).await?;
     enqueue_attached_intent_cleanup(transaction, upload, intent, now).await?;
     if !matches!(
         intent.state(),
@@ -267,6 +268,7 @@ async fn abort_locked_attached_intent(
         if changed.rows_affected() != 1 {
             return Err(RepositoryError::Conflict);
         }
+        release_s3_upload_intent_quota(transaction, intent).await?;
     }
     Ok(())
 }

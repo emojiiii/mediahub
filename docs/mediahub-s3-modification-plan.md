@@ -19,12 +19,12 @@
 | Put/Get/Head/Copy | 核心完成 | SigV4 顺序、流式写入、SHA-256 + MD5、Content-MD5、单 Range、条件请求、metadata、版本响应头、CopyObject | 更多 checksum；外部 S3 Full GET/Copy 改成真正端到端流式读取 |
 | List/Delete | 核心完成 | ListObjectsV2 与 ListObjectVersions 的分页/marker/prefix/delimiter；DeleteObject/DeleteObjects 的 marker/null/lock/GC 语义 | ListObjectsV1 与更多 golden/客户端测试 |
 | Multipart | 核心完成 | Create/UploadPart/ListParts/Complete/Abort/ListMultipartUploads/UploadPartCopy；Part MD5、标准 multipart ETag、恢复与重放、ObjectVersion 原子提交、持久 GC | 真实客户端并发与故障注入矩阵 |
-| Application Quota | 部分完成 | JSON/原生上传链路已有 `used_bytes/reserved_bytes` 账本 | S3 Put/Multipart/Copy/覆盖/null replacement/永久删除必须作为独立纵向切片一次性接入，禁止只在 Lifecycle 删除侧扣减 |
-| Bucket 配置 | 部分完成 | List/Create/Head/Delete/GetLocation；Versioning GET/PUT；Lifecycle GET/PUT/DELETE；Object Lock GET/PUT/CreateBucket header 与不可逆约束 | Policy、CORS、Notification、Bucket Tagging |
+| Application Quota | 已完成当前 S3 闭环 | S3 Put/Copy/Multipart reservation/commit/abort/expiry、Unversioned/Suspended null replacement、永久删除与 Lifecycle 已统一接入 `used_bytes/reserved_bytes`；Memory + PostgreSQL 17 contract 通过 | 增加高并发死锁/竞争 soak 与真实 HTTP Copy quota 合同 |
+| Bucket 配置 | 核心完成 | List/Create/Head/Delete/GetLocation；Versioning、Lifecycle、Object Lock；Bucket Policy signed-owner GET/PUT/DELETE 与 PolicyStatus GET；`0014` 提供全局 Bucket namespace、12 位 account ID 和 policy persistence | CORS、Notification、Bucket Tagging；Policy 数据面授权接线 |
 | Lifecycle | 核心完成 | 配置 schema/parser/validator；ObjectVersion Expiration、Noncurrent Expiration、Expired Marker、Multipart Abort；事务复检、Object Lock 与持久 GC | 标签/大小过滤、Transition、性能与多实例 soak 矩阵 |
 | Object Lock | 核心完成 | Bucket 配置、默认 Retention、PutObject 锁头、对象 Retention/Legal Hold GET/PUT、签名 Governance bypass、不可逆 Versioning 约束与删除事务保护 | CopyObject/Multipart 显式锁头支持与 native-client 矩阵 |
 | Object Tagging | 核心完成 | 当前/精确版本 GET/PUT/DELETE；独立版本标签表；PutObject、Copy COPY/REPLACE、Multipart 冻结与 TagCount | Bucket Tagging、标签条件 Policy/Lifecycle、真实 AWS CLI endpoint 回归 |
-| Policy/Auth | 未完成 | 现有 SigV4 和 Application 授权边界继续工作 | 替换固定权限为标准 S3 Policy evaluator |
+| Policy/Auth | 分层进行中 | Bucket Policy strict Core parser/evaluator、stable JSON、PolicyStatus、PostgreSQL persistence 与 signed-owner 管理 HTTP 已完成；Access Key Identity Policy Core 与 App unified authorization service 已完成 | 完成 Identity Policy persistence/Server identity decision，让 Server 数据操作消费统一授权服务，并接入 anonymous GetObject/ListBucket；在此之前 signed handler 仍暂时使用旧 `permissions` |
 
 本轮没有加入旧 `/s3`、旧 schema 或旧品牌兼容代码。历史 `Media` 路径仍存在只是因为非 S3 消费者尚未全部迁移，不是新旧双写；S3 普通对象与 Multipart 的新写入只提交到 Object/ObjectVersion。
 
@@ -35,6 +35,9 @@
 - Server 全量测试：lib 8/8、server 165/165 通过，包含真实 PostgreSQL 的 SigV4 S3、WebDAV、Object Tagging 和不可变版本预览用例。
 - PostgreSQL Repository、S3 列表、Bucket Object Lock、ObjectVersion Lock 与 Object Tagging 合同：各 1/1 通过。
 - PostgreSQL Lifecycle 合同 1/1、App 52/52 通过；覆盖 Enabled/Suspended/Unversioned、配置与 head 竞争、Retention、GC、Multipart 锁序、公平预算和普通 Expiration marker。
+- S3 quota 的 Memory 测试与 PostgreSQL 17 `s3_quota_contract` 通过；覆盖 Put/Copy/Multipart 预留与结算、abort/expiry、null replacement、永久删除和 Lifecycle，delete marker 不计容量。
+- PostgreSQL 17 从 `0001` 到 `0014` fresh migration 通过；`0014` 已验证稳定且唯一的 12 位 S3 account ID、全局 Bucket 名称约束与 Bucket Policy 持久化。
+- Bucket Policy Core 严格解析/求值、稳定 JSON 与 PolicyStatus 单测通过；signed-owner Policy/PolicyStatus PostgreSQL 17 SQLx HTTP 测试 7/7 通过。
 - Silo `docker.io/pgsty/silo:latest`：真实 ObjectStore 与 Presigned PUT 合同 1/1 通过。
 - 真实测试修复了两个仅靠静态检查无法发现的问题：PostgreSQL constraint 自动命名冲突/NUL 检查，以及 generic S3 create-only copy 的能力差异。
 
@@ -1295,8 +1298,10 @@ PutBucketObjectLockConfiguration：
 - versionId/null version/delete marker response headers；
 - 标准 S3 XML error。
 
-CopyObject/UploadPartCopy 与版本级 Object Tagging 已由后续纵向切片完成。仍待实现的是 Bucket Policy、Notification、Bucket Tagging、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token；未实现 operation 必须返回标准错误，不能假成功。
+CopyObject/UploadPartCopy、版本级 Object Tagging，以及 Bucket Policy signed-owner 管理 API/PolicyStatus 已由后续纵向切片完成。Bucket Policy 的 Server 数据面 enforcement、Access Key Identity Policy persistence/decision 与 anonymous GetObject/ListBucket 仍待接线；Notification、Bucket Tagging、CORS、POST Policy、SSE-S3、GetObjectAttributes、更多 checksum 与临时 session token 也尚未实现。未实现 operation 必须返回标准错误，不能假成功。
 ## 10. Policy 实现
+
+> 当前实现状态：Bucket Policy strict Core parser/evaluator、稳定 JSON 与 PolicyStatus 已完成；迁移 `0014` 已提供稳定 12 位 account ID、全局 Bucket namespace 和 policy persistence；signed owner 的 GET/PUT/DELETE `?policy` 与 GET `?policyStatus` 已完成，并通过 PostgreSQL 17 SQLx HTTP 7/7。标准 Access Key Identity Policy Core 与 App 层 unified authorization service 已完成，但 persistence、Server identity decision、对象/列表数据面 enforcement 与 anonymous GetObject/ListBucket 尚未接线；旧 `permissions` 仍暂时服务当前 signed handler，因此本章最终授权模型尚未全面启用。
 
 ### 10.1 Core 类型
 
@@ -1821,6 +1826,8 @@ crates/mediahub-adapter-postgres/tests/
   multipart_repository_contract.rs
   storage_gc_contract.rs
   listing_contract.rs
+  s3_quota_contract.rs
+  s3_bucket_policy_contract.rs
 
 crates/mediahub-server/tests/s3/
   sigv4.rs
@@ -1850,7 +1857,8 @@ crates/mediahub-server/tests/s3/
 - Compliance 只能延长、不能缩短；
 - Legal Hold 与 Retention 相互独立；
 - Lifecycle evaluator 表驱动测试；
-- 第一阶段不支持的 Lifecycle filter/action 被 validator 拒绝。
+- 第一阶段不支持的 Lifecycle filter/action 被 validator 拒绝；
+- Bucket Policy 严格结构/边界、Allow/Deny、Principal、Action/Resource/Condition、稳定 JSON 往返与 PolicyStatus public/trusted 判定。
 
 ### 19.3 PostgreSQL Repository Contract
 
@@ -1874,6 +1882,9 @@ crates/mediahub-server/tests/s3/
 | Multipart Complete/Abort 并发 | 只能有一个终态 |
 | Multipart Complete 重放 | 返回同一 version ID/ETag，不重复 Outbox |
 | GC storage delete 失败 | task 可重试，逻辑状态不回滚 |
+| S3 quota reservation/commit/abort/expiry | `reserved_bytes` 与 `used_bytes` 只转换或释放一次，重放不漂移 |
+| null replacement 与永久删除 | 同事务扣除旧 data version；delete marker 不收费；GC 成败不重复改 quota |
+| Bucket Policy persistence | 12 位 account ID 稳定且唯一，Bucket 名全局唯一，Policy revision 原子递增，跨租户写入隔离 |
 
 ### 19.4 HTTP 集成测试
 
@@ -1890,6 +1901,7 @@ crates/mediahub-server/tests/s3/
 - Retention/LegalHold PUT/GET；
 - Governance bypass；
 - PutObject 与 Multipart 的默认 Retention/Lock headers；
+- signed-owner Get/Put/DeleteBucketPolicy、GetBucketPolicyStatus、Content-Length/Content-MD5、expected-owner 与跨 owner 行为；
 - Error XML、状态码与 response headers golden tests。
 
 ### 19.5 SDK 黑盒与对照
@@ -1988,9 +2000,9 @@ crates/mediahub-server/tests/s3/
 
 验收：Fake Clock、并发删除、Retention 延长与配置 revision 变化测试通过。
 
-### Phase 7：补齐 S3 扩展切片
+### Phase 7：补齐 S3 扩展切片（进行中）
 
-CopyObject/UploadPartCopy 与 Object Tagging 已完成。后续依次实现 Policy、Notification，再处理 Bucket Tagging、CORS/SSE 等能力。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
+CopyObject/UploadPartCopy、Object Tagging、S3 quota 闭环，以及 Bucket Policy Core/persistence/signed-owner 管理 API/PolicyStatus 已完成。Policy 下一步是完成 Access Key Identity Policy persistence 与 Server identity decision，把 App unified resource-policy authorization service 接入对象/列表数据操作，并实现 anonymous GetObject/ListBucket；完成前不得宣称标准 Policy 授权全面启用。随后实现 Notification，再处理 Bucket Tagging、CORS/SSE 与 virtual-host style。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
 
 ### Phase 8：切换其余消费者
 
