@@ -1,15 +1,17 @@
 use async_trait::async_trait;
 use mediahub_core::{
-    ApplicationId, BucketId, BucketS3Configuration, Checksum, EntityTag, NewStorageGcTask,
-    ObjectId, ObjectVersion, ObjectVersionId, ObjectVersionState, S3Bucket,
-    S3LifecycleConfiguration, S3Object, S3VersionId, StorageGcTask, StorageGcTaskId, UploadIntent,
-    UploadIntentId, VersioningStatus,
+    ApplicationId, BucketId, BucketS3Configuration, Checksum, DefaultRetention, EntityTag,
+    NewStorageGcTask, ObjectId, ObjectRetention, ObjectVersion, ObjectVersionId,
+    ObjectVersionState, S3Bucket, S3LifecycleConfiguration, S3Object, S3VersionId, StorageGcTask,
+    StorageGcTaskId, UploadIntent, UploadIntentId, VersioningStatus,
 };
 use time::OffsetDateTime;
 
 use crate::RepositoryError;
 
 pub const MAX_S3_OBJECT_LIST_LIMIT: usize = 1_000;
+pub const MAX_S3_VERSION_LIST_LIMIT: usize = 1_000;
+pub const MAX_S3_MULTIPART_UPLOAD_LIST_LIMIT: usize = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct S3ObjectListQuery {
@@ -42,6 +44,103 @@ pub struct S3ObjectPage {
     pub items: Vec<S3ObjectListItem>,
     pub common_prefixes: Vec<String>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3ObjectVersionListQuery {
+    pub bucket_id: BucketId,
+    pub prefix: String,
+    pub key_marker: Option<String>,
+    pub version_id_marker: Option<S3VersionId>,
+    pub delimiter: bool,
+    pub limit: usize,
+}
+
+impl S3ObjectVersionListQuery {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.limit > MAX_S3_VERSION_LIST_LIMIT {
+            return Err(RepositoryError::Invariant(
+                "S3 object-version page limit must not exceed 1000".into(),
+            ));
+        }
+        if self.version_id_marker.is_some() && self.key_marker.is_none() {
+            return Err(RepositoryError::Invariant(
+                "version-id-marker requires key-marker".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3ObjectVersionListItem {
+    pub key: String,
+    pub version: ObjectVersion,
+    pub is_latest: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct S3ObjectVersionPage {
+    pub items: Vec<S3ObjectVersionListItem>,
+    pub common_prefixes: Vec<String>,
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<S3VersionId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3MultipartUploadListQuery {
+    pub bucket_id: BucketId,
+    pub prefix: String,
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<String>,
+    pub delimiter: bool,
+    pub limit: usize,
+    pub as_of: OffsetDateTime,
+}
+
+impl S3MultipartUploadListQuery {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.limit > MAX_S3_MULTIPART_UPLOAD_LIST_LIMIT {
+            return Err(RepositoryError::Invariant(
+                "S3 multipart-upload page limit must not exceed 1000".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3MultipartUploadListItem {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct S3MultipartUploadPage {
+    pub items: Vec<S3MultipartUploadListItem>,
+    pub common_prefixes: Vec<String>,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
+}
+
+/// Bucket-scoped S3 listings backed only by logical object/version and
+/// multipart-upload metadata. Implementations must apply markers and the
+/// delimiter before the shared `limit + 1` page window.
+#[allow(clippy::missing_errors_doc)]
+#[async_trait]
+pub trait S3ListingRepository: Send + Sync {
+    async fn list_s3_object_versions_page(
+        &self,
+        application_id: ApplicationId,
+        query: &S3ObjectVersionListQuery,
+    ) -> Result<S3ObjectVersionPage, RepositoryError>;
+
+    async fn list_s3_multipart_uploads_page(
+        &self,
+        application_id: ApplicationId,
+        query: &S3MultipartUploadListQuery,
+    ) -> Result<S3MultipartUploadPage, RepositoryError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +178,39 @@ pub enum DeleteS3ObjectOutcome {
     NoOp,
     VersionNotFound,
     Locked(S3DeleteLockReason),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum S3ObjectLockMutation {
+    Retention {
+        retention: ObjectRetention,
+        bypass_governance: bool,
+    },
+    LegalHold(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PutS3ObjectLockCommand {
+    pub application_id: ApplicationId,
+    pub bucket_id: BucketId,
+    pub object_key: String,
+    pub version_id: Option<S3VersionId>,
+    pub mutation: S3ObjectLockMutation,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PutS3ObjectLockOutcome {
+    Updated(ObjectVersion),
+    ObjectNotFound,
+    VersionNotFound,
+    DeleteMarker {
+        version_id: S3VersionId,
+        is_current: bool,
+    },
+    ObjectLockNotEnabled,
+    RetentionLocked(S3DeleteLockReason),
+    InvalidRetention,
 }
 
 /// Persistence boundary for S3 bucket identity and configuration.
@@ -138,6 +270,16 @@ pub trait S3BucketRepository: Send + Sync {
         updated_at: OffsetDateTime,
     ) -> Result<BucketS3Configuration, RepositoryError>;
 
+    /// Locks the bucket row, irreversibly enables Object Lock and versioning,
+    /// and replaces the optional default retention rule in one transaction.
+    async fn replace_s3_bucket_object_lock(
+        &self,
+        application_id: ApplicationId,
+        name: &str,
+        default_retention: Option<DefaultRetention>,
+        updated_at: OffsetDateTime,
+    ) -> Result<BucketS3Configuration, RepositoryError>;
+
     /// Stores normalized lifecycle configuration as a JSON document. XML
     /// parsing and S3 protocol validation remain outside this port.
     async fn replace_s3_bucket_lifecycle(
@@ -194,6 +336,17 @@ pub trait S3ObjectRepository: Send + Sync {
         ))
     }
 
+    /// Resolves one immutable, committed data version inside an Application.
+    ///
+    /// This is the control-plane read boundary for version-addressed content:
+    /// implementations must apply the Application predicate in the storage
+    /// query and must not return delete markers or non-committed versions.
+    async fn find_committed_s3_object_version_for_application(
+        &self,
+        application_id: ApplicationId,
+        version_id: ObjectVersionId,
+    ) -> Result<Option<S3ObjectVersionRead>, RepositoryError>;
+
     async fn find_current_s3_object_version(
         &self,
         object_id: ObjectId,
@@ -212,6 +365,13 @@ pub trait S3ObjectRepository: Send + Sync {
         command: &DeleteS3ObjectCommand,
     ) -> Result<DeleteS3ObjectOutcome, RepositoryError>;
 
+    /// Updates retention or legal hold while locking the tenant bucket,
+    /// logical object and exact immutable version identity in one transaction.
+    async fn put_s3_object_lock(
+        &self,
+        command: &PutS3ObjectLockCommand,
+    ) -> Result<PutS3ObjectLockOutcome, RepositoryError>;
+
     /// Creates an empty logical object, inserts generation one, then points the    /// object at that version in one transaction.
     async fn create_s3_object_with_version(
         &self,
@@ -229,6 +389,13 @@ pub trait S3ObjectRepository: Send + Sync {
         version: ObjectVersion,
         updated_at: OffsetDateTime,
     ) -> Result<S3Object, RepositoryError>;
+}
+
+/// Tenant-scoped read model for immutable ObjectVersion content experiences.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3ObjectVersionRead {
+    pub object_key: String,
+    pub version: ObjectVersion,
 }
 
 pub const MAX_UPLOAD_INTENT_EXPIRY_LIMIT: usize = 1_000;
@@ -252,6 +419,11 @@ pub struct S3ObjectVersionCommit {
     pub committed_at: OffsetDateTime,
     pub replaced_null_version_id: Option<ObjectVersionId>,
     pub gc_tasks: Vec<NewStorageGcTask>,
+    /// Explicit S3 request values. The repository combines these with the
+    /// bucket default while holding the bucket row lock, then freezes the
+    /// resulting values on the inserted ObjectVersion.
+    pub requested_retention: Option<ObjectRetention>,
+    pub requested_legal_hold: Option<bool>,
 }
 
 impl S3ObjectVersionCommit {
@@ -465,6 +637,8 @@ mod phase_one_tests {
             committed_at: OffsetDateTime::UNIX_EPOCH,
             replaced_null_version_id: None,
             gc_tasks: Vec::new(),
+            requested_retention: None,
+            requested_legal_hold: None,
         };
         assert!(matches!(
             commit.validate(),
@@ -517,6 +691,8 @@ mod phase_one_tests {
             committed_at: OffsetDateTime::UNIX_EPOCH,
             replaced_null_version_id: Some(replacement_id),
             gc_tasks: Vec::new(),
+            requested_retention: None,
+            requested_legal_hold: None,
         };
         assert!(matches!(
             invalid.validate(),
@@ -546,6 +722,8 @@ mod phase_one_tests {
             committed_at: OffsetDateTime::UNIX_EPOCH,
             replaced_null_version_id: Some(replacement_id),
             gc_tasks: Vec::new(),
+            requested_retention: None,
+            requested_legal_hold: None,
         };
         assert_eq!(valid.validate(), Ok(()));
     }

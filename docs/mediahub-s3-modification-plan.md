@@ -2,7 +2,7 @@
 
 > 文档性质：代码修改文档，不是产品规划或架构白皮书
 > PrismArk 工作区：`E:\emojiiii\mediaHub`
-> Silo 参考源码：`E:\emojiiii\silo-reference`
+> Silo 参考源码：`E:\emojiiii\mediaHub\.research\silo`（已由根 `.gitignore` 排除）
 > Silo 版本：`100e2e57a799781d23f134acaf47ce454a468be6`
 > 前提：目前没有线上用户和需要保留的数据，最终版本不保留旧 schema、旧 API、旧权限或兼容层
 > 实施原则：开发期间按可验证的纵向切片迁移；所有消费者切换完成后，再删除旧模型并压平为新的 `0001_initial.sql`
@@ -14,14 +14,14 @@
 | 切片 | 当前状态 | 已落地代码与行为 | 下一步 |
 | --- | --- | --- | --- |
 | S3 入口 | 已完成 | 独立 `MEDIAHUB_S3_BIND_ADDR` listener，默认 `0.0.0.0:9000`；Bucket/Object 使用根路径；生产 Router 已删除 `/s3` 路由 | 增加反向代理、virtual-host style 与更多客户端矩阵 |
-| 对象模型 | 核心完成 | `objects`、不可变 `object_versions`、`upload_intents`、`storage_gc_tasks`；新 S3 对象路径不读写 `Media` | 切换 JSON API、WebDAV、Preview、Variant 等剩余消费者并删除旧模型 |
-| Versioning | 核心完成 | Unversioned/Enabled/Suspended、opaque version ID、null version、delete marker、精确版本读删、当前指针重算 | 实现 ListObjectVersions 与版本级 Tagging/Lock API |
-| Put/Get/Head | 核心完成 | SigV4 顺序、流式写入、SHA-256 + MD5、Content-MD5、单 Range、条件请求、metadata、版本响应头 | CopyObject、更多 checksum；外部 S3 Full GET 改成真正流式读取 |
-| List/Delete | 核心完成 | ListObjectsV2 的 prefix/delimiter/start-after/token；DeleteObject/DeleteObjects 的 marker/null/lock/GC 语义 | ListObjectsV1、ListObjectVersions 与更完整 golden tests |
-| Multipart | 核心完成 | Create/UploadPart/ListParts/Complete/Abort；Part MD5、标准 multipart ETag、恢复与重放、ObjectVersion 原子提交、持久 GC | ListMultipartUploads、UploadPartCopy、真实客户端并发/故障注入矩阵 |
-| Bucket 配置 | 部分完成 | List/Create/Head/Delete/GetLocation；Versioning GET/PUT；Lifecycle GET/PUT/DELETE 和未支持 action 的明确拒绝 | Policy、Object Lock 配置、CORS、Notification、Tagging |
+| 对象模型 | 核心完成 | `objects`、不可变 `object_versions`、`upload_intents`、`storage_gc_tasks`；S3、WebDAV 普通文件路径和版本预览后端不读写 `Media` | 切换 JSON 写路径、Variant 等剩余消费者并删除旧模型 |
+| Versioning | 核心完成 | Unversioned/Enabled/Suspended、opaque version ID、null version、delete marker、精确版本读删、ListObjectVersions、当前指针重算 | 版本级 Tagging/Lock API 与更多客户端矩阵 |
+| Put/Get/Head/Copy | 核心完成 | SigV4 顺序、流式写入、SHA-256 + MD5、Content-MD5、单 Range、条件请求、metadata、版本响应头、CopyObject | 更多 checksum；外部 S3 Full GET/Copy 改成真正端到端流式读取 |
+| List/Delete | 核心完成 | ListObjectsV2 与 ListObjectVersions 的分页/marker/prefix/delimiter；DeleteObject/DeleteObjects 的 marker/null/lock/GC 语义 | ListObjectsV1 与更多 golden/客户端测试 |
+| Multipart | 核心完成 | Create/UploadPart/ListParts/Complete/Abort/ListMultipartUploads/UploadPartCopy；Part MD5、标准 multipart ETag、恢复与重放、ObjectVersion 原子提交、持久 GC | 真实客户端并发与故障注入矩阵 |
+| Bucket 配置 | 部分完成 | List/Create/Head/Delete/GetLocation；Versioning GET/PUT；Lifecycle GET/PUT/DELETE；Object Lock GET/PUT/CreateBucket header 与不可逆约束 | Policy、CORS、Notification、Tagging |
 | Lifecycle | 部分完成 | 配置 schema、parser、validator 与 Multipart 过期回收 | 完成基于 ObjectVersion 的 Expiration/Noncurrent/ExpiredMarker 执行器 |
-| Object Lock | 部分完成 | 删除事务内检查 Legal Hold、Compliance、Governance 和签名 bypass header | Bucket/Object Retention 与 Legal Hold 的 GET/PUT API、Put 默认保留 |
+| Object Lock | 核心完成 | Bucket 配置、默认 Retention、PutObject 锁头、对象 Retention/Legal Hold GET/PUT、签名 Governance bypass、不可逆 Versioning 约束与删除事务保护 | CopyObject/Multipart 显式锁头支持与 native-client 矩阵 |
 | Policy/Auth | 未完成 | 现有 SigV4 和 Application 授权边界继续工作 | 替换固定权限为标准 S3 Policy evaluator |
 
 本轮没有加入旧 `/s3`、旧 schema 或旧品牌兼容代码。历史 `Media` 路径仍存在只是因为非 S3 消费者尚未全部迁移，不是新旧双写；S3 普通对象与 Multipart 的新写入只提交到 Object/ObjectVersion。
@@ -30,7 +30,8 @@
 
 - PostgreSQL 17 fresh migration：通过。
 - PostgreSQL Repository Contract：1/1 通过。
-- Server 全量测试：lib 8/8、server 133/133 通过，其中包含 15 个 `sqlx::test` 数据库用例。
+- Server 全量测试：lib 8/8、server 155/155 通过，包含真实 PostgreSQL 的 SigV4 S3、WebDAV 和不可变版本预览用例。
+- PostgreSQL S3 列表合同与 Bucket Object Lock 合同：各 1/1 通过。
 - Silo `docker.io/pgsty/silo:latest`：真实 ObjectStore 与 Presigned PUT 合同 1/1 通过。
 - 真实测试修复了两个仅靠静态检查无法发现的问题：PostgreSQL constraint 自动命名冲突/NUL 检查，以及 generic S3 create-only copy 的能力差异。
 
@@ -1940,7 +1941,7 @@ crates/mediahub-server/tests/s3/
 ### Phase 2：ObjectService 基础纵向闭环（已完成核心对象路径）
 
 - 复用现有 SigV4 与 Application 边界，但直接使用独立 S3 listener；
-- 完成 Put/Get/Head/Delete；ListObjectVersions 留到后续扩展切片；
+- 完成 Put/Get/Head/Delete、ListObjectsV2 与 ListObjectVersions；
 - 完成 null version、delete marker、head/generation、quota/outbox 和持久化 GC；
 - 新 S3 路径不再写 Media。
 
@@ -1961,14 +1962,17 @@ crates/mediahub-server/tests/s3/
 - Initiate 冻结 metadata/checksum/lock；
 - Complete 原子提交 version/head/quota/outbox/终态；
 - Abort 与 Complete 竞争、重放和 GC。
+- ListMultipartUploads 与 UploadPartCopy 已作为独立协议切片完成。
 
 验收：并行、重传、重放、abort/complete race 与 failure injection 通过。
 
-### Phase 5：Object Lock
+### Phase 5：Object Lock（核心纵向闭环已完成）
 
 - Bucket 创建后启用、不可关闭、自动 Enabled、禁止 Suspended；
 - Default Retention、Object Retention、Legal Hold、Governance bypass；
 - PutObject/Multipart lock headers。
+
+当前 PutObject、Bucket DefaultRetention、对象级 Retention/Legal Hold 已完成；CopyObject 目标锁头和 Multipart 显式锁头暂时明确拒绝，不会静默忽略。无显式锁头的 Multipart Complete 会在版本提交事务内应用 Bucket DefaultRetention。
 
 验收：锁定版本在用户、Lifecycle 和 GC 路径均不会被提前物理删除。
 
@@ -1983,11 +1987,11 @@ crates/mediahub-server/tests/s3/
 
 ### Phase 7：补齐 S3 扩展切片
 
-依次实现 CopyObject/UploadPartCopy、Tagging、Policy、Notification，再处理 CORS/SSE 等后续能力。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
+CopyObject/UploadPartCopy 已完成。后续依次实现 Tagging、Policy、Notification，再处理 CORS/SSE 等能力。每个切片包含 operation classifier、action、repository、HTTP golden 与 SDK 测试，不把 Router/Auth/Policy/Error 一次重写。
 
 ### Phase 8：切换其余消费者
 
-按顺序切换 JSON API、WebDAV、Preview、Variant、Short Link、Batch Job、Worker 和 Web UI 到 Object/ObjectVersion。每切换一个消费者，就删除其旧 Media 写入口与旧契约。
+WebDAV 普通文件路径和不可变版本 Preview 后端已经切换；后续按顺序切换 JSON API、Variant、Short Link、Batch Job、Worker 和 Web UI 的剩余路径到 Object/ObjectVersion。每切换一个消费者，就删除其旧 Media 写入口与旧契约。
 
 验收：所有协议读取同一 head，同一版本 ETag 一致，旧预览/Variant 不因 Key 覆盖漂移。
 

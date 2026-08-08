@@ -88,16 +88,29 @@ async fn load_s3_authentication(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3BucketGetOperation {
     ListObjects,
+    ListObjectVersions,
+    ListMultipartUploads,
     GetLocation,
     GetVersioning,
     GetLifecycle,
+    GetObjectLock,
 }
 
 fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOperation, S3ApiError> {
     let location = s3_query_flag(uri, "location", request_id)?;
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
-    if usize::from(location) + usize::from(versioning) + usize::from(lifecycle) > 1 {
+    let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
+    let versions = s3_query_flag(uri, "versions", request_id)?;
+    let uploads = s3_query_flag(uri, "uploads", request_id)?;
+    if usize::from(location)
+        + usize::from(versioning)
+        + usize::from(lifecycle)
+        + usize::from(object_lock)
+        + usize::from(versions)
+        + usize::from(uploads)
+        > 1
+    {
         return Err(S3ApiError::invalid_request(
             "Bucket subresources cannot be combined.",
             uri.path(),
@@ -111,14 +124,17 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         S3BucketGetOperation::GetVersioning
     } else if lifecycle {
         S3BucketGetOperation::GetLifecycle
+    } else if object_lock {
+        S3BucketGetOperation::GetObjectLock
+    } else if versions {
+        S3BucketGetOperation::ListObjectVersions
+    } else if uploads {
+        S3BucketGetOperation::ListMultipartUploads
     } else {
         S3BucketGetOperation::ListObjects
     };
-    if operation == S3BucketGetOperation::ListObjects {
-        return Ok(operation);
-    }
 
-    const LIST_QUERY_PARAMETERS: [&str; 8] = [
+    const ALL_LIST_QUERY_PARAMETERS: [&str; 13] = [
         "list-type",
         "prefix",
         "delimiter",
@@ -127,17 +143,240 @@ fn classify_s3_bucket_get(uri: &Uri, request_id: &str) -> Result<S3BucketGetOper
         "start-after",
         "encoding-type",
         "max-keys",
+        "key-marker",
+        "version-id-marker",
+        "max-uploads",
+        "upload-id-marker",
+        "uploads",
     ];
-    for name in LIST_QUERY_PARAMETERS {
+
+    match operation {
+        S3BucketGetOperation::GetLocation
+        | S3BucketGetOperation::GetVersioning
+        | S3BucketGetOperation::GetLifecycle
+        | S3BucketGetOperation::GetObjectLock => {
+            for name in ALL_LIST_QUERY_PARAMETERS {
+                if s3_query_value(uri, name, request_id)?.is_some() {
+                    return Err(S3ApiError::invalid_request(
+                        "Bucket configuration parameters cannot be combined with listing parameters.",
+                        uri.path(),
+                        request_id,
+                    ));
+                }
+            }
+        }
+        S3BucketGetOperation::ListObjects => {
+            reject_s3_listing_parameters(
+                uri,
+                request_id,
+                &["key-marker", "version-id-marker", "max-uploads", "upload-id-marker"],
+            )?;
+        }
+        S3BucketGetOperation::ListObjectVersions => {
+            reject_s3_listing_parameters(
+                uri,
+                request_id,
+                &[
+                    "list-type",
+                    "marker",
+                    "continuation-token",
+                    "start-after",
+                    "max-uploads",
+                    "upload-id-marker",
+                ],
+            )?;
+        }
+        S3BucketGetOperation::ListMultipartUploads => {
+            reject_s3_listing_parameters(
+                uri,
+                request_id,
+                &[
+                    "list-type",
+                    "marker",
+                    "continuation-token",
+                    "start-after",
+                    "max-keys",
+                    "version-id-marker",
+                ],
+            )?;
+        }
+    }
+    Ok(operation)
+}
+
+fn reject_s3_listing_parameters(
+    uri: &Uri,
+    request_id: &str,
+    names: &[&'static str],
+) -> Result<(), S3ApiError> {
+    for &name in names {
         if s3_query_value(uri, name, request_id)?.is_some() {
             return Err(S3ApiError::invalid_request(
-                "Bucket configuration parameters cannot be combined with object listing parameters.",
+                format!("Query parameter {name} is not valid for this bucket operation."),
                 uri.path(),
                 request_id,
             ));
         }
     }
-    Ok(operation)
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListObjectVersionsQuery {
+    prefix: String,
+    delimiter: Option<String>,
+    key_marker: Option<String>,
+    version_id_marker: Option<S3VersionId>,
+    max_keys: usize,
+    encoding_url: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListMultipartUploadsQuery {
+    prefix: String,
+    delimiter: Option<String>,
+    key_marker: Option<String>,
+    upload_id_marker: Option<String>,
+    max_uploads: usize,
+    encoding_url: bool,
+}
+
+fn parse_list_object_versions_query(
+    uri: &Uri,
+    request_id: &str,
+) -> Result<ListObjectVersionsQuery, S3ApiError> {
+    let prefix = s3_query_value(uri, "prefix", request_id)?.unwrap_or_default();
+    validate_s3_listing_key_like(&prefix, "prefix", uri, request_id)?;
+    let key_marker = s3_query_value(uri, "key-marker", request_id)?;
+    if let Some(marker) = key_marker.as_deref() {
+        validate_s3_listing_key_like(marker, "key-marker", uri, request_id)?;
+    }
+    let version_id_marker = s3_query_value(uri, "version-id-marker", request_id)?
+        .map(S3VersionId::new)
+        .transpose()
+        .map_err(|_| {
+            S3ApiError::invalid_argument(
+                "version-id-marker is invalid.",
+                uri.path(),
+                request_id,
+            )
+        })?;
+    if version_id_marker.is_some() && key_marker.is_none() {
+        return Err(S3ApiError::invalid_argument(
+            "version-id-marker cannot be specified without key-marker.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    Ok(ListObjectVersionsQuery {
+        prefix,
+        delimiter: parse_s3_listing_delimiter(uri, request_id)?,
+        key_marker,
+        version_id_marker,
+        max_keys: parse_s3_listing_limit(uri, "max-keys", request_id)?,
+        encoding_url: parse_s3_listing_encoding(uri, request_id)?,
+    })
+}
+
+fn parse_list_multipart_uploads_query(
+    uri: &Uri,
+    request_id: &str,
+) -> Result<ListMultipartUploadsQuery, S3ApiError> {
+    let prefix = s3_query_value(uri, "prefix", request_id)?.unwrap_or_default();
+    validate_s3_listing_key_like(&prefix, "prefix", uri, request_id)?;
+    let key_marker = s3_query_value(uri, "key-marker", request_id)?;
+    if let Some(marker) = key_marker.as_deref() {
+        validate_s3_listing_key_like(marker, "key-marker", uri, request_id)?;
+    }
+    let upload_id_marker = s3_query_value(uri, "upload-id-marker", request_id)?;
+    if upload_id_marker.as_ref().is_some_and(String::is_empty) {
+        return Err(S3ApiError::invalid_argument(
+            "upload-id-marker must not be empty.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    Ok(ListMultipartUploadsQuery {
+        prefix,
+        delimiter: parse_s3_listing_delimiter(uri, request_id)?,
+        key_marker,
+        upload_id_marker,
+        max_uploads: parse_s3_listing_limit(uri, "max-uploads", request_id)?,
+        encoding_url: parse_s3_listing_encoding(uri, request_id)?,
+    })
+}
+
+fn parse_s3_listing_limit(
+    uri: &Uri,
+    name: &'static str,
+    request_id: &str,
+) -> Result<usize, S3ApiError> {
+    let Some(value) = s3_query_value(uri, name, request_id)? else {
+        return Ok(1_000);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(S3ApiError::invalid_argument(
+            format!("{name} must be an integer between 0 and 1000."),
+            uri.path(),
+            request_id,
+        ));
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value <= 1_000)
+        .ok_or_else(|| {
+            S3ApiError::invalid_argument(
+                format!("{name} must be an integer between 0 and 1000."),
+                uri.path(),
+                request_id,
+            )
+        })
+}
+
+fn parse_s3_listing_delimiter(
+    uri: &Uri,
+    request_id: &str,
+) -> Result<Option<String>, S3ApiError> {
+    match s3_query_value(uri, "delimiter", request_id)? {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) if value == "/" => Ok(Some(value)),
+        Some(_) => Err(S3ApiError::invalid_argument(
+            "Only delimiter=/ is supported.",
+            uri.path(),
+            request_id,
+        )),
+    }
+}
+
+fn parse_s3_listing_encoding(uri: &Uri, request_id: &str) -> Result<bool, S3ApiError> {
+    match s3_query_value(uri, "encoding-type", request_id)?.as_deref() {
+        None => Ok(false),
+        Some("url") => Ok(true),
+        Some(_) => Err(S3ApiError::invalid_argument(
+            "encoding-type must be url.",
+            uri.path(),
+            request_id,
+        )),
+    }
+}
+
+fn validate_s3_listing_key_like(
+    value: &str,
+    name: &str,
+    uri: &Uri,
+    request_id: &str,
+) -> Result<(), S3ApiError> {
+    if value.len() <= 1_024 && !value.as_bytes().contains(&0) {
+        Ok(())
+    } else {
+        Err(S3ApiError::invalid_argument(
+            format!("{name} is invalid."),
+            uri.path(),
+            request_id,
+        ))
+    }
 }
 pub(super) async fn s3_list_buckets(
     State(state): State<Arc<AppState>>,
@@ -182,6 +421,8 @@ pub(super) async fn s3_create_bucket(
             .await?;
     auth.authorize("bucket:manage")
         .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let object_lock_enabled =
+        parse_s3_create_bucket_object_lock_header(&headers, &uri, &request_id.0.0)?;
     validate_s3_create_bucket_configuration(&content).map_err(|error| match error {
         S3CreateBucketConfigurationError::MalformedXml => {
             S3ApiError::malformed_xml(uri.path(), &request_id.0.0)
@@ -207,15 +448,18 @@ pub(super) async fn s3_create_bucket(
         ));
     }
 
-    let bucket = Bucket::new(
+    let now = OffsetDateTime::now_utc();
+    let bucket = S3Bucket::new(
         BucketId::new(),
         auth.application.id,
         bucket_name.clone(),
-        BucketPolicy::unrestricted(Visibility::Private),
-        OffsetDateTime::now_utc(),
+        DEFAULT_S3_REGION,
+        object_lock_enabled,
+        None,
+        now,
     )
     .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
-    match state.repository.create_bucket(&bucket).await {
+    match state.repository.create_s3_bucket(&bucket).await {
         Ok(()) => {}
         Err(mediahub_app::RepositoryError::Conflict) => {
             return Err(S3ApiError::bucket_already_owned_by_you(
@@ -238,9 +482,10 @@ pub(super) async fn s3_create_bucket(
         bucket.id().to_string(),
         serde_json::json!({
             "name": bucket.name(),
-            "visibility": bucket.policy().visibility(),
+            "visibility": "private",
             "protocol": "s3",
             "region": DEFAULT_S3_REGION,
+            "object_lock_enabled": object_lock_enabled,
         }),
     )
     .await;
@@ -370,6 +615,225 @@ fn s3_list_api_error(error: S3ListError, resource: &str, request_id: &str) -> S3
         )
     } else {
         S3ApiError::from_list(error, resource, request_id)
+    }
+}
+
+pub(super) async fn s3_list_object_versions(
+    State(state): State<Arc<AppState>>,
+    Path(bucket_name): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    request_id: Extension<RequestId>,
+) -> Result<Response, S3ApiError> {
+    validate_s3_bucket_name(&bucket_name)
+        .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
+    let auth =
+        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    auth.authorize("media:list")
+        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let bucket = state
+        .repository
+        .find_s3_bucket(auth.application.id, &bucket_name)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 ListObjectVersions bucket lookup failed");
+            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
+        })?
+        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
+    let query = parse_list_object_versions_query(&uri, &request_id.0.0)?;
+    let page = state
+        .repository
+        .list_s3_object_versions_page(
+            auth.application.id,
+            &S3ObjectVersionListQuery {
+                bucket_id: bucket.id(),
+                prefix: query.prefix.clone(),
+                key_marker: query.key_marker.clone(),
+                version_id_marker: query.version_id_marker.clone(),
+                delimiter: query.delimiter.is_some(),
+                limit: query.max_keys,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            RepositoryError::NotFound => S3ApiError::invalid_argument(
+                "The version-id-marker does not identify a visible version of key-marker.",
+                uri.path(),
+                &request_id.0.0,
+            ),
+            error => {
+                warn!(error = %error, "S3 ListObjectVersions lookup failed");
+                S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
+            }
+        })?;
+    let result = s3_object_versions_result_from_page(
+        auth.application.id,
+        bucket.id(),
+        bucket_name,
+        auth.application.app_id.clone(),
+        auth.application.name.clone(),
+        query,
+        page,
+    )
+    .map_err(|error| {
+        warn!(error = %error, "S3 ListObjectVersions repository invariant failed");
+        S3ApiError::internal_error(uri.path(), &request_id.0.0)
+    })?;
+    let body = list_object_versions_result_xml(&result).map_err(|error| {
+        warn!(error = %error, "S3 ListObjectVersions XML encoding failed");
+        S3ApiError::internal_error(uri.path(), &request_id.0.0)
+    })?;
+    Ok(s3_xml_response(StatusCode::OK, body, &request_id.0.0))
+}
+
+fn s3_object_versions_result_from_page(
+    application_id: ApplicationId,
+    bucket_id: BucketId,
+    bucket: String,
+    owner_id: String,
+    owner_display_name: String,
+    query: ListObjectVersionsQuery,
+    page: S3ObjectVersionPage,
+) -> Result<ListObjectVersionsResult, RepositoryError> {
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in page.items {
+        let version = item.version;
+        if version.application_id() != application_id
+            || version.bucket_id() != bucket_id
+            || version.state() != mediahub_core::ObjectVersionState::Committed
+        {
+            return Err(RepositoryError::Invariant(
+                "ListObjectVersions returned a version outside the requested bucket".into(),
+            ));
+        }
+        let kind = match version.payload() {
+            ObjectVersionPayload::Object(payload) => ListedVersionKind::Object {
+                etag: payload.etag().as_str().to_owned(),
+                size: payload.size_bytes(),
+            },
+            ObjectVersionPayload::DeleteMarker => ListedVersionKind::DeleteMarker,
+        };
+        items.push(ListedObjectVersion {
+            key: item.key,
+            version_id: version.external_version_id().as_str().to_owned(),
+            is_latest: item.is_latest,
+            last_modified: version.created_at(),
+            kind,
+        });
+    }
+    Ok(ListObjectVersionsResult {
+        bucket,
+        owner_id,
+        owner_display_name,
+        prefix: query.prefix,
+        delimiter: query.delimiter,
+        key_marker: query.key_marker,
+        version_id_marker: query
+            .version_id_marker
+            .map(|version_id| version_id.as_str().to_owned()),
+        next_key_marker: page.next_key_marker,
+        next_version_id_marker: page
+            .next_version_id_marker
+            .map(|version_id| version_id.as_str().to_owned()),
+        max_keys: query.max_keys,
+        encoding_url: query.encoding_url,
+        items,
+        common_prefixes: page.common_prefixes,
+    })
+}
+
+pub(super) async fn s3_list_multipart_uploads(
+    State(state): State<Arc<AppState>>,
+    Path(bucket_name): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    request_id: Extension<RequestId>,
+) -> Result<Response, S3ApiError> {
+    validate_s3_bucket_name(&bucket_name)
+        .map_err(|_| S3ApiError::invalid_bucket_name(uri.path(), &request_id.0.0))?;
+    let auth =
+        authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    auth.authorize("media:list")
+        .map_err(|error| S3ApiError::from_api(error, uri.path(), &request_id.0.0))?;
+    let bucket = state
+        .repository
+        .find_s3_bucket(auth.application.id, &bucket_name)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 ListMultipartUploads bucket lookup failed");
+            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
+        })?
+        .ok_or_else(|| S3ApiError::no_such_bucket(uri.path(), &request_id.0.0))?;
+    let query = parse_list_multipart_uploads_query(&uri, &request_id.0.0)?;
+    let repository_upload_id_marker = if query.key_marker.is_some() {
+        query.upload_id_marker.clone()
+    } else {
+        None
+    };
+    let page = state
+        .repository
+        .list_s3_multipart_uploads_page(
+            auth.application.id,
+            &S3MultipartUploadListQuery {
+                bucket_id: bucket.id(),
+                prefix: query.prefix.clone(),
+                key_marker: query.key_marker.clone(),
+                upload_id_marker: repository_upload_id_marker,
+                delimiter: query.delimiter.is_some(),
+                limit: query.max_uploads,
+                as_of: OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "S3 ListMultipartUploads lookup failed");
+            S3ApiError::service_unavailable(uri.path(), &request_id.0.0)
+        })?;
+    let result = s3_multipart_uploads_result_from_page(
+        bucket_name,
+        auth.application.app_id.clone(),
+        auth.application.name.clone(),
+        query,
+        page,
+    );
+    let body = list_multipart_uploads_result_xml(&result).map_err(|error| {
+        warn!(error = %error, "S3 ListMultipartUploads XML encoding failed");
+        S3ApiError::internal_error(uri.path(), &request_id.0.0)
+    })?;
+    Ok(s3_xml_response(StatusCode::OK, body, &request_id.0.0))
+}
+
+fn s3_multipart_uploads_result_from_page(
+    bucket: String,
+    owner_id: String,
+    owner_display_name: String,
+    query: ListMultipartUploadsQuery,
+    page: S3MultipartUploadPage,
+) -> ListMultipartUploadsResult {
+    ListMultipartUploadsResult {
+        bucket,
+        owner_id,
+        owner_display_name,
+        prefix: query.prefix,
+        delimiter: query.delimiter,
+        key_marker: query.key_marker,
+        upload_id_marker: query.upload_id_marker,
+        next_key_marker: page.next_key_marker,
+        next_upload_id_marker: page.next_upload_id_marker,
+        max_uploads: query.max_uploads,
+        encoding_url: query.encoding_url,
+        items: page
+            .items
+            .into_iter()
+            .map(|item| ListedMultipartUpload {
+                key: item.key,
+                upload_id: item.upload_id,
+                initiated_at: item.initiated_at,
+            })
+            .collect(),
+        common_prefixes: page.common_prefixes,
     }
 }
 pub(super) async fn s3_get_bucket_location(
@@ -634,6 +1098,36 @@ pub(super) async fn s3_put_object(
     request_id: Extension<RequestId>,
     content: Body,
 ) -> Result<Response, S3ApiError> {
+    if let Some(lock_operation) =
+        classify_s3_object_version_lock(&uri, &request_id.0.0)?
+    {
+        let content = to_bytes(content, MAX_S3_XML_BODY_BYTES)
+            .await
+            .map_err(|_| S3ApiError::entity_too_large(uri.path(), &request_id.0.0))?;
+        let auth = authenticate_s3_application(
+            &state,
+            &method,
+            &uri,
+            &headers,
+            &content,
+            &request_id.0.0,
+        )
+        .await?;
+        return s3_put_object_version_lock(
+            S3ObjectOperation {
+                state: &state,
+                auth: &auth,
+                bucket_name: &bucket_name,
+                object_key: &object_key,
+                uri: &uri,
+                request_id: &request_id.0.0,
+            },
+            lock_operation,
+            &headers,
+            &content,
+        )
+        .await;
+    }
     let (auth, signature) =
         authenticate_s3_streaming_application(&state, &method, &uri, &headers, &request_id.0.0)
             .await?;
@@ -661,7 +1155,9 @@ pub(super) async fn s3_put_object(
     }
     let upload_id = s3_query_value(&uri, "uploadId", &request_id.0.0)?;
     let part_number = s3_query_value(&uri, "partNumber", &request_id.0.0)?;
+    let is_copy = headers.contains_key("x-amz-copy-source");
     if upload_id.is_some() || part_number.is_some() {
+        reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         reject_s3_versioning(&uri, &request_id.0.0)?;
         let upload_id = upload_id.ok_or_else(|| {
             S3ApiError::invalid_argument("uploadId is required.", uri.path(), &request_id.0.0)
@@ -681,7 +1177,39 @@ pub(super) async fn s3_put_object(
                     &request_id.0.0,
                 )
             })?;
-        return s3_upload_part(
+        let operation = S3ObjectOperation {
+            state: &state,
+            auth: &auth,
+            bucket_name: &bucket_name,
+            object_key: &object_key,
+            uri: &uri,
+            request_id: &request_id.0.0,
+        };
+        return if is_copy {
+            s3_upload_part_copy(
+                operation,
+                &upload_id,
+                part_number,
+                &signature,
+                &headers,
+                content,
+            )
+            .await
+        } else {
+            s3_upload_part(
+                operation,
+                &upload_id,
+                part_number,
+                signature,
+                &headers,
+                content,
+            )
+            .await
+        };
+    }
+    if is_copy {
+        reject_copy_object_lock_headers(&headers, &uri, &request_id.0.0)?;
+        return s3_copy_object(
             S3ObjectOperation {
                 state: &state,
                 auth: &auth,
@@ -690,9 +1218,7 @@ pub(super) async fn s3_put_object(
                 uri: &uri,
                 request_id: &request_id.0.0,
             },
-            &upload_id,
-            part_number,
-            signature,
+            &signature,
             &headers,
             content,
         )
@@ -750,8 +1276,30 @@ pub(super) async fn s3_get_object(
     headers: HeaderMap,
     request_id: Extension<RequestId>,
 ) -> Result<Response, S3ApiError> {
+    let lock_operation = classify_s3_object_version_lock(&uri, &request_id.0.0)?;
     let auth =
         authenticate_s3_application(&state, &method, &uri, &headers, &[], &request_id.0.0).await?;
+    if let Some(lock_operation) = lock_operation {
+        if method != Method::GET {
+            return Err(S3ApiError::method_not_allowed(
+                "Object retention and legal hold subresources require GET.",
+                uri.path(),
+                &request_id.0.0,
+            ));
+        }
+        return s3_get_object_version_lock(
+            S3ObjectOperation {
+                state: &state,
+                auth: &auth,
+                bucket_name: &bucket_name,
+                object_key: &object_key,
+                uri: &uri,
+                request_id: &request_id.0.0,
+            },
+            lock_operation,
+        )
+        .await;
+    }
     if s3_query_flag(&uri, "acl", &request_id.0.0)? {
         reject_s3_versioning(&uri, &request_id.0.0)?;
         if method != Method::GET {

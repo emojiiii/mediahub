@@ -1,9 +1,10 @@
-// WebDAV guarded filesystem operations.
+// ObjectVersion-backed WebDAV guarded filesystem operations.
 
 #[derive(Clone)]
 struct MediaHubDavFs {
     repository: PostgresRepository,
     object_store: RuntimeObjectStore,
+    gc_grace: time::Duration,
 }
 
 impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
@@ -14,60 +15,54 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
         credentials: &'a DavCredentials,
     ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
-            let resource = DavResource::parse(path, credentials)?;
             let DavResource::Object {
                 bucket_name,
                 object_key,
                 collection: false,
-            } = resource
+            } = DavResource::parse(path, credentials)?
             else {
                 return Err(FsError::Forbidden);
             };
-            let bucket = self.find_bucket(credentials, &bucket_name).await?;
+            self.find_bucket(credentials, &bucket_name).await?;
             if options.write || options.create || options.append || options.truncate {
                 credentials.require("media:upload")?;
-                if options.append {
-                    return Err(FsError::Forbidden);
+                if credentials.method != axum::http::Method::PUT || options.append {
+                    return Err(FsError::NotImplemented);
                 }
                 if let Some(size) = options.size
                     && size > MAX_REQUEST_BYTES as u64
                 {
                     return Err(FsError::TooLarge);
                 }
-                if self
-                    .find_media(credentials.application.id, bucket.id(), &object_key)
-                    .await?
-                    .is_some()
-                {
-                    return Err(FsError::Exists);
+                if options.create_new {
+                    match self
+                        .head_object(credentials, &bucket_name, &object_key)
+                        .await
+                    {
+                        Ok(_) => return Err(FsError::Exists),
+                        Err(FsError::NotFound) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
-                let mime = credentials
+                let content_type = credentials
                     .content_type
                     .clone()
                     .unwrap_or_else(|| guess_mime(&object_key));
-                if let Some(size) = options.size {
-                    bucket
-                        .validate_upload(&mime, size)
-                        .map_err(map_domain_error)?;
-                }
-                let file = MediaHubDavFile::write(
+                Ok(Box::new(MediaHubDavFile::write(
                     self.clone(),
                     credentials.clone(),
-                    credentials.application.id,
-                    bucket.id(),
+                    bucket_name,
                     object_key,
-                    mime,
+                    content_type,
                     options.size,
-                );
-                Ok(Box::new(file) as Box<dyn DavFile>)
+                )) as Box<dyn DavFile>)
             } else {
                 credentials.require("media:read")?;
-                let media = self
-                    .find_media(credentials.application.id, bucket.id(), &object_key)
-                    .await?
-                    .ok_or(FsError::NotFound)?;
+                let version = self
+                    .head_object(credentials, &bucket_name, &object_key)
+                    .await?;
                 Ok(
-                    Box::new(MediaHubDavFile::read(self.object_store.clone(), media))
+                    Box::new(MediaHubDavFile::read(self.object_store.clone(), version))
                         as Box<dyn DavFile>,
                 )
             }
@@ -81,8 +76,7 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
         credentials: &'a DavCredentials,
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
-            let resource = DavResource::parse(path, credentials)?;
-            let entries = match resource {
+            let entries = match DavResource::parse(path, credentials)? {
                 DavResource::Root => {
                     credentials.require_any(&[
                         "application:read",
@@ -104,14 +98,14 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                         "media:upload",
                     ])?;
                     self.repository
-                        .list_buckets(credentials.application.id)
+                        .list_s3_buckets(credentials.application.id)
                         .await
-                        .map_err(|_| FsError::GeneralFailure)?
+                        .map_err(map_repository_error)?
                         .into_iter()
                         .map(|bucket| {
                             DavEntry::directory(
                                 bucket.name().as_bytes().to_vec(),
-                                to_system_time(bucket.updated_at()),
+                                to_system_time(bucket.configuration().updated_at()),
                             )
                         })
                         .collect()
@@ -119,13 +113,13 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                 DavResource::Bucket { bucket_name } => {
                     credentials.require_any(&["media:list", "media:read", "media:upload"])?;
                     let bucket = self.find_bucket(credentials, &bucket_name).await?;
-                    let media = self
-                        .list_media(credentials.application.id, bucket.id(), None)
+                    let entries = self
+                        .list_directory_entries(credentials.application.id, bucket.id(), "")
                         .await?;
-                    if credentials.method == axum::http::Method::DELETE && !media.is_empty() {
+                    if credentials.method == axum::http::Method::DELETE && !entries.is_empty() {
                         return Err(FsError::Exists);
                     }
-                    direct_entries(&media, "")
+                    entries
                 }
                 DavResource::Object {
                     bucket_name,
@@ -135,17 +129,13 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                     credentials.require_any(&["media:list", "media:read", "media:upload"])?;
                     let bucket = self.find_bucket(credentials, &bucket_name).await?;
                     let prefix = directory_prefix(&object_key);
-                    let media = self
-                        .list_media(
-                            credentials.application.id,
-                            bucket.id(),
-                            Some(prefix.clone()),
-                        )
+                    let entries = self
+                        .list_directory_entries(credentials.application.id, bucket.id(), &prefix)
                         .await?;
-                    if media.is_empty() {
+                    if entries.is_empty() {
                         return Err(FsError::NotFound);
                     }
-                    direct_entries(&media, &prefix)
+                    entries
                 }
             };
             let entries = entries
@@ -161,12 +151,11 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
         credentials: &'a DavCredentials,
     ) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
-            let resource = DavResource::parse(path, credentials)?;
-            let metadata = match resource {
+            let metadata = match DavResource::parse(path, credentials)? {
                 DavResource::Root | DavResource::Application => DavMetadata::directory(UNIX_EPOCH),
                 DavResource::Bucket { bucket_name } => {
                     let bucket = self.find_bucket(credentials, &bucket_name).await?;
-                    DavMetadata::directory(to_system_time(bucket.updated_at()))
+                    DavMetadata::directory(to_system_time(bucket.configuration().updated_at()))
                 }
                 DavResource::Object {
                     bucket_name,
@@ -174,20 +163,43 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                     collection,
                 } => {
                     let bucket = self.find_bucket(credentials, &bucket_name).await?;
-                    if !collection
-                        && let Some(media) = self
-                            .find_media(credentials.application.id, bucket.id(), &object_key)
-                            .await?
-                    {
-                        credentials.require_any(&["media:list", "media:read"])?;
-                        DavMetadata::from_media(&media)
+                    if !collection {
+                        match self
+                            .head_object(credentials, &bucket_name, &object_key)
+                            .await
+                        {
+                            Ok(version) => {
+                                credentials.require_any(&["media:list", "media:read"])?;
+                                DavMetadata::from_object_version(&version)?
+                            }
+                            Err(FsError::NotFound) => {
+                                credentials.require_any(&[
+                                    "media:list",
+                                    "media:read",
+                                    "media:upload",
+                                ])?;
+                                let prefix = directory_prefix(&object_key);
+                                if !self
+                                    .directory_exists(
+                                        credentials.application.id,
+                                        bucket.id(),
+                                        &prefix,
+                                    )
+                                    .await?
+                                {
+                                    return Err(FsError::NotFound);
+                                }
+                                DavMetadata::directory(UNIX_EPOCH)
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         credentials.require_any(&["media:list", "media:read", "media:upload"])?;
                         let prefix = directory_prefix(&object_key);
-                        let media = self
-                            .list_media(credentials.application.id, bucket.id(), Some(prefix))
-                            .await?;
-                        if media.is_empty() {
+                        if !self
+                            .directory_exists(credentials.application.id, bucket.id(), &prefix)
+                            .await?
+                        {
                             return Err(FsError::NotFound);
                         }
                         DavMetadata::directory(UNIX_EPOCH)
@@ -209,24 +221,25 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                     credentials.require("bucket:manage")?;
                     if self
                         .repository
-                        .find_bucket_by_name(credentials.application.id, &bucket_name)
+                        .find_s3_bucket(credentials.application.id, &bucket_name)
                         .await
-                        .map_err(|_| FsError::GeneralFailure)?
+                        .map_err(map_repository_error)?
                         .is_some()
                     {
                         return Err(FsError::Exists);
                     }
-                    let bucket = Bucket::new(
+                    let bucket = S3Bucket::new(
                         BucketId::new(),
                         credentials.application.id,
                         bucket_name,
-                        BucketPolicy::new(Visibility::Private, None, None, [])
-                            .map_err(map_domain_error)?,
+                        "us-east-1",
+                        false,
+                        None,
                         OffsetDateTime::now_utc(),
                     )
-                    .map_err(map_domain_error)?;
+                    .map_err(map_s3_model_error)?;
                     self.repository
-                        .create_bucket(&bucket)
+                        .create_s3_bucket(&bucket)
                         .await
                         .map_err(map_repository_error)?;
                     self.record_audit(
@@ -247,13 +260,13 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                     credentials.require("media:upload")?;
                     let bucket = self.find_bucket(credentials, &bucket_name).await?;
                     let prefix = directory_prefix(&object_key);
-                    if !self
-                        .list_media(credentials.application.id, bucket.id(), Some(prefix))
+                    if self
+                        .directory_exists(credentials.application.id, bucket.id(), &prefix)
                         .await?
-                        .is_empty()
                     {
                         return Err(FsError::Exists);
                     }
+                    // PrismArk directories are prefixes; MKCOL does not create a marker object.
                     Ok(())
                 }
                 DavResource::Root | DavResource::Application => Err(FsError::Forbidden),
@@ -268,11 +281,44 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
     ) -> FsFuture<'a, ()> {
         Box::pin(async move {
             credentials.require("media:delete")?;
-            let (bucket, media) = self.resolve_file(path, credentials).await?;
-            if media.bucket_id() != bucket.id() {
-                return Err(FsError::NotFound);
-            }
-            self.schedule_delete(media, credentials, "webdav").await
+            let DavResource::Object {
+                bucket_name,
+                object_key,
+                collection: false,
+            } = DavResource::parse(path, credentials)?
+            else {
+                return Err(FsError::Forbidden);
+            };
+            // DAV DELETE of a missing key is 404 even though S3 DeleteObject is idempotent.
+            self.head_object(credentials, &bucket_name, &object_key)
+                .await?;
+            let receipt = self
+                .object_service()
+                .delete(&DeleteObjectRequest {
+                    application_id: credentials.application.id,
+                    bucket_name: bucket_name.clone(),
+                    object_key: object_key.clone(),
+                    version_id: None,
+                    bypass_governance: false,
+                    deleted_by: format!("webdav:{}", credentials.access_key_id),
+                })
+                .await
+                .map_err(map_s3_object_error)?;
+            self.record_audit(
+                credentials,
+                "dav.object.deleted",
+                "object",
+                format!("{bucket_name}/{object_key}"),
+                serde_json::json!({
+                    "bucket": bucket_name,
+                    "object_key": object_key,
+                    "delete_marker": receipt.delete_marker,
+                    "version_id": receipt.version_id.as_ref().map(|version| version.as_str()),
+                    "protocol": "webdav",
+                }),
+            )
+            .await;
+            Ok(())
         })
     }
 
@@ -287,11 +333,11 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                     credentials.require("bucket:manage")?;
                     let deleted = self
                         .repository
-                        .delete_empty_bucket(credentials.application.id, &bucket_name)
+                        .delete_s3_bucket(credentials.application.id, &bucket_name)
                         .await
                         .map_err(map_repository_error)?;
                     if !deleted {
-                        return Err(FsError::Exists);
+                        return Err(FsError::NotFound);
                     }
                     self.record_audit(
                         credentials,
@@ -306,6 +352,7 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
                 DavResource::Object { bucket_name, .. } => {
                     credentials.require("media:delete")?;
                     self.find_bucket(credentials, &bucket_name).await?;
+                    // dav-server removes discovered children before this prefix-only callback.
                     Ok(())
                 }
                 DavResource::Root | DavResource::Application => Err(FsError::Forbidden),
@@ -319,343 +366,367 @@ impl GuardedFileSystem<DavCredentials> for MediaHubDavFs {
         to: &'a DavPath,
         credentials: &'a DavCredentials,
     ) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.copy_file(from, to, credentials).await.map(|_| ()) })
+        Box::pin(async move {
+            credentials.require("media:read")?;
+            credentials.require("media:upload")?;
+            let DavResource::Object {
+                bucket_name: source_bucket,
+                object_key: source_key,
+                collection: false,
+            } = DavResource::parse(from, credentials)?
+            else {
+                return Err(FsError::NotImplemented);
+            };
+            let DavResource::Object {
+                bucket_name: destination_bucket,
+                object_key: destination_key,
+                collection: false,
+            } = DavResource::parse(to, credentials)?
+            else {
+                return Err(FsError::NotImplemented);
+            };
+            if source_bucket == destination_bucket && source_key == destination_key {
+                return Err(FsError::Exists);
+            }
+            let receipt = self
+                .copy_object(
+                    credentials,
+                    &source_bucket,
+                    &source_key,
+                    &destination_bucket,
+                    &destination_key,
+                )
+                .await?;
+            self.record_audit(
+                credentials,
+                "dav.object.copied",
+                "object_version",
+                receipt.version.id().to_string(),
+                serde_json::json!({
+                    "source_bucket": source_bucket,
+                    "source_key": source_key,
+                    "destination_bucket": destination_bucket,
+                    "destination_key": destination_key,
+                    "object_id": receipt.object.id().to_string(),
+                    "version_id": receipt.version.external_version_id().as_str(),
+                    "protocol": "webdav",
+                }),
+            )
+            .await;
+            Ok(())
+        })
     }
 
     fn rename<'a>(
         &'a self,
-        from: &'a DavPath,
-        to: &'a DavPath,
+        _from: &'a DavPath,
+        _to: &'a DavPath,
         credentials: &'a DavCredentials,
     ) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            credentials.require("media:read")?;
+            credentials.require("media:upload")?;
             credentials.require("media:delete")?;
-            let source_resource = DavResource::parse(from, credentials)?;
-            if matches!(source_resource, DavResource::Object { .. }) {
-                match self.resolve_file(from, credentials).await {
-                    Ok((_, source)) => {
-                        self.copy_file(from, to, credentials).await?;
-                        self.schedule_delete(source, credentials, "webdav_move")
-                            .await
-                    }
-                    Err(FsError::NotFound | FsError::Forbidden) => {
-                        self.move_directory(from, to, credentials).await
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                Err(FsError::Forbidden)
-            }
+            Err(FsError::NotImplemented)
         })
     }
 
     fn get_quota<'a>(
         &'a self,
-        credentials: &'a DavCredentials,
+        _credentials: &'a DavCredentials,
     ) -> FsFuture<'a, (u64, Option<u64>)> {
-        Box::pin(async move {
-            let quota = self
-                .repository
-                .quota(credentials.application.id)
-                .await
-                .map_err(|_| FsError::GeneralFailure)?;
-            Ok((
-                quota.used_bytes.saturating_add(quota.reserved_bytes),
-                Some(quota.quota_bytes),
-            ))
-        })
+        Box::pin(async move { Err(FsError::NotImplemented) })
     }
 }
 
 impl MediaHubDavFs {
+    fn object_service(&self) -> DavObjectService {
+        S3ObjectService::new(
+            self.repository.clone(),
+            self.repository.clone(),
+            self.repository.clone(),
+            self.object_store.clone(),
+            SystemClock,
+        )
+        .with_gc_grace(self.gc_grace)
+        .expect("WebDAV GC grace is validated during server configuration")
+    }
+
     async fn find_bucket(
         &self,
         credentials: &DavCredentials,
         bucket_name: &str,
-    ) -> FsResult<Bucket> {
+    ) -> FsResult<S3Bucket> {
         self.repository
-            .find_bucket_by_name(credentials.application.id, bucket_name)
+            .find_s3_bucket(credentials.application.id, bucket_name)
             .await
-            .map_err(|_| FsError::GeneralFailure)?
+            .map_err(map_repository_error)?
             .ok_or(FsError::NotFound)
     }
 
-    async fn find_media(
+    async fn head_object(
         &self,
-        application_id: ApplicationId,
-        bucket_id: BucketId,
+        credentials: &DavCredentials,
+        bucket_name: &str,
         object_key: &str,
-    ) -> FsResult<Option<Media>> {
-        let media = self
-            .repository
-            .find_by_object_key(application_id, bucket_id, object_key)
+    ) -> FsResult<ObjectVersion> {
+        self.object_service()
+            .head(&S3ObjectRequest {
+                application_id: credentials.application.id,
+                bucket_name: bucket_name.to_owned(),
+                object_key: object_key.to_owned(),
+                version_id: None,
+            })
             .await
-            .map_err(|_| FsError::GeneralFailure)?;
-        Ok(media.filter(|media| media.state().is_readable()))
+            .map(|receipt| receipt.version)
+            .map_err(map_s3_object_error)
     }
 
-    async fn list_media(
+    async fn list_directory_entries(
         &self,
         application_id: ApplicationId,
         bucket_id: BucketId,
-        prefix: Option<String>,
-    ) -> FsResult<Vec<Media>> {
+        prefix: &str,
+    ) -> FsResult<Vec<DavEntry>> {
         let mut cursor = None;
-        let mut items = Vec::new();
+        let mut entries = BTreeMap::<String, DavEntry>::new();
         loop {
             let page = self
                 .repository
-                .list_media_page(
+                .list_current_s3_objects(
                     application_id,
-                    &MediaListQuery {
-                        bucket_id: Some(bucket_id),
-                        state: Some(MediaState::Active),
-                        object_key_prefix: prefix.clone(),
-                        cursor,
+                    &S3ObjectListQuery {
+                        bucket_id,
+                        prefix: prefix.to_owned(),
+                        start_after: cursor,
+                        delimiter: true,
                         limit: PAGE_SIZE,
-                        ..MediaListQuery::default()
                     },
                 )
                 .await
-                .map_err(|_| FsError::GeneralFailure)?;
-            let next = page.items.last().map(|media| MediaListCursor {
-                created_at: media.created_at(),
-                id: media.id(),
-            });
-            items.extend(page.items);
-            if !page.has_more {
+                .map_err(map_repository_error)?;
+            for common_prefix in page.common_prefixes {
+                let Some(name) = common_prefix
+                    .strip_prefix(prefix)
+                    .and_then(|value| value.strip_suffix('/'))
+                else {
+                    return Err(FsError::GeneralFailure);
+                };
+                if !name.is_empty() {
+                    entries.entry(name.to_owned()).or_insert_with(|| {
+                        DavEntry::directory(name.as_bytes().to_vec(), UNIX_EPOCH)
+                    });
+                }
+            }
+            for item in page.items {
+                let Some(name) = item.key.strip_prefix(prefix) else {
+                    return Err(FsError::GeneralFailure);
+                };
+                if name.is_empty() || name.contains('/') {
+                    return Err(FsError::GeneralFailure);
+                }
+                entries.insert(
+                    name.to_owned(),
+                    DavEntry::file(name.as_bytes().to_vec(), &item.version)?,
+                );
+            }
+            let Some(next_cursor) = page.next_cursor else {
                 break;
-            }
-            cursor = Some(next.ok_or(FsError::GeneralFailure)?);
+            };
+            cursor = Some(next_cursor);
         }
-        Ok(items)
+        Ok(entries.into_values().collect())
     }
 
-    async fn resolve_file(
+    async fn directory_exists(
         &self,
-        path: &DavPath,
-        credentials: &DavCredentials,
-    ) -> FsResult<(Bucket, Media)> {
-        let DavResource::Object {
-            bucket_name,
-            object_key,
-            collection: false,
-        } = DavResource::parse(path, credentials)?
-        else {
-            return Err(FsError::Forbidden);
-        };
-        let bucket = self.find_bucket(credentials, &bucket_name).await?;
-        let media = self
-            .find_media(credentials.application.id, bucket.id(), &object_key)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        Ok((bucket, media))
-    }
-
-    async fn copy_file(
-        &self,
-        from: &DavPath,
-        to: &DavPath,
-        credentials: &DavCredentials,
-    ) -> FsResult<Media> {
-        credentials.require("media:read")?;
-        credentials.require("media:upload")?;
-        let (_, source) = self.resolve_file(from, credentials).await?;
-        let DavResource::Object {
-            bucket_name,
-            object_key,
-            collection: false,
-        } = DavResource::parse(to, credentials)?
-        else {
-            return Err(FsError::Forbidden);
-        };
-        let destination_bucket = self.find_bucket(credentials, &bucket_name).await?;
-        if self
-            .find_media(
-                credentials.application.id,
-                destination_bucket.id(),
-                &object_key,
-            )
-            .await?
-            .is_some()
-        {
-            return Err(FsError::Exists);
-        }
-        self.copy_media(&source, destination_bucket.id(), object_key, credentials)
-            .await
-    }
-
-    async fn copy_media(
-        &self,
-        source: &Media,
-        destination_bucket_id: BucketId,
-        object_key: String,
-        credentials: &DavCredentials,
-    ) -> FsResult<Media> {
-        let content = self
-            .object_store
-            .read(source.storage_key())
-            .await
-            .map_err(|_| FsError::GeneralFailure)?;
-        let receipt = self
-            .upload(DavUpload {
-                application_id: credentials.application.id,
-                bucket_id: destination_bucket_id,
-                object_key,
-                mime: source.mime().to_owned(),
-                content,
-                visibility_override: source.visibility_override(),
-                expire_at: source.expire_at(),
-            })
-            .await?;
-        self.record_audit(
-            credentials,
-            "media.copied",
-            "media",
-            receipt.id().to_string(),
-            serde_json::json!({
-                "source_media_id": source.id().to_string(),
-                "object_key": receipt.object_key(),
-                "protocol": "webdav",
-            }),
-        )
-        .await;
-        Ok(receipt)
-    }
-
-    async fn move_directory(
-        &self,
-        from: &DavPath,
-        to: &DavPath,
-        credentials: &DavCredentials,
-    ) -> FsResult<()> {
-        credentials.require("media:read")?;
-        credentials.require("media:upload")?;
-        credentials.require("media:delete")?;
-        let DavResource::Object {
-            bucket_name: source_bucket_name,
-            object_key: source_key,
-            ..
-        } = DavResource::parse(from, credentials)?
-        else {
-            return Err(FsError::Forbidden);
-        };
-        let DavResource::Object {
-            bucket_name: destination_bucket_name,
-            object_key: destination_key,
-            ..
-        } = DavResource::parse(to, credentials)?
-        else {
-            return Err(FsError::Forbidden);
-        };
-        let source_bucket = self.find_bucket(credentials, &source_bucket_name).await?;
-        let destination_bucket = self
-            .find_bucket(credentials, &destination_bucket_name)
-            .await?;
-        let source_prefix = directory_prefix(&source_key);
-        let destination_prefix = directory_prefix(&destination_key);
-        if source_bucket.id() == destination_bucket.id()
-            && (source_prefix == destination_prefix
-                || destination_prefix.starts_with(&source_prefix))
-        {
-            return Err(FsError::LoopDetected);
-        }
-        let source_media = self
-            .list_media(
-                credentials.application.id,
-                source_bucket.id(),
-                Some(source_prefix.clone()),
-            )
-            .await?;
-        if source_media.is_empty() {
-            return Err(FsError::NotFound);
-        }
-        let mut destinations = Vec::with_capacity(source_media.len());
-        for media in &source_media {
-            let suffix = media
-                .object_key()
-                .strip_prefix(&source_prefix)
-                .ok_or(FsError::GeneralFailure)?;
-            let object_key = format!("{destination_prefix}{suffix}");
-            if self
-                .find_media(
-                    credentials.application.id,
-                    destination_bucket.id(),
-                    &object_key,
-                )
-                .await?
-                .is_some()
-            {
-                return Err(FsError::Exists);
-            }
-            destinations.push(object_key);
-        }
-        for (media, object_key) in source_media.into_iter().zip(destinations) {
-            self.copy_media(&media, destination_bucket.id(), object_key, credentials)
-                .await?;
-            self.schedule_delete(media, credentials, "webdav_move")
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn upload(&self, upload: DavUpload) -> FsResult<Media> {
-        let display_name = upload
-            .object_key
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .ok_or(FsError::Forbidden)?
-            .to_owned();
-        let extension = display_name
-            .rsplit_once('.')
-            .and_then(|(_, extension)| (!extension.is_empty()).then(|| extension.to_owned()));
-        let service = UploadMediaService::new(
-            self.object_store.clone(),
-            self.repository.clone(),
-            self.repository.clone(),
-            DavClock,
-        );
-        service
-            .upload(&UploadMediaRequest {
-                application_id: upload.application_id,
-                bucket_id: upload.bucket_id,
-                object_key: upload.object_key,
-                original_name: Some(display_name.clone()),
-                display_name,
-                extension,
-                mime: upload.mime,
-                content: upload.content,
-                visibility_override: upload.visibility_override,
-                expire_at: upload.expire_at,
-                metadata: ClientMetadata::default(),
-            })
-            .await
-            .map(|receipt| receipt.media)
-            .map_err(map_application_error)
-    }
-
-    async fn schedule_delete(
-        &self,
-        media: Media,
-        credentials: &DavCredentials,
-        reason: &str,
-    ) -> FsResult<()> {
-        let now = OffsetDateTime::now_utc();
-        let event = OutboxEvent::media_delete_scheduled(&media, now, reason);
+        application_id: ApplicationId,
+        bucket_id: BucketId,
+        prefix: &str,
+    ) -> FsResult<bool> {
         self.repository
-            .schedule_delete(media.id(), now, event)
+            .list_current_s3_objects(
+                application_id,
+                &S3ObjectListQuery {
+                    bucket_id,
+                    prefix: prefix.to_owned(),
+                    start_after: None,
+                    delimiter: false,
+                    limit: 1,
+                },
+            )
             .await
-            .map_err(map_repository_error)?;
-        self.record_audit(
-            credentials,
-            "media.delete_scheduled",
-            "media",
-            media.id().to_string(),
-            serde_json::json!({ "reason": reason, "protocol": "webdav" }),
-        )
-        .await;
-        Ok(())
+            .map(|page| !page.items.is_empty())
+            .map_err(map_repository_error)
+    }
+
+    async fn put_object(
+        &self,
+        upload: DavUpload,
+        credentials: &DavCredentials,
+    ) -> FsResult<CompletePutObjectReceipt> {
+        let service = self.object_service();
+        let expected_size = upload.content.len() as u64;
+        let begun = service
+            .begin_put(&BeginPutObjectRequest {
+                application_id: credentials.application.id,
+                bucket_name: upload.bucket_name,
+                object_key: upload.object_key,
+                expected_size_bytes: expected_size,
+                content_type: Some(upload.content_type.clone()),
+                user_metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .map_err(map_s3_object_error)?;
+        let intent_id = begun.intent.id();
+        let stream = once(async move { Ok::<Bytes, Infallible>(Bytes::from(upload.content)) });
+        let streamed = match self
+            .object_store
+            .put_temporary_stream(
+                begun.intent.temporary_storage_key(),
+                stream,
+                expected_size,
+                &upload.content_type,
+            )
+            .await
+        {
+            Ok(streamed) => streamed,
+            Err(error) => {
+                self.abort_staged_put(&service, credentials.application.id, intent_id)
+                    .await;
+                return Err(map_streaming_upload_error(error));
+            }
+        };
+        match service
+            .complete_put(&CompletePutObjectRequest {
+                application_id: credentials.application.id,
+                intent_id,
+                streamed,
+                created_by: format!("webdav:{}", credentials.access_key_id),
+                source_protocol: SourceProtocol::Dav,
+            })
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                self.abort_staged_put(&service, credentials.application.id, intent_id)
+                    .await;
+                Err(map_s3_object_error(error))
+            }
+        }
+    }
+
+    async fn copy_object(
+        &self,
+        credentials: &DavCredentials,
+        source_bucket: &str,
+        source_key: &str,
+        destination_bucket: &str,
+        destination_key: &str,
+    ) -> FsResult<CompletePutObjectReceipt> {
+        self.find_bucket(credentials, destination_bucket).await?;
+        let source = self
+            .head_object(credentials, source_bucket, source_key)
+            .await?;
+        let payload = stored_payload(&source)?;
+        let service = self.object_service();
+        let begun = service
+            .begin_put(&BeginPutObjectRequest {
+                application_id: credentials.application.id,
+                bucket_name: destination_bucket.to_owned(),
+                object_key: destination_key.to_owned(),
+                expected_size_bytes: payload.size_bytes(),
+                content_type: Some(
+                    payload
+                        .content_type()
+                        .unwrap_or("application/octet-stream")
+                        .to_owned(),
+                ),
+                user_metadata: payload.user_metadata().clone(),
+                expires_at: None,
+            })
+            .await
+            .map_err(map_s3_object_error)?;
+        let intent_id = begun.intent.id();
+        let streamed = match self
+            .object_store
+            .copy_committed_to_temporary(
+                payload.storage_key(),
+                payload.size_bytes(),
+                None,
+                begun.intent.temporary_storage_key(),
+                payload.content_type().unwrap_or("application/octet-stream"),
+            )
+            .await
+        {
+            Ok(streamed) => streamed,
+            Err(error) => {
+                self.abort_staged_put(&service, credentials.application.id, intent_id)
+                    .await;
+                return Err(map_streaming_upload_error(error));
+            }
+        };
+        match service
+            .complete_put(&CompletePutObjectRequest {
+                application_id: credentials.application.id,
+                intent_id,
+                streamed,
+                created_by: format!("webdav:{}", credentials.access_key_id),
+                source_protocol: SourceProtocol::Dav,
+            })
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                self.abort_staged_put(&service, credentials.application.id, intent_id)
+                    .await;
+                Err(map_s3_object_error(error))
+            }
+        }
+    }
+
+    async fn abort_staged_put(
+        &self,
+        service: &DavObjectService,
+        application_id: ApplicationId,
+        intent_id: mediahub_core::UploadIntentId,
+    ) {
+        if let Err(error) = service
+            .abort_staged_put(&AbortStagedPutRequest {
+                application_id,
+                intent_id,
+            })
+            .await
+        {
+            warn!(%intent_id, error = %error, "failed to abort rejected WebDAV staged PUT");
+        }
+    }
+
+    async fn content_type_for_uri(
+        &self,
+        uri: &axum::http::Uri,
+        credentials: &DavCredentials,
+    ) -> FsResult<Option<String>> {
+        let mut path = DavPath::new(uri.path()).map_err(|_| FsError::Forbidden)?;
+        path.set_prefix("/dav").map_err(|_| FsError::Forbidden)?;
+        let DavResource::Object {
+            bucket_name,
+            object_key,
+            collection: false,
+        } = DavResource::parse(&path, credentials)?
+        else {
+            return Ok(None);
+        };
+        let version = self
+            .head_object(credentials, &bucket_name, &object_key)
+            .await?;
+        Ok(Some(
+            stored_payload(&version)?
+                .content_type()
+                .unwrap_or("application/octet-stream")
+                .to_owned(),
+        ))
     }
 
     async fn record_audit(
@@ -683,4 +754,3 @@ impl MediaHubDavFs {
         }
     }
 }
-

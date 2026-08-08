@@ -65,3 +65,80 @@
 | WebDAV/sqlx 运行时测试最初缺少 `DATABASE_URL` | 1 | 用户启动 Docker 后使用无持久卷的 PostgreSQL 17 临时容器完成真实测试；Server 133/133、Repository Contract 1/1 通过 |
 | fresh migration 中自动与显式 state constraint 同名，且 `chr(0)` 检查会阻断 INSERT | 2 | 为值域约束使用独立名称；删除 PostgreSQL `text` 不需要且不可执行的 NUL 检查，重建数据库复验通过 |
 | Silo 实测不支持未配置的 `copy_if_not_exists` | 1 | 启用条件 Multipart Copy，并在取得目标所有权后恢复 metadata；Silo 真实 ObjectStore + Presigned PUT 合同通过 |
+# PrismArk S3 Listing vertical slice (2026-08-08)
+
+## Goal
+
+Implement ListObjectVersions and ListMultipartUploads from PostgreSQL metadata only, with stable S3 marker, delimiter, encoding and pagination semantics. Do not commit or push.
+
+## Phases
+
+- [completed] Audit existing repository, classifier, list XML and multipart schema.
+- [completed] Add app DTOs and parameterized PostgreSQL limit+1 queries.
+- [completed] Add HTTP classification, query parsing and XML rendering.
+- [completed] Add PostgreSQL static tests and HTTP golden/unit tests.
+- [completed] Run fmt, focused tests and strict clippy; document uncovered edges.
+
+## Final validation
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo check -p mediahub-server --bin mediahub-server`: pass.
+- HTTP listing unit/golden tests: 5/5 pass.
+- PostgreSQL lib/static tests: 27/27 pass.
+- Real PostgreSQL 17 listing contract: 1/1 pass.
+- Strict app/PostgreSQL clippy: pass.
+- Server clippy: listing slice passes; unqualified workspace command is blocked only by two concurrent CopyObject `collapsible_if` findings, and passes with that foreign lint explicitly allowed.
+- `git diff --check`: pass.
+- No commit and no push.
+
+## Constraints
+
+- No Media reads/writes or storage-backend scans.
+- Keep business-code changes in S3 listing/repository/XML files.
+- No git commit or push.
+
+## Decisions
+
+- Use one bucket-scoped `S3ListingRepository` for both APIs.
+- Version order is key (`COLLATE "C"`) ascending, generation descending; `current_version_id` is the only `IsLatest` source.
+- Multipart order is key (`COLLATE "C"`) ascending, upload ID (`COLLATE "C"`) ascending; only non-expired pending/completing rows are visible.
+- Prefix/common-prefix entries share the same SQL page window and count toward the requested maximum.
+
+## Errors
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| `s3_http.rs` import patch context was stale because CopyObject imports are present at the baseline | 1 | Re-read the exact import block and apply a narrower patch preserving CopyObject symbols |
+| `cargo fmt --all -- --check` also reported concurrent Copy/WebDAV files outside this slice | 1 | Apply formatting only to listing-owned hunks now; do not rewrite concurrent files, then rerun after their changes settle |
+| Disposable PostgreSQL `docker run` timed out while Docker Desktop was pulling/starting the image | 1 | Inspect exact container/image state before choosing a non-repeating recovery action |
+| Fixed host port `127.0.0.1:55439` is reserved/forbidden on this Windows host | 1 | Let Docker allocate an ephemeral loopback port, then discover it with `docker port` |
+| Workspace-wide strict clippy is blocked by two `collapsible_if` findings in concurrent untracked `s3_http_copy.rs` | 1 | Do not edit the concurrent Copy slice; run strict clippy for app/PG and server with only those two foreign lints explicitly allowed, then retry unqualified strict clippy at final state |
+
+---
+
+# PrismArk 第二阶段并行收口（2026-08-08）
+
+## 当前目标
+
+在本地基线提交 `bdd6323` 之上继续补齐高价值 S3 兼容能力，并同步强化 ObjectVersion 预览和 Win11 文件浏览体验；所有验证完成后只做本地提交，不 push。
+
+## 状态
+
+- [completed] 将第一阶段提交为 `bdd6323 feat: launch PrismArk and complete S3 object core`，未 push。
+- [completed] 将 Silo 源码克隆到被 Git 忽略的 `.research/silo`，只参考协议顺序、模块边界和测试思路。
+- [completed] 完成 CopyObject、UploadPartCopy、ListObjectVersions、ListMultipartUploads。
+- [completed] WebDAV 普通文件路径迁移到 ObjectVersion；COPY 可用，MOVE 安全地明确拒绝。
+- [completed] 完成 Bucket Object Lock Configuration 与不可变 ObjectVersion 预览后端。
+- [completed] 新增 AWS CLI、mcli/mc、rclone 可重复兼容矩阵，并把已完成能力改成必须 PASS。
+- [completed] Win11 瀑布流加入视口懒加载、并发受限的 Variant 图片缩略图。
+- [completed] 对象级 Retention / Legal Hold、PutObject lock headers 与默认 Retention。
+- [completed] 栅格图片预览缩放、平移、适应窗口与键盘交互。
+- [completed] 统一 PostgreSQL、Silo、Rust、OpenAPI、前端、格式与 Clippy 回归。
+- [in_progress] 更新最终差距说明并创建第二个本地提交；保持不 push。
+
+## 范围边界
+
+- 不复制 Silo 的 AGPL 实现。
+- 不恢复旧 `/s3` 路由、旧 schema 或旧品牌兼容层。
+- 视频 Variant 继续留给独立异步服务与队列。
+- Policy、完整 Lifecycle 执行器、Tagging/Notification/CORS/SSE 等未在本切片完成的能力必须明确列为剩余差距，不伪装为已支持。

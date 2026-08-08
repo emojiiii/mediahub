@@ -59,6 +59,7 @@ const PARAMETERS: &[ParameterContract] = &[
     parameter!("IfMatch", "If-Match", Header, false, String),
     parameter!("Range", "Range", Header, false, String),
     parameter!("MediaId", "media_id", Path, true, Uuid),
+    parameter!("ObjectVersionId", "version_id", Path, true, Uuid),
     parameter!("JobId", "job_id", Path, true, Uuid),
     parameter!("AppId", "app_id", Path, true, String),
     parameter!("BucketName", "name", Path, true, String),
@@ -176,4 +177,3 @@ pub fn parameters() -> Value {
             .collect(),
     )
 }
-

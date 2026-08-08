@@ -79,6 +79,7 @@ pub(super) async fn run() -> anyhow::Result<()> {
     let webdav = webdav::WebDavService::new(
         repository.clone(),
         object_store.clone(),
+        time::Duration::hours(config.s3_gc_grace_hours),
         Arc::clone(&access_key_cipher),
     );
     let control_bind_addr = config.bind_addr;
@@ -109,9 +110,7 @@ pub(super) async fn run() -> anyhow::Result<()> {
     let control_listener = TcpListener::bind(control_bind_addr)
         .await
         .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to bind control-plane listener at {control_bind_addr}: {error}"
-            )
+            anyhow::anyhow!("failed to bind control-plane listener at {control_bind_addr}: {error}")
         })?;
     let s3_listener = TcpListener::bind(s3_bind_addr).await.map_err(|error| {
         anyhow::anyhow!("failed to bind S3 listener at {s3_bind_addr}: {error}")
@@ -183,8 +182,7 @@ pub(super) async fn run() -> anyhow::Result<()> {
 
     match exit {
         RuntimeExit::Shutdown(trigger) => {
-            let (control_result, s3_result) =
-                tokio::join!(&mut control_server, &mut s3_server);
+            let (control_result, s3_result) = tokio::join!(&mut control_server, &mut s3_server);
             shutdown_outcome(trigger, control_result, s3_result)
         }
         RuntimeExit::Control(control_result) => {
@@ -196,8 +194,7 @@ pub(super) async fn run() -> anyhow::Result<()> {
             unexpected_listener_outcome("S3", s3_result, "control-plane", control_result)
         }
         RuntimeExit::Worker(error) => {
-            let (control_result, s3_result) =
-                tokio::join!(&mut control_server, &mut s3_server);
+            let (control_result, s3_result) = tokio::join!(&mut control_server, &mut s3_server);
             worker_failure_outcome(error, control_result, s3_result)
         }
     }
@@ -231,8 +228,7 @@ fn shutdown_outcome(
     control_result.map_err(|error| {
         anyhow::anyhow!("control-plane listener failed during shutdown: {error}")
     })?;
-    s3_result
-        .map_err(|error| anyhow::anyhow!("S3 listener failed during shutdown: {error}"))?;
+    s3_result.map_err(|error| anyhow::anyhow!("S3 listener failed during shutdown: {error}"))?;
     Ok(())
 }
 

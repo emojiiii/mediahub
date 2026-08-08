@@ -320,6 +320,7 @@ pub(super) async fn s3_post_object(
             .await?;
     reject_s3_versioning(&uri, &request_id.0.0)?;
     if s3_query_flag(&uri, "uploads", &request_id.0.0)? {
+        reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         return s3_create_multipart_upload(
             &state,
             &auth,
@@ -332,6 +333,7 @@ pub(super) async fn s3_post_object(
         .await;
     }
     if let Some(upload_id) = s3_query_value(&uri, "uploadId", &request_id.0.0)? {
+        reject_multipart_object_lock_headers(&headers, &uri, &request_id.0.0)?;
         return s3_complete_multipart_upload(
             S3ObjectOperation {
                 state: &state,
@@ -572,6 +574,36 @@ impl S3ApiError {
             StatusCode::NOT_FOUND,
             "NoSuchLifecycleConfiguration",
             "The lifecycle configuration does not exist.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn object_lock_configuration_not_found(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "ObjectLockConfigurationNotFoundError",
+            "Object Lock configuration does not exist for this bucket.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn invalid_bucket_object_lock_configuration(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Object Lock is not enabled for this bucket.",
+            resource,
+            request_id,
+        )
+    }
+
+    fn no_such_object_lock_configuration(resource: &str, request_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchObjectLockConfiguration",
+            "The specified object does not have a retention configuration.",
             resource,
             request_id,
         )

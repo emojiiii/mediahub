@@ -75,14 +75,19 @@ pub use s3_object_service::{
     AbortStagedPutRequest, BeginPutObjectReceipt, BeginPutObjectRequest, CompletePutObjectReceipt,
     CompletePutObjectRequest, DEFAULT_S3_UPLOAD_INTENT_TTL_SECONDS,
     DEFAULT_S3_UPLOAD_LEASE_SECONDS, DeleteObjectReceipt, DeleteObjectRequest,
-    ListObjectVersionsRequest, S3GetObjectReceipt, S3HeadObjectReceipt, S3ObjectRequest,
-    S3ObjectService, S3ObjectServiceError,
+    ListObjectVersionsRequest, NewS3ObjectLock, PrepareClaimedUploadCommitRequest,
+    PutObjectLegalHoldRequest, PutObjectRetentionRequest, S3GetObjectReceipt, S3HeadObjectReceipt,
+    S3ObjectRequest, S3ObjectService, S3ObjectServiceError,
 };
 pub use s3_repository::{
-    DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion, MAX_S3_OBJECT_LIST_LIMIT,
-    MAX_STORAGE_GC_CLAIM_LIMIT, MAX_UPLOAD_INTENT_EXPIRY_LIMIT, S3BucketRepository,
-    S3DeleteLockReason, S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectPage,
-    S3ObjectRepository, S3ObjectVersionCommit, S3UploadIntentRepository, StorageGcRepository,
+    DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion,
+    MAX_S3_MULTIPART_UPLOAD_LIST_LIMIT, MAX_S3_OBJECT_LIST_LIMIT, MAX_S3_VERSION_LIST_LIMIT,
+    MAX_STORAGE_GC_CLAIM_LIMIT, MAX_UPLOAD_INTENT_EXPIRY_LIMIT, PutS3ObjectLockCommand,
+    PutS3ObjectLockOutcome, S3BucketRepository, S3DeleteLockReason, S3ListingRepository,
+    S3MultipartUploadListItem, S3MultipartUploadListQuery, S3MultipartUploadPage,
+    S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectLockMutation, S3ObjectPage,
+    S3ObjectRepository, S3ObjectVersionCommit, S3ObjectVersionListItem, S3ObjectVersionListQuery,
+    S3ObjectVersionPage, S3ObjectVersionRead, S3UploadIntentRepository, StorageGcRepository,
 };
 pub use upload::{
     MEDIA_UPLOAD_HEARTBEAT_SECONDS, MEDIA_UPLOAD_LEASE_SECONDS, UploadMediaRequest,

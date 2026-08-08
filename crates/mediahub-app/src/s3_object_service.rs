@@ -1,8 +1,8 @@
 use mediahub_core::{
-    ApplicationId, BucketId, Checksum, EntityTag, NewStorageGcTask, ObjectId, ObjectVersion,
-    ObjectVersionId, ObjectVersionPayload, ObjectVersionState, S3Bucket, S3ModelError, S3Object,
-    S3VersionId, SourceProtocol, StorageGcReason, StorageGcTaskId, StoredObjectVersion,
-    UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
+    ApplicationId, BucketId, Checksum, EntityTag, NewStorageGcTask, ObjectId, ObjectRetention,
+    ObjectVersion, ObjectVersionId, ObjectVersionPayload, ObjectVersionState, S3Bucket,
+    S3ModelError, S3Object, S3VersionId, SourceProtocol, StorageGcReason, StorageGcTaskId,
+    StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -10,8 +10,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{
     Clock, DeleteS3ObjectCommand, DeleteS3ObjectOutcome, ObjectStore, ObjectStoreError,
-    RepositoryError, S3BucketRepository, S3DeleteLockReason, S3ObjectCommitTarget,
-    S3ObjectRepository, S3ObjectVersionCommit, S3UploadIntentRepository, StreamedObject,
+    PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository,
+    S3DeleteLockReason, S3ObjectCommitTarget, S3ObjectLockMutation, S3ObjectRepository,
+    S3ObjectVersionCommit, S3UploadIntentRepository, StreamedObject,
 };
 
 pub const DEFAULT_S3_UPLOAD_INTENT_TTL_SECONDS: i64 = 3_600;
@@ -47,6 +48,7 @@ pub struct CompletePutObjectRequest {
     pub intent_id: UploadIntentId,
     pub streamed: StreamedObject,
     pub created_by: String,
+    pub source_protocol: SourceProtocol,
 }
 
 #[derive(Clone, Debug)]
@@ -55,10 +57,33 @@ pub struct CompletePutObjectReceipt {
     pub version: ObjectVersion,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NewS3ObjectLock {
+    pub retention: Option<ObjectRetention>,
+    pub legal_hold: Option<bool>,
+}
+
+impl NewS3ObjectLock {
+    #[must_use]
+    pub const fn requested(self) -> bool {
+        self.retention.is_some() || self.legal_hold.is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedS3ObjectVersionCommit {
     pub commit: S3ObjectVersionCommit,
     pub version: ObjectVersion,
+}
+
+pub struct PrepareClaimedUploadCommitRequest<'a> {
+    pub intent: &'a UploadIntent,
+    pub lease_token: &'a str,
+    pub entity_tag: &'a EntityTag,
+    pub checksum: &'a Checksum,
+    pub size_bytes: u64,
+    pub created_by: &'a str,
+    pub source_protocol: SourceProtocol,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +129,19 @@ pub struct ListObjectVersionsRequest {
     pub object_key: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct PutObjectRetentionRequest {
+    pub object: S3ObjectRequest,
+    pub retention: ObjectRetention,
+    pub bypass_governance: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PutObjectLegalHoldRequest {
+    pub object: S3ObjectRequest,
+    pub legal_hold: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum S3ObjectServiceError {
     #[error("S3 bucket was not found")]
@@ -141,6 +179,18 @@ pub enum S3ObjectServiceError {
 
     #[error("S3 object deletion is blocked by Object Lock: {0:?}")]
     DeleteLocked(S3DeleteLockReason),
+
+    #[error("Object Lock is not enabled for the bucket")]
+    ObjectLockNotEnabled,
+
+    #[error("object retention configuration was not found")]
+    ObjectRetentionNotFound,
+
+    #[error("object retention update is denied by Object Lock: {0:?}")]
+    RetentionUpdateLocked(S3DeleteLockReason),
+
+    #[error("object retention date must be in the future")]
+    InvalidObjectRetention,
 
     #[error("failed to promote the staged object: {0}")]
     Promotion(ObjectStoreError),
@@ -304,6 +354,15 @@ where
         &self,
         request: &CompletePutObjectRequest,
     ) -> Result<CompletePutObjectReceipt, S3ObjectServiceError> {
+        self.complete_put_with_object_lock(request, NewS3ObjectLock::default())
+            .await
+    }
+
+    pub async fn complete_put_with_object_lock(
+        &self,
+        request: &CompletePutObjectRequest,
+        object_lock: NewS3ObjectLock,
+    ) -> Result<CompletePutObjectReceipt, S3ObjectServiceError> {
         let checksum = Checksum::sha256_hex(&request.streamed.sha256)?;
         let entity_tag = EntityTag::new(&request.streamed.md5)?;
         let intent = self
@@ -313,6 +372,15 @@ where
             .ok_or(S3ObjectServiceError::UploadIntentNotFound)?;
         if intent.application_id() != request.application_id {
             return Err(S3ObjectServiceError::UploadIntentOwnershipMismatch);
+        }
+        if object_lock.requested()
+            && !self
+                .find_bucket_by_id(&intent)
+                .await?
+                .configuration()
+                .object_lock_enabled()
+        {
+            return Err(S3ObjectServiceError::ObjectLockNotEnabled);
         }
 
         let ready = match intent.state() {
@@ -356,20 +424,36 @@ where
         self.promote_claimed_upload_intent(&committing, &lease_token)
             .await?;
         let prepared = self
-            .prepare_claimed_upload_commit(
-                &committing,
-                &lease_token,
-                &entity_tag,
-                &checksum,
-                request.streamed.size,
-                &request.created_by,
+            .prepare_claimed_upload_commit_with_object_lock(
+                PrepareClaimedUploadCommitRequest {
+                    intent: &committing,
+                    lease_token: &lease_token,
+                    entity_tag: &entity_tag,
+                    checksum: &checksum,
+                    size_bytes: request.streamed.size,
+                    created_by: &request.created_by,
+                    source_protocol: request.source_protocol,
+                },
+                object_lock,
             )
             .await?;
-        let version = prepared.version;
+        let version_id = prepared.version.id();
         let object = self
             .upload_intent_repository
             .commit_upload_intent(committing.id(), &lease_token, prepared.commit)
             .await?;
+        let version = self
+            .object_repository
+            .find_s3_object_version_by_id(version_id)
+            .await?
+            .filter(|version| {
+                version.object_id() == object.id()
+                    && version.application_id() == request.application_id
+                    && version.bucket_id() == object.bucket_id()
+            })
+            .ok_or_else(|| {
+                RepositoryError::Invariant("committed object-lock version is missing".into())
+            })?;
         Ok(CompletePutObjectReceipt { object, version })
     }
 
@@ -396,13 +480,26 @@ where
     /// storage key observable.
     pub async fn prepare_claimed_upload_commit(
         &self,
-        intent: &UploadIntent,
-        lease_token: &str,
-        entity_tag: &EntityTag,
-        checksum: &Checksum,
-        size_bytes: u64,
-        created_by: &str,
+        request: PrepareClaimedUploadCommitRequest<'_>,
     ) -> Result<PreparedS3ObjectVersionCommit, S3ObjectServiceError> {
+        self.prepare_claimed_upload_commit_with_object_lock(request, NewS3ObjectLock::default())
+            .await
+    }
+
+    async fn prepare_claimed_upload_commit_with_object_lock(
+        &self,
+        request: PrepareClaimedUploadCommitRequest<'_>,
+        object_lock: NewS3ObjectLock,
+    ) -> Result<PreparedS3ObjectVersionCommit, S3ObjectServiceError> {
+        let PrepareClaimedUploadCommitRequest {
+            intent,
+            lease_token,
+            entity_tag,
+            checksum,
+            size_bytes,
+            created_by,
+            source_protocol,
+        } = request;
         if intent.state() != UploadIntentState::Committing
             || intent.lease_token() != Some(lease_token)
         {
@@ -413,6 +510,9 @@ where
         ensure_ready_facts(intent, entity_tag, checksum, size_bytes)?;
 
         let bucket = self.find_bucket_by_id(intent).await?;
+        if object_lock.requested() && !bucket.configuration().object_lock_enabled() {
+            return Err(S3ObjectServiceError::ObjectLockNotEnabled);
+        }
         let existing_object = self
             .object_repository
             .find_s3_object(
@@ -487,7 +587,7 @@ where
             None,
             false,
             created_by,
-            SourceProtocol::S3,
+            source_protocol,
             committed_at,
         )?;
         let commit = S3ObjectVersionCommit {
@@ -500,6 +600,8 @@ where
                 committed_at,
                 self.gc_grace,
             ),
+            requested_retention: object_lock.retention,
+            requested_legal_hold: object_lock.legal_hold,
         };
         Ok(PreparedS3ObjectVersionCommit { commit, version })
     }
@@ -520,6 +622,90 @@ where
         request: &S3ObjectRequest,
     ) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
         self.resolve_visible_version(request).await
+    }
+
+    pub async fn get_object_lock(
+        &self,
+        request: &S3ObjectRequest,
+    ) -> Result<S3HeadObjectReceipt, S3ObjectServiceError> {
+        let bucket = self
+            .bucket_repository
+            .find_s3_bucket(request.application_id, &request.bucket_name)
+            .await?
+            .ok_or(S3ObjectServiceError::BucketNotFound)?;
+        if !bucket.configuration().object_lock_enabled() {
+            return Err(S3ObjectServiceError::ObjectLockNotEnabled);
+        }
+        self.resolve_visible_version(request).await
+    }
+
+    pub async fn put_object_retention(
+        &self,
+        request: &PutObjectRetentionRequest,
+    ) -> Result<ObjectVersion, S3ObjectServiceError> {
+        self.put_object_lock(
+            &request.object,
+            S3ObjectLockMutation::Retention {
+                retention: request.retention,
+                bypass_governance: request.bypass_governance,
+            },
+        )
+        .await
+    }
+
+    pub async fn put_object_legal_hold(
+        &self,
+        request: &PutObjectLegalHoldRequest,
+    ) -> Result<ObjectVersion, S3ObjectServiceError> {
+        self.put_object_lock(
+            &request.object,
+            S3ObjectLockMutation::LegalHold(request.legal_hold),
+        )
+        .await
+    }
+
+    async fn put_object_lock(
+        &self,
+        request: &S3ObjectRequest,
+        mutation: S3ObjectLockMutation,
+    ) -> Result<ObjectVersion, S3ObjectServiceError> {
+        let bucket = self
+            .bucket_repository
+            .find_s3_bucket(request.application_id, &request.bucket_name)
+            .await?
+            .ok_or(S3ObjectServiceError::BucketNotFound)?;
+        let outcome = self
+            .object_repository
+            .put_s3_object_lock(&PutS3ObjectLockCommand {
+                application_id: request.application_id,
+                bucket_id: bucket.id(),
+                object_key: request.object_key.clone(),
+                version_id: request.version_id.clone(),
+                mutation,
+                updated_at: self.clock.now(),
+            })
+            .await?;
+        match outcome {
+            PutS3ObjectLockOutcome::Updated(version) => Ok(version),
+            PutS3ObjectLockOutcome::ObjectNotFound => Err(S3ObjectServiceError::ObjectNotFound),
+            PutS3ObjectLockOutcome::VersionNotFound => Err(S3ObjectServiceError::VersionNotFound),
+            PutS3ObjectLockOutcome::DeleteMarker {
+                version_id,
+                is_current,
+            } => Err(S3ObjectServiceError::DeleteMarker {
+                version_id,
+                is_current,
+            }),
+            PutS3ObjectLockOutcome::ObjectLockNotEnabled => {
+                Err(S3ObjectServiceError::ObjectLockNotEnabled)
+            }
+            PutS3ObjectLockOutcome::RetentionLocked(reason) => {
+                Err(S3ObjectServiceError::RetentionUpdateLocked(reason))
+            }
+            PutS3ObjectLockOutcome::InvalidRetention => {
+                Err(S3ObjectServiceError::InvalidObjectRetention)
+            }
+        }
     }
 
     pub async fn delete(

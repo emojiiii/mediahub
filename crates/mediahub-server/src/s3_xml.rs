@@ -4,6 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest as _, Md5};
 use quick_xml::{events::Event, reader::Reader};
 use thiserror::Error;
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const ALL_USERS_GROUP: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
@@ -76,6 +77,62 @@ pub(crate) struct ListPartsResult {
     pub(crate) max_parts: u16,
     pub(crate) is_truncated: bool,
     pub(crate) parts: Vec<ListedPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ListedVersionKind {
+    Object { etag: String, size: u64 },
+    DeleteMarker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListedObjectVersion {
+    pub(crate) key: String,
+    pub(crate) version_id: String,
+    pub(crate) is_latest: bool,
+    pub(crate) last_modified: OffsetDateTime,
+    pub(crate) kind: ListedVersionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListObjectVersionsResult {
+    pub(crate) bucket: String,
+    pub(crate) owner_id: String,
+    pub(crate) owner_display_name: String,
+    pub(crate) prefix: String,
+    pub(crate) delimiter: Option<String>,
+    pub(crate) key_marker: Option<String>,
+    pub(crate) version_id_marker: Option<String>,
+    pub(crate) next_key_marker: Option<String>,
+    pub(crate) next_version_id_marker: Option<String>,
+    pub(crate) max_keys: usize,
+    pub(crate) encoding_url: bool,
+    pub(crate) items: Vec<ListedObjectVersion>,
+    pub(crate) common_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListedMultipartUpload {
+    pub(crate) key: String,
+    pub(crate) upload_id: String,
+    pub(crate) initiated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListMultipartUploadsResult {
+    pub(crate) bucket: String,
+    pub(crate) owner_id: String,
+    pub(crate) owner_display_name: String,
+    pub(crate) prefix: String,
+    pub(crate) delimiter: Option<String>,
+    pub(crate) key_marker: Option<String>,
+    pub(crate) upload_id_marker: Option<String>,
+    pub(crate) next_key_marker: Option<String>,
+    pub(crate) next_upload_id_marker: Option<String>,
+    pub(crate) max_uploads: usize,
+    pub(crate) encoding_url: bool,
+    pub(crate) items: Vec<ListedMultipartUpload>,
+    pub(crate) common_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +401,151 @@ pub(crate) fn list_parts_result_xml(result: &ListPartsResult) -> Result<String, 
     Ok(output)
 }
 
+pub(crate) fn list_object_versions_result_xml(
+    result: &ListObjectVersionsResult,
+) -> Result<String, S3XmlError> {
+    let mut output = xml_document_start("ListVersionsResult");
+    push_element(&mut output, "Name", &result.bucket)?;
+    push_listing_element(&mut output, "Prefix", &result.prefix, result.encoding_url)?;
+    if let Some(marker) = result.key_marker.as_deref() {
+        push_listing_element(&mut output, "KeyMarker", marker, result.encoding_url)?;
+    } else {
+        push_element(&mut output, "KeyMarker", "")?;
+    }
+    if let Some(marker) = result.version_id_marker.as_deref() {
+        push_element(&mut output, "VersionIdMarker", marker)?;
+    } else {
+        push_element(&mut output, "VersionIdMarker", "")?;
+    }
+    if let Some(marker) = result.next_key_marker.as_deref() {
+        push_listing_element(&mut output, "NextKeyMarker", marker, result.encoding_url)?;
+    }
+    if let Some(marker) = result.next_version_id_marker.as_deref() {
+        push_element(&mut output, "NextVersionIdMarker", marker)?;
+    }
+    if let Some(delimiter) = result.delimiter.as_deref() {
+        push_listing_element(&mut output, "Delimiter", delimiter, result.encoding_url)?;
+    }
+    if result.encoding_url {
+        push_element(&mut output, "EncodingType", "url")?;
+    }
+    push_number_element(&mut output, "MaxKeys", result.max_keys);
+    push_element(
+        &mut output,
+        "IsTruncated",
+        if result.next_key_marker.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    for item in &result.items {
+        let element = match item.kind {
+            ListedVersionKind::Object { .. } => "Version",
+            ListedVersionKind::DeleteMarker => "DeleteMarker",
+        };
+        write!(output, "<{element}>").expect("writing to String cannot fail");
+        push_listing_element(&mut output, "Key", &item.key, result.encoding_url)?;
+        push_element(&mut output, "VersionId", &item.version_id)?;
+        push_element(
+            &mut output,
+            "IsLatest",
+            if item.is_latest { "true" } else { "false" },
+        )?;
+        push_element(
+            &mut output,
+            "LastModified",
+            &format_s3_timestamp(item.last_modified)?,
+        )?;
+        match &item.kind {
+            ListedVersionKind::Object { etag, size } => {
+                let quoted_etag = if etag.starts_with('"') && etag.ends_with('"') {
+                    etag.clone()
+                } else {
+                    format!("\"{etag}\"")
+                };
+                push_element(&mut output, "ETag", &quoted_etag)?;
+                push_number_element(&mut output, "Size", size);
+                push_element(&mut output, "StorageClass", "STANDARD")?;
+            }
+            ListedVersionKind::DeleteMarker => {}
+        }
+        push_owner(&mut output, &result.owner_id, &result.owner_display_name)?;
+        write!(output, "</{element}>").expect("writing to String cannot fail");
+    }
+    for prefix in &result.common_prefixes {
+        output.push_str("<CommonPrefixes>");
+        push_listing_element(&mut output, "Prefix", prefix, result.encoding_url)?;
+        output.push_str("</CommonPrefixes>");
+    }
+    output.push_str("</ListVersionsResult>");
+    Ok(output)
+}
+
+pub(crate) fn list_multipart_uploads_result_xml(
+    result: &ListMultipartUploadsResult,
+) -> Result<String, S3XmlError> {
+    let mut output = xml_document_start("ListMultipartUploadsResult");
+    push_element(&mut output, "Bucket", &result.bucket)?;
+    if let Some(marker) = result.key_marker.as_deref() {
+        push_listing_element(&mut output, "KeyMarker", marker, result.encoding_url)?;
+    } else {
+        push_element(&mut output, "KeyMarker", "")?;
+    }
+    if let Some(marker) = result.upload_id_marker.as_deref() {
+        push_element(&mut output, "UploadIdMarker", marker)?;
+    } else {
+        push_element(&mut output, "UploadIdMarker", "")?;
+    }
+    if let Some(marker) = result.next_key_marker.as_deref() {
+        push_listing_element(&mut output, "NextKeyMarker", marker, result.encoding_url)?;
+    }
+    if let Some(marker) = result.next_upload_id_marker.as_deref() {
+        push_element(&mut output, "NextUploadIdMarker", marker)?;
+    }
+    if let Some(delimiter) = result.delimiter.as_deref() {
+        push_listing_element(&mut output, "Delimiter", delimiter, result.encoding_url)?;
+    }
+    push_listing_element(&mut output, "Prefix", &result.prefix, result.encoding_url)?;
+    if result.encoding_url {
+        push_element(&mut output, "EncodingType", "url")?;
+    }
+    push_number_element(&mut output, "MaxUploads", result.max_uploads);
+    push_element(
+        &mut output,
+        "IsTruncated",
+        if result.next_key_marker.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    for item in &result.items {
+        output.push_str("<Upload>");
+        push_listing_element(&mut output, "Key", &item.key, result.encoding_url)?;
+        push_element(&mut output, "UploadId", &item.upload_id)?;
+        output.push_str("<Initiator>");
+        push_element(&mut output, "ID", &result.owner_id)?;
+        push_element(&mut output, "DisplayName", &result.owner_display_name)?;
+        output.push_str("</Initiator>");
+        push_owner(&mut output, &result.owner_id, &result.owner_display_name)?;
+        push_element(&mut output, "StorageClass", "STANDARD")?;
+        push_element(
+            &mut output,
+            "Initiated",
+            &format_s3_timestamp(item.initiated_at)?,
+        )?;
+        output.push_str("</Upload>");
+    }
+    for prefix in &result.common_prefixes {
+        output.push_str("<CommonPrefixes>");
+        push_listing_element(&mut output, "Prefix", prefix, result.encoding_url)?;
+        output.push_str("</CommonPrefixes>");
+    }
+    output.push_str("</ListMultipartUploadsResult>");
+    Ok(output)
+}
+
 pub(crate) fn complete_multipart_upload_result_xml(
     location: &str,
     bucket: &str,
@@ -356,6 +558,25 @@ pub(crate) fn complete_multipart_upload_result_xml(
     push_element(&mut output, "Key", key)?;
     push_element(&mut output, "ETag", etag)?;
     output.push_str("</CompleteMultipartUploadResult>");
+    Ok(output)
+}
+
+pub(crate) fn copy_object_result_xml(
+    last_modified: &str,
+    etag: &str,
+) -> Result<String, S3XmlError> {
+    let mut output = xml_document_start("CopyObjectResult");
+    push_element(&mut output, "LastModified", last_modified)?;
+    push_element(&mut output, "ETag", etag)?;
+    output.push_str("</CopyObjectResult>");
+    Ok(output)
+}
+
+pub(crate) fn copy_part_result_xml(last_modified: &str, etag: &str) -> Result<String, S3XmlError> {
+    let mut output = xml_document_start("CopyPartResult");
+    push_element(&mut output, "LastModified", last_modified)?;
+    push_element(&mut output, "ETag", etag)?;
+    output.push_str("</CopyPartResult>");
     Ok(output)
 }
 
@@ -550,6 +771,49 @@ fn append_text(stack: &mut [XmlNode], value: &str) -> Result<(), S3XmlError> {
 
 fn xml_document_start(root_name: &str) -> String {
     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><{root_name} xmlns=\"{S3_XML_NAMESPACE}\">")
+}
+
+fn push_owner(output: &mut String, id: &str, display_name: &str) -> Result<(), S3XmlError> {
+    output.push_str("<Owner>");
+    push_element(output, "ID", id)?;
+    push_element(output, "DisplayName", display_name)?;
+    output.push_str("</Owner>");
+    Ok(())
+}
+
+fn format_s3_timestamp(value: OffsetDateTime) -> Result<String, S3XmlError> {
+    value
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| S3XmlError::InvalidXmlCharacter)
+}
+
+fn push_listing_element(
+    output: &mut String,
+    name: &str,
+    value: &str,
+    encoding_url: bool,
+) -> Result<(), S3XmlError> {
+    if encoding_url {
+        push_element(output, name, &s3_url_encode(value))
+    } else {
+        push_element(output, name, value)
+    }
+}
+
+fn s3_url_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
 }
 
 fn push_element(output: &mut String, name: &str, value: &str) -> Result<(), S3XmlError> {

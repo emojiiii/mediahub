@@ -129,6 +129,14 @@ pub struct ObjectRetention {
     retain_until: OffsetDateTime,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectRetentionUpdateError {
+    InvalidVersion,
+    RetainUntilMustBeFuture,
+    ComplianceRetentionLocked,
+    GovernanceRetentionLocked,
+}
+
 impl ObjectRetention {
     #[must_use]
     pub const fn new(mode: RetentionMode, retain_until: OffsetDateTime) -> Self {
@@ -240,7 +248,7 @@ impl StoredObjectVersion {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObjectVersionPayload {
-    Object(StoredObjectVersion),
+    Object(Box<StoredObjectVersion>),
     DeleteMarker,
 }
 
@@ -292,7 +300,7 @@ impl ObjectVersion {
             generation,
             is_null_version,
             state,
-            payload: ObjectVersionPayload::Object(object),
+            payload: ObjectVersionPayload::Object(Box::new(object)),
             retention,
             legal_hold,
             created_by: created_by.into(),
@@ -452,6 +460,68 @@ impl ObjectVersion {
     #[must_use]
     pub const fn became_noncurrent_at(&self) -> Option<OffsetDateTime> {
         self.became_noncurrent_at
+    }
+
+    /// Freezes Object Lock metadata while creating a committed data version.
+    /// Immutable payload facts and identity are preserved.
+    pub fn with_initial_object_lock(
+        &self,
+        retention: Option<ObjectRetention>,
+        legal_hold: bool,
+    ) -> Result<Self, S3ModelError> {
+        if self.state != ObjectVersionState::Committed || self.is_delete_marker() {
+            return Err(S3ModelError::InvalidObjectVersionPayload);
+        }
+        if retention.is_some_and(|value| value.retain_until() <= self.created_at) {
+            return Err(S3ModelError::InvalidObjectRetention);
+        }
+        let mut updated = self.clone();
+        updated.retention = retention;
+        updated.legal_hold = legal_hold;
+        Ok(updated)
+    }
+
+    /// Applies the S3 retention transition rules to an existing version.
+    pub fn with_retention_update(
+        &self,
+        retention: ObjectRetention,
+        now: OffsetDateTime,
+        bypass_governance: bool,
+    ) -> Result<Self, ObjectRetentionUpdateError> {
+        if self.state != ObjectVersionState::Committed || self.is_delete_marker() {
+            return Err(ObjectRetentionUpdateError::InvalidVersion);
+        }
+        if retention.retain_until() <= now {
+            return Err(ObjectRetentionUpdateError::RetainUntilMustBeFuture);
+        }
+        if let Some(current) = self.retention.filter(|value| value.retain_until() > now) {
+            match current.mode() {
+                RetentionMode::Compliance
+                    if retention.mode() != RetentionMode::Compliance
+                        || retention.retain_until() < current.retain_until() =>
+                {
+                    return Err(ObjectRetentionUpdateError::ComplianceRetentionLocked);
+                }
+                RetentionMode::Governance
+                    if retention.retain_until() < current.retain_until() && !bypass_governance =>
+                {
+                    return Err(ObjectRetentionUpdateError::GovernanceRetentionLocked);
+                }
+                _ => {}
+            }
+        }
+        let mut updated = self.clone();
+        updated.retention = Some(retention);
+        Ok(updated)
+    }
+
+    pub fn with_legal_hold_update(&self, legal_hold: bool) -> Result<Self, S3ModelError> {
+        if self.state != ObjectVersionState::Committed || self.is_delete_marker() {
+            return Err(S3ModelError::InvalidObjectVersionPayload);
+        }
+        let mut updated = self.clone();
+        updated.legal_hold = legal_hold;
+        Ok(updated)
     }
 }
 
@@ -721,7 +791,7 @@ mod tests {
             generation: 1,
             is_null_version: false,
             state: ObjectVersionState::Committed,
-            payload: ObjectVersionPayload::Object(stored_object()),
+            payload: ObjectVersionPayload::Object(Box::new(stored_object())),
             retention: None,
             legal_hold: false,
             created_by: "test".into(),
@@ -741,6 +811,70 @@ mod tests {
                 ..base
             }),
             Err(S3ModelError::InvalidVersionId)
+        );
+    }
+
+    #[test]
+    fn object_retention_transitions_enforce_compliance_and_governance_rules() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let base = ObjectVersion::new_object(
+            ObjectVersionId::new(),
+            ObjectId::new(),
+            ApplicationId::new(),
+            BucketId::new(),
+            S3VersionId::new("version-lock").expect("version ID"),
+            1,
+            false,
+            ObjectVersionState::Committed,
+            stored_object(),
+            Some(ObjectRetention::new(
+                RetentionMode::Compliance,
+                now + time::Duration::days(30),
+            )),
+            false,
+            "test",
+            SourceProtocol::S3,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("version");
+
+        assert_eq!(
+            base.with_retention_update(
+                ObjectRetention::new(RetentionMode::Compliance, now + time::Duration::days(20)),
+                now,
+                true,
+            ),
+            Err(ObjectRetentionUpdateError::ComplianceRetentionLocked)
+        );
+
+        let governance = base
+            .with_initial_object_lock(
+                Some(ObjectRetention::new(
+                    RetentionMode::Governance,
+                    now + time::Duration::days(30),
+                )),
+                false,
+            )
+            .expect("governance version");
+        assert_eq!(
+            governance.with_retention_update(
+                ObjectRetention::new(RetentionMode::Governance, now + time::Duration::days(20)),
+                now,
+                false,
+            ),
+            Err(ObjectRetentionUpdateError::GovernanceRetentionLocked)
+        );
+        assert!(
+            governance
+                .with_retention_update(
+                    ObjectRetention::new(
+                        RetentionMode::Governance,
+                        now + time::Duration::days(20),
+                    ),
+                    now,
+                    true,
+                )
+                .is_ok()
         );
     }
 }

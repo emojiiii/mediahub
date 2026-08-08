@@ -228,6 +228,15 @@
           "type": "string"
         }
       },
+      "ObjectVersionId": {
+        "in": "path",
+        "name": "version_id",
+        "required": true,
+        "schema": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
       "PublicBucketName": {
         "in": "path",
         "name": "bucket",
@@ -2140,6 +2149,83 @@
           "next_cursor"
         ],
         "type": "object"
+      },
+      "ObjectVersionPreviewManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "content_type": {
+            "type": "string"
+          },
+          "content_url": {
+            "type": "string"
+          },
+          "etag": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ObjectVersionPreviewMode"
+          },
+          "renderer": {
+            "$ref": "#/components/schemas/ObjectVersionPreviewRenderer"
+          },
+          "renderer_version": {
+            "type": "string"
+          },
+          "size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version_id": {
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "version_id",
+          "etag",
+          "content_type",
+          "size",
+          "renderer",
+          "renderer_version",
+          "mode",
+          "content_url",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "ObjectVersionPreviewMode": {
+        "enum": [
+          "stream",
+          "buffered"
+        ],
+        "type": "string"
+      },
+      "ObjectVersionPreviewRenderer": {
+        "enum": [
+          "archive",
+          "audio_video",
+          "image",
+          "pdf",
+          "spreadsheet",
+          "sqlite",
+          "text",
+          "general"
+        ],
+        "type": "string"
       },
       "OneTimeToken": {
         "additionalProperties": false,
@@ -4603,6 +4689,171 @@
           }
         ],
         "summary": "Run or schedule a media batch operation"
+      }
+    },
+    "/api/v1/object-versions/{version_id}/content": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ApplicationContext"
+          },
+          {
+            "$ref": "#/components/parameters/ObjectVersionId"
+          },
+          {
+            "$ref": "#/components/parameters/Range"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Partial content"
+          },
+          "304": {
+            "description": "Not modified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "416": {
+            "description": "Range not satisfiable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "HmacAccessKey": []
+          }
+        ],
+        "summary": "Read immutable ObjectVersion content"
+      },
+      "head": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ApplicationContext"
+          },
+          {
+            "$ref": "#/components/parameters/ObjectVersionId"
+          },
+          {
+            "$ref": "#/components/parameters/Range"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "206": {
+            "description": "Partial content"
+          },
+          "304": {
+            "description": "Not modified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "416": {
+            "description": "Range not satisfiable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "HmacAccessKey": []
+          }
+        ],
+        "summary": "Read immutable ObjectVersion content headers"
+      }
+    },
+    "/api/v1/object-versions/{version_id}/preview-manifest": {
+      "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ApplicationContext"
+          },
+          {
+            "$ref": "#/components/parameters/ObjectVersionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectVersionPreviewManifest"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "HmacAccessKey": []
+          }
+        ],
+        "summary": "Resolve an immutable ObjectVersion preview manifest"
       }
     },
     "/api/v1/short-links": {

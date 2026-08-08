@@ -22,18 +22,21 @@ use mediahub_app::{
     AbortStagedPutRequest, AccessKeyRepository, ApplicationRepository, BeginPutObjectRequest,
     CompletePutObjectRequest, CompletedS3MultipartPart, DEFAULT_S3_MULTIPART_GC_MAX_ATTEMPTS,
     DeleteObjectReceipt, DeleteObjectRequest, NewS3MultipartPart, NewS3MultipartUpload,
-    ObjectStore, ObjectStoreError, RepositoryError, S3BucketRepository, S3DeleteLockReason,
-    S3MultipartAbort, S3MultipartCompletionClaim, S3MultipartManifest, S3MultipartManifestError,
-    S3MultipartPartPut, S3MultipartRepository, S3MultipartUpload, S3MultipartUploadState,
+    NewS3ObjectLock, ObjectStore, ObjectStoreError, PrepareClaimedUploadCommitRequest,
+    PutObjectLegalHoldRequest, PutObjectRetentionRequest, RepositoryError, S3BucketRepository,
+    S3DeleteLockReason, S3ListingRepository, S3MultipartAbort, S3MultipartCompletionClaim,
+    S3MultipartManifest, S3MultipartManifestError, S3MultipartPartPut, S3MultipartRepository,
+    S3MultipartUpload, S3MultipartUploadListQuery, S3MultipartUploadPage, S3MultipartUploadState,
     S3ObjectListItem, S3ObjectListQuery, S3ObjectPage, S3ObjectRepository, S3ObjectRequest,
-    S3ObjectService, S3ObjectServiceError, S3UploadIntentRepository, StorageGcRepository,
-    StreamingUploadError, is_lowercase_md5_hex,
+    S3ObjectService, S3ObjectServiceError, S3ObjectVersionListQuery, S3ObjectVersionPage,
+    S3UploadIntentRepository, StorageGcRepository, StreamingUploadError, is_lowercase_md5_hex,
 };
 use mediahub_core::{
-    ApplicationId, Bucket, BucketId, BucketPolicy, Checksum, ChecksumAlgorithm, EntityTag,
-    NewStorageGcTask, ObjectVersion, ObjectVersionPayload, OffsetDateTime, S3VersionId,
-    StorageGcReason, StorageGcTaskId, StoredObjectVersion, UploadIntent, UploadIntentId,
-    UploadIntentState, VersioningStatus, Visibility,
+    ApplicationId, Bucket, BucketId, Checksum, ChecksumAlgorithm, DefaultRetention,
+    DefaultRetentionPeriod, EntityTag, NewStorageGcTask, ObjectRetention, ObjectVersion,
+    ObjectVersionPayload, OffsetDateTime, RetentionMode, S3Bucket, S3VersionId, StorageGcReason,
+    StorageGcTaskId, StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState,
+    VersioningStatus, Visibility,
 };
 use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
@@ -45,15 +48,18 @@ use super::s3_list::{
 };
 use super::s3_multipart_storage::{multipart_entity_tag, new_multipart_part_storage_key};
 use super::s3_xml::{
-    DeleteObjectError, DeleteResult, DeletedObject, ListPartsResult, ListedPart, ObjectAcl,
-    S3XmlError, complete_multipart_upload_result_xml, delete_result_xml, get_object_acl_xml,
-    initiate_multipart_upload_result_xml, list_parts_result_xml,
+    DeleteObjectError, DeleteResult, DeletedObject, ListMultipartUploadsResult,
+    ListObjectVersionsResult, ListPartsResult, ListedMultipartUpload, ListedObjectVersion,
+    ListedPart, ListedVersionKind, MAX_S3_XML_BODY_BYTES, ObjectAcl, S3XmlError,
+    complete_multipart_upload_result_xml, copy_object_result_xml, copy_part_result_xml,
+    delete_result_xml, get_object_acl_xml, initiate_multipart_upload_result_xml,
+    list_multipart_uploads_result_xml, list_object_versions_result_xml, list_parts_result_xml,
     parse_complete_multipart_upload_xml, parse_delete_objects_xml, validate_content_md5,
 };
 use super::{
     ApiError, AppState, ApplicationAuth, HmacIdentity, MAX_ERROR_RESPONSE_BYTES,
     MAX_UPLOAD_OBJECT_BYTES, RequestId, SystemClock, entity_tag_header_value, local_file_body,
-    normalized_mime, record_audit, validate_upload_expected_size,
+    normalized_mime, record_audit,
 };
 
 const MIN_S3_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
@@ -62,6 +68,9 @@ const S3_MULTIPART_COMPLETION_LEASE_SECONDS: i64 = 5 * 60;
 
 include!("s3_http_bucket.rs");
 include!("s3_http_configuration.rs");
+include!("s3_http_object_lock.rs");
+include!("s3_http_object_version_lock.rs");
+include!("s3_http_copy.rs");
 include!("s3_http_core.rs");
 include!("s3_http_multipart.rs");
 include!("s3_http_object.rs");
@@ -72,8 +81,16 @@ include!("s3_http_bucket_tests.rs");
 #[cfg(test)]
 include!("s3_http_configuration_tests.rs");
 #[cfg(test)]
+include!("s3_http_object_lock_tests.rs");
+#[cfg(test)]
+include!("s3_http_object_version_lock_tests.rs");
+#[cfg(test)]
 include!("s3_http_object_tests.rs");
 #[cfg(test)]
 include!("s3_http_delete_tests.rs");
 #[cfg(test)]
 include!("s3_http_list_tests.rs");
+#[cfg(test)]
+include!("s3_http_copy_tests.rs");
+#[cfg(test)]
+include!("s3_http_listing_tests.rs");

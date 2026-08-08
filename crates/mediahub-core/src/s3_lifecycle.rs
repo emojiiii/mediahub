@@ -154,10 +154,10 @@ impl S3LifecycleConfiguration {
         let mut ids = HashSet::with_capacity(self.rules.len());
         for rule in &self.rules {
             rule.validate()?;
-            if let Some(id) = rule.id.as_deref() {
-                if !ids.insert(id) {
-                    return Err(S3ModelError::InvalidLifecycleConfiguration);
-                }
+            if let Some(id) = rule.id.as_deref()
+                && !ids.insert(id)
+            {
+                return Err(S3ModelError::InvalidLifecycleConfiguration);
             }
         }
         Ok(())

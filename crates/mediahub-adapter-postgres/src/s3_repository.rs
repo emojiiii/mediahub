@@ -2,18 +2,22 @@ use async_trait::async_trait;
 use mediahub_app::{
     DEFAULT_S3_MULTIPART_GC_MAX_ATTEMPTS, DeleteS3ObjectCommand, DeleteS3ObjectOutcome,
     DeletedS3ObjectVersion, MAX_STORAGE_GC_CLAIM_LIMIT, MAX_UPLOAD_INTENT_EXPIRY_LIMIT,
-    RepositoryError, S3BucketRepository, S3DeleteLockReason, S3ObjectCommitTarget,
-    S3ObjectListItem, S3ObjectListQuery, S3ObjectPage, S3ObjectRepository, S3ObjectVersionCommit,
+    PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError, S3BucketRepository,
+    S3DeleteLockReason, S3ListingRepository, S3MultipartUploadListItem, S3MultipartUploadListQuery,
+    S3MultipartUploadPage, S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery,
+    S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectVersionCommit,
+    S3ObjectVersionListItem, S3ObjectVersionListQuery, S3ObjectVersionPage, S3ObjectVersionRead,
     S3UploadIntentRepository, StorageGcRepository, is_multipart_etag,
 };
 use mediahub_core::{
     ApplicationId, BucketId, BucketS3Configuration, Checksum, ChecksumAlgorithm, DefaultRetention,
-    EntityTag, NewStorageGcTask, ObjectId, ObjectRetention, ObjectVersion, ObjectVersionId,
-    ObjectVersionPayload, ObjectVersionState, PersistedBucketS3Configuration,
-    PersistedObjectVersion, PersistedS3Bucket, PersistedS3Object, PersistedUploadIntent,
-    RetentionMode, S3Bucket, S3LifecycleConfiguration, S3Object, S3VersionId, SourceProtocol,
-    StorageGcReason, StorageGcTask, StorageGcTaskId, StorageGcTaskState, StoredObjectVersion,
-    UploadIntent, UploadIntentId, UploadIntentState, VersioningStatus,
+    EntityTag, NewStorageGcTask, ObjectId, ObjectRetention, ObjectRetentionUpdateError,
+    ObjectVersion, ObjectVersionId, ObjectVersionPayload, ObjectVersionState,
+    PersistedBucketS3Configuration, PersistedObjectVersion, PersistedS3Bucket, PersistedS3Object,
+    PersistedUploadIntent, RetentionMode, S3Bucket, S3LifecycleConfiguration, S3Object,
+    S3VersionId, SourceProtocol, StorageGcReason, StorageGcTask, StorageGcTaskId,
+    StorageGcTaskState, StoredObjectVersion, UploadIntent, UploadIntentId, UploadIntentState,
+    VersioningStatus,
 };
 use serde_json::{Value, json};
 use sqlx::{Postgres, QueryBuilder, Row, postgres::PgRow, types::Json};
@@ -57,6 +61,16 @@ WHERE object_id = $1 AND external_version_id = $2
   AND superseded_at IS NULL AND state = 'committed'";
 
 const FIND_OBJECT_VERSION_BY_ID_AUDIT_SQL: &str = "SELECT * FROM object_versions WHERE id = $1";
+
+const FIND_COMMITTED_OBJECT_VERSION_FOR_APPLICATION_SQL: &str =
+    "SELECT version.*, logical_object.object_key AS preview_object_key
+FROM object_versions AS version
+JOIN objects AS logical_object
+  ON logical_object.id = version.object_id
+ AND logical_object.application_id = version.application_id
+ AND logical_object.bucket_id = version.bucket_id
+WHERE version.id = $1 AND version.application_id = $2
+  AND version.state = 'committed' AND NOT version.is_delete_marker";
 
 const FIND_CURRENT_OBJECT_VERSION_SQL: &str = "SELECT version.* FROM objects object
 JOIN object_versions version ON version.id = object.current_version_id
@@ -162,6 +176,363 @@ fn build_list_current_s3_objects_query(
              ORDER BY paged.entry_key COLLATE \"C\" ASC",
         );
     sql
+}
+
+const FIND_LIST_VERSION_MARKER_GENERATION_SQL: &str = "SELECT version.generation
+FROM objects AS logical_object
+JOIN object_versions AS version ON version.object_id = logical_object.id
+WHERE logical_object.application_id = $1
+  AND logical_object.bucket_id = $2
+  AND logical_object.object_key = $3
+  AND version.external_version_id = $4
+  AND version.superseded_at IS NULL
+  AND version.state = 'committed'";
+
+fn s3_version_fetch_limit(
+    query: &S3ObjectVersionListQuery,
+) -> Result<Option<i64>, RepositoryError> {
+    query.validate()?;
+    if query.limit == 0 {
+        return Ok(None);
+    }
+    i64::try_from(query.limit + 1)
+        .map(Some)
+        .map_err(|_| RepositoryError::Invariant("S3 version page limit is too large".into()))
+}
+
+fn build_list_s3_object_versions_query(
+    application_id: ApplicationId,
+    query: &S3ObjectVersionListQuery,
+    marker_generation: Option<i64>,
+    fetch_limit: i64,
+) -> QueryBuilder<Postgres> {
+    let mut sql = QueryBuilder::<Postgres>::new(
+        "WITH visible_versions AS (\
+         SELECT logical_object.object_key, version.id AS version_id, version.generation, \
+                version.external_version_id, \
+                logical_object.current_version_id = version.id AS is_latest \
+         FROM objects AS logical_object \
+         JOIN object_versions AS version ON version.object_id = logical_object.id \
+         WHERE logical_object.application_id = ",
+    );
+    sql.push_bind(application_id.as_uuid())
+        .push(" AND logical_object.bucket_id = ")
+        .push_bind(query.bucket_id.as_uuid())
+        .push(" AND version.superseded_at IS NULL")
+        .push(" AND version.state = 'committed'")
+        .push(" AND LEFT(logical_object.object_key, char_length(")
+        .push_bind(query.prefix.clone())
+        .push(")) = ")
+        .push_bind(query.prefix.clone())
+        .push(')');
+
+    if query.delimiter {
+        sql.push(
+            ", filtered AS (\
+             SELECT object_key, version_id, generation, external_version_id, is_latest, \
+                    substring(object_key FROM char_length(",
+        )
+        .push_bind(query.prefix.clone())
+        .push(
+            ") + 1) AS relative_key FROM visible_versions\
+             ), entries AS (\
+             SELECT object_key AS entry_key, FALSE AS is_prefix, version_id, generation, \
+                    external_version_id, is_latest \
+             FROM filtered WHERE strpos(relative_key, '/') = 0 \
+             UNION ALL SELECT ",
+        )
+        .push_bind(query.prefix.clone())
+        .push(
+            " || split_part(relative_key, '/', 1) || '/' AS entry_key, \
+             TRUE AS is_prefix, NULL::uuid AS version_id, NULL::bigint AS generation, \
+             NULL::text AS external_version_id, FALSE AS is_latest \
+             FROM filtered WHERE strpos(relative_key, '/') > 0 \
+             GROUP BY split_part(relative_key, '/', 1)\
+             )",
+        );
+    } else {
+        sql.push(
+            ", entries AS (\
+             SELECT object_key AS entry_key, FALSE AS is_prefix, version_id, generation, \
+                    external_version_id, is_latest FROM visible_versions\
+             )",
+        );
+    }
+
+    sql.push(
+        ", paged AS (\
+         SELECT entry_key, is_prefix, version_id, generation, external_version_id, is_latest \
+         FROM entries",
+    );
+    if let Some(key_marker) = &query.key_marker {
+        if let Some(marker_generation) = marker_generation {
+            sql.push(" WHERE (entry_key COLLATE \"C\" > ")
+                .push_bind(key_marker.clone())
+                .push(" COLLATE \"C\") OR (entry_key COLLATE \"C\" = ")
+                .push_bind(key_marker.clone())
+                .push(" COLLATE \"C\" AND NOT is_prefix AND generation < ")
+                .push_bind(marker_generation)
+                .push(')');
+        } else {
+            sql.push(" WHERE entry_key COLLATE \"C\" > ")
+                .push_bind(key_marker.clone())
+                .push(" COLLATE \"C\"");
+        }
+    }
+    sql.push(
+        " ORDER BY entry_key COLLATE \"C\" ASC, is_prefix ASC, generation DESC NULLS LAST \
+         LIMIT ",
+    )
+    .push_bind(fetch_limit)
+    .push(
+        ") \
+         SELECT paged.entry_key, paged.is_prefix, paged.is_latest, version.* \
+         FROM paged \
+         LEFT JOIN object_versions AS version ON version.id = paged.version_id \
+         ORDER BY paged.entry_key COLLATE \"C\" ASC, paged.is_prefix ASC, \
+                  paged.generation DESC NULLS LAST",
+    );
+    sql
+}
+
+fn s3_multipart_upload_fetch_limit(
+    query: &S3MultipartUploadListQuery,
+) -> Result<Option<i64>, RepositoryError> {
+    query.validate()?;
+    if query.limit == 0 {
+        return Ok(None);
+    }
+    i64::try_from(query.limit + 1).map(Some).map_err(|_| {
+        RepositoryError::Invariant("S3 multipart-upload page limit is too large".into())
+    })
+}
+
+fn build_list_s3_multipart_uploads_query(
+    application_id: ApplicationId,
+    query: &S3MultipartUploadListQuery,
+    fetch_limit: i64,
+) -> QueryBuilder<Postgres> {
+    let mut sql = QueryBuilder::<Postgres>::new(
+        "WITH active_uploads AS (\
+         SELECT object_key, upload_id, created_at \
+         FROM s3_multipart_uploads \
+         WHERE application_id = ",
+    );
+    sql.push_bind(application_id.as_uuid())
+        .push(" AND bucket_id = ")
+        .push_bind(query.bucket_id.as_uuid())
+        .push(" AND state IN ('pending', 'completing')")
+        .push(" AND expires_at > ")
+        .push_bind(query.as_of)
+        .push(" AND LEFT(object_key, char_length(")
+        .push_bind(query.prefix.clone())
+        .push(")) = ")
+        .push_bind(query.prefix.clone())
+        .push(')');
+
+    if query.delimiter {
+        sql.push(
+            ", filtered AS (\
+             SELECT object_key, upload_id, created_at, \
+                    substring(object_key FROM char_length(",
+        )
+        .push_bind(query.prefix.clone())
+        .push(
+            ") + 1) AS relative_key FROM active_uploads\
+             ), entries AS (\
+             SELECT object_key AS entry_key, FALSE AS is_prefix, upload_id, created_at \
+             FROM filtered WHERE strpos(relative_key, '/') = 0 \
+             UNION ALL SELECT ",
+        )
+        .push_bind(query.prefix.clone())
+        .push(
+            " || split_part(relative_key, '/', 1) || '/' AS entry_key, \
+             TRUE AS is_prefix, NULL::text AS upload_id, NULL::timestamptz AS created_at \
+             FROM filtered WHERE strpos(relative_key, '/') > 0 \
+             GROUP BY split_part(relative_key, '/', 1)\
+             )",
+        );
+    } else {
+        sql.push(
+            ", entries AS (\
+             SELECT object_key AS entry_key, FALSE AS is_prefix, upload_id, created_at \
+             FROM active_uploads\
+             )",
+        );
+    }
+
+    sql.push(
+        ", paged AS (\
+         SELECT entry_key, is_prefix, upload_id, created_at FROM entries",
+    );
+    if let Some(key_marker) = &query.key_marker {
+        if let Some(upload_id_marker) = &query.upload_id_marker {
+            sql.push(" WHERE (entry_key COLLATE \"C\" > ")
+                .push_bind(key_marker.clone())
+                .push(" COLLATE \"C\") OR (entry_key COLLATE \"C\" = ")
+                .push_bind(key_marker.clone())
+                .push(" COLLATE \"C\" AND NOT is_prefix AND upload_id COLLATE \"C\" > ")
+                .push_bind(upload_id_marker.clone())
+                .push(" COLLATE \"C\")");
+        } else {
+            sql.push(" WHERE entry_key COLLATE \"C\" > ")
+                .push_bind(key_marker.clone())
+                .push(" COLLATE \"C\"");
+        }
+    }
+    sql.push(
+        " ORDER BY entry_key COLLATE \"C\" ASC, is_prefix ASC, \
+                  upload_id COLLATE \"C\" ASC NULLS LAST LIMIT ",
+    )
+    .push_bind(fetch_limit)
+    .push(
+        ") SELECT entry_key, is_prefix, upload_id, created_at FROM paged \
+         ORDER BY entry_key COLLATE \"C\" ASC, is_prefix ASC, \
+                  upload_id COLLATE \"C\" ASC NULLS LAST",
+    );
+    sql
+}
+
+#[async_trait]
+impl S3ListingRepository for PostgresRepository {
+    async fn list_s3_object_versions_page(
+        &self,
+        application_id: ApplicationId,
+        query: &S3ObjectVersionListQuery,
+    ) -> Result<S3ObjectVersionPage, RepositoryError> {
+        let Some(fetch_limit) = s3_version_fetch_limit(query)? else {
+            return Ok(S3ObjectVersionPage::default());
+        };
+        let marker_generation = match (&query.key_marker, &query.version_id_marker) {
+            (Some(key_marker), Some(version_id_marker)) => Some(
+                sqlx::query_scalar::<_, i64>(FIND_LIST_VERSION_MARKER_GENERATION_SQL)
+                    .bind(application_id.as_uuid())
+                    .bind(query.bucket_id.as_uuid())
+                    .bind(key_marker)
+                    .bind(version_id_marker.as_str())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(database_error)?
+                    .ok_or(RepositoryError::NotFound)?,
+            ),
+            _ => None,
+        };
+        let mut sql = build_list_s3_object_versions_query(
+            application_id,
+            query,
+            marker_generation,
+            fetch_limit,
+        );
+        let mut rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
+        let has_more = rows.len() > query.limit;
+        rows.truncate(query.limit);
+        let (next_key_marker, next_version_id_marker) = if has_more {
+            let row = rows
+                .last()
+                .expect("a truncated positive-limit page is non-empty");
+            let key = row
+                .try_get::<String, _>("entry_key")
+                .map_err(database_error)?;
+            let version_id = row
+                .try_get::<Option<String>, _>("external_version_id")
+                .map_err(database_error)?
+                .map(S3VersionId::new)
+                .transpose()
+                .map_err(invariant)?;
+            (Some(key), version_id)
+        } else {
+            (None, None)
+        };
+        let mut page = S3ObjectVersionPage {
+            next_key_marker,
+            next_version_id_marker,
+            ..S3ObjectVersionPage::default()
+        };
+        for row in rows {
+            let key = row
+                .try_get::<String, _>("entry_key")
+                .map_err(database_error)?;
+            if row
+                .try_get::<bool, _>("is_prefix")
+                .map_err(database_error)?
+            {
+                page.common_prefixes.push(key);
+                continue;
+            }
+            let is_latest = row.try_get("is_latest").map_err(database_error)?;
+            let version = row_to_object_version(row)?;
+            if version.state() != ObjectVersionState::Committed {
+                return Err(invariant(
+                    "ListObjectVersions query returned a non-committed version",
+                ));
+            }
+            page.items.push(S3ObjectVersionListItem {
+                key,
+                version,
+                is_latest,
+            });
+        }
+        Ok(page)
+    }
+
+    async fn list_s3_multipart_uploads_page(
+        &self,
+        application_id: ApplicationId,
+        query: &S3MultipartUploadListQuery,
+    ) -> Result<S3MultipartUploadPage, RepositoryError> {
+        let Some(fetch_limit) = s3_multipart_upload_fetch_limit(query)? else {
+            return Ok(S3MultipartUploadPage::default());
+        };
+        let mut sql = build_list_s3_multipart_uploads_query(application_id, query, fetch_limit);
+        let mut rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
+        let has_more = rows.len() > query.limit;
+        rows.truncate(query.limit);
+        let (next_key_marker, next_upload_id_marker) = if has_more {
+            let row = rows
+                .last()
+                .expect("a truncated positive-limit page is non-empty");
+            (
+                Some(
+                    row.try_get::<String, _>("entry_key")
+                        .map_err(database_error)?,
+                ),
+                row.try_get("upload_id").map_err(database_error)?,
+            )
+        } else {
+            (None, None)
+        };
+        let mut page = S3MultipartUploadPage {
+            next_key_marker,
+            next_upload_id_marker,
+            ..S3MultipartUploadPage::default()
+        };
+        for row in rows {
+            let key = row
+                .try_get::<String, _>("entry_key")
+                .map_err(database_error)?;
+            if row
+                .try_get::<bool, _>("is_prefix")
+                .map_err(database_error)?
+            {
+                page.common_prefixes.push(key);
+                continue;
+            }
+            page.items.push(S3MultipartUploadListItem {
+                key,
+                upload_id: row.try_get("upload_id").map_err(database_error)?,
+                initiated_at: row.try_get("created_at").map_err(database_error)?,
+            });
+        }
+        Ok(page)
+    }
 }
 
 #[async_trait]
@@ -345,6 +716,48 @@ impl S3BucketRepository for PostgresRepository {
         Ok(configuration)
     }
 
+    async fn replace_s3_bucket_object_lock(
+        &self,
+        application_id: ApplicationId,
+        name: &str,
+        default_retention: Option<DefaultRetention>,
+        updated_at: OffsetDateTime,
+    ) -> Result<BucketS3Configuration, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let row =
+            sqlx::query("SELECT * FROM buckets WHERE application_id = $1 AND name = $2 FOR UPDATE")
+                .bind(application_id.as_uuid())
+                .bind(name)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .ok_or(RepositoryError::NotFound)?;
+        let mut configuration = row_to_s3_configuration(&row)?;
+        let changed = configuration
+            .replace_object_lock_configuration(default_retention, updated_at)
+            .map_err(invariant)?;
+        if changed {
+            let default_retention = configuration.default_retention().map(Json);
+            sqlx::query(
+                "UPDATE buckets
+                 SET versioning_status = $1, object_lock_enabled = TRUE,
+                     default_retention = $2, s3_configuration_revision = $3, updated_at = $4
+                 WHERE application_id = $5 AND name = $6",
+            )
+            .bind(versioning_status_name(configuration.versioning_status()))
+            .bind(default_retention)
+            .bind(as_i64(configuration.revision())?)
+            .bind(postgres_time(configuration.updated_at()))
+            .bind(application_id.as_uuid())
+            .bind(name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(configuration)
+    }
+
     async fn replace_s3_bucket_lifecycle(
         &self,
         application_id: ApplicationId,
@@ -488,6 +901,28 @@ impl S3ObjectRepository for PostgresRepository {
         row.map(row_to_object_version).transpose()
     }
 
+    async fn find_committed_s3_object_version_for_application(
+        &self,
+        application_id: ApplicationId,
+        version_id: ObjectVersionId,
+    ) -> Result<Option<S3ObjectVersionRead>, RepositoryError> {
+        let row = sqlx::query(FIND_COMMITTED_OBJECT_VERSION_FOR_APPLICATION_SQL)
+            .bind(version_id.as_uuid())
+            .bind(application_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?;
+        row.map(|row| {
+            let object_key = row.try_get("preview_object_key").map_err(database_error)?;
+            let version = row_to_object_version(row)?;
+            Ok(S3ObjectVersionRead {
+                object_key,
+                version,
+            })
+        })
+        .transpose()
+    }
+
     async fn find_current_s3_object_version(
         &self,
         object_id: ObjectId,
@@ -520,6 +955,157 @@ impl S3ObjectRepository for PostgresRepository {
         let outcome = delete_s3_object_in_transaction(&mut transaction, command).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(outcome)
+    }
+
+    async fn put_s3_object_lock(
+        &self,
+        command: &PutS3ObjectLockCommand,
+    ) -> Result<PutS3ObjectLockOutcome, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let object_lock_enabled = sqlx::query_scalar::<_, bool>(
+            "SELECT object_lock_enabled FROM buckets
+             WHERE application_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(command.application_id.as_uuid())
+        .bind(command.bucket_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(RepositoryError::NotFound)?;
+        if !object_lock_enabled {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(PutS3ObjectLockOutcome::ObjectLockNotEnabled);
+        }
+
+        let object = sqlx::query(
+            "SELECT * FROM objects
+             WHERE application_id = $1 AND bucket_id = $2 AND object_key = $3
+             FOR UPDATE",
+        )
+        .bind(command.application_id.as_uuid())
+        .bind(command.bucket_id.as_uuid())
+        .bind(&command.object_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .map(row_to_s3_object)
+        .transpose()?;
+        let Some(object) = object else {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(if command.version_id.is_some() {
+                PutS3ObjectLockOutcome::VersionNotFound
+            } else {
+                PutS3ObjectLockOutcome::ObjectNotFound
+            });
+        };
+
+        let version_row = if let Some(version_id) = &command.version_id {
+            sqlx::query(
+                "SELECT * FROM object_versions
+                 WHERE application_id = $1 AND bucket_id = $2 AND object_id = $3
+                   AND external_version_id = $4 AND state = 'committed'
+                   AND superseded_at IS NULL
+                 FOR UPDATE",
+            )
+            .bind(command.application_id.as_uuid())
+            .bind(command.bucket_id.as_uuid())
+            .bind(object.id().as_uuid())
+            .bind(version_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+        } else if let Some(version_id) = object.current_version_id() {
+            sqlx::query(
+                "SELECT * FROM object_versions
+                 WHERE application_id = $1 AND bucket_id = $2 AND object_id = $3
+                   AND id = $4 AND state = 'committed' AND superseded_at IS NULL
+                 FOR UPDATE",
+            )
+            .bind(command.application_id.as_uuid())
+            .bind(command.bucket_id.as_uuid())
+            .bind(object.id().as_uuid())
+            .bind(version_id.as_uuid())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+        } else {
+            None
+        };
+        let Some(version_row) = version_row else {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(if command.version_id.is_some() {
+                PutS3ObjectLockOutcome::VersionNotFound
+            } else {
+                PutS3ObjectLockOutcome::ObjectNotFound
+            });
+        };
+        let version = row_to_object_version(version_row)?;
+        if version.is_delete_marker() {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(PutS3ObjectLockOutcome::DeleteMarker {
+                version_id: version.external_version_id().clone(),
+                is_current: object.current_version_id() == Some(version.id()),
+            });
+        }
+
+        let updated = match command.mutation {
+            S3ObjectLockMutation::Retention {
+                retention,
+                bypass_governance,
+            } => match version.with_retention_update(
+                retention,
+                command.updated_at,
+                bypass_governance,
+            ) {
+                Ok(updated) => updated,
+                Err(ObjectRetentionUpdateError::RetainUntilMustBeFuture) => {
+                    return Ok(PutS3ObjectLockOutcome::InvalidRetention);
+                }
+                Err(ObjectRetentionUpdateError::ComplianceRetentionLocked) => {
+                    return Ok(PutS3ObjectLockOutcome::RetentionLocked(
+                        S3DeleteLockReason::ComplianceRetention,
+                    ));
+                }
+                Err(ObjectRetentionUpdateError::GovernanceRetentionLocked) => {
+                    return Ok(PutS3ObjectLockOutcome::RetentionLocked(
+                        S3DeleteLockReason::GovernanceRetention,
+                    ));
+                }
+                Err(ObjectRetentionUpdateError::InvalidVersion) => {
+                    return Ok(PutS3ObjectLockOutcome::VersionNotFound);
+                }
+            },
+            S3ObjectLockMutation::LegalHold(legal_hold) => version
+                .with_legal_hold_update(legal_hold)
+                .map_err(invariant)?,
+        };
+        let retention_mode = updated
+            .retention()
+            .map(|retention| retention_mode_name(retention.mode()));
+        let retain_until = updated
+            .retention()
+            .map(|retention| postgres_time(retention.retain_until()));
+        let result = sqlx::query(
+            "UPDATE object_versions
+             SET retention_mode = $1, retain_until = $2, legal_hold = $3
+             WHERE id = $4 AND object_id = $5 AND application_id = $6 AND bucket_id = $7
+               AND state = 'committed' AND superseded_at IS NULL",
+        )
+        .bind(retention_mode)
+        .bind(retain_until)
+        .bind(updated.legal_hold())
+        .bind(updated.id().as_uuid())
+        .bind(updated.object_id().as_uuid())
+        .bind(command.application_id.as_uuid())
+        .bind(command.bucket_id.as_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() != 1 {
+            return Err(RepositoryError::Conflict);
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(PutS3ObjectLockOutcome::Updated(updated))
     }
     async fn create_s3_object_with_version(
         &self,
@@ -1177,6 +1763,7 @@ impl S3UploadIntentRepository for PostgresRepository {
     ) -> Result<S3Object, RepositoryError> {
         validate_token(lease_token)?;
         commit.validate()?;
+        let mut commit = commit;
         let committed_at = postgres_time(commit.committed_at);
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let intent = lock_upload_intent(&mut transaction, intent_id).await?;
@@ -1188,6 +1775,7 @@ impl S3UploadIntentRepository for PostgresRepository {
         {
             return Err(RepositoryError::Conflict);
         }
+        freeze_postgres_object_lock(&mut transaction, &mut commit).await?;
 
         let expected = ExpectedObjectIdentity {
             application_id: intent.application_id(),
@@ -1332,6 +1920,7 @@ impl S3UploadIntentRepository for PostgresRepository {
         validate_token(upload_id)?;
         validate_token(completion_token)?;
         commit.validate()?;
+        let mut commit = commit;
         validate_multipart_commit_payload(&commit, final_entity_tag, final_checksum)?;
         if !is_multipart_etag(final_entity_tag.as_str())
             || final_checksum.algorithm() != ChecksumAlgorithm::Sha256
@@ -1486,6 +2075,8 @@ impl S3UploadIntentRepository for PostgresRepository {
         {
             return Err(RepositoryError::Conflict);
         }
+
+        freeze_postgres_object_lock(&mut transaction, &mut commit).await?;
 
         let object =
             commit_object_version_in_transaction(&mut transaction, &commit, expected).await?;
@@ -2063,6 +2654,48 @@ async fn supersede_active_null_version(
     }
 }
 
+async fn freeze_postgres_object_lock(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    commit: &mut S3ObjectVersionCommit,
+) -> Result<(), RepositoryError> {
+    let row = sqlx::query(
+        "SELECT * FROM buckets
+         WHERE application_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(commit.version.application_id().as_uuid())
+    .bind(commit.version.bucket_id().as_uuid())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or(RepositoryError::NotFound)?;
+    let configuration = row_to_s3_configuration(&row)?;
+    let requested = commit.requested_retention.is_some() || commit.requested_legal_hold.is_some();
+    if requested && !configuration.object_lock_enabled() {
+        return Err(RepositoryError::Conflict);
+    }
+    let retention = if configuration.object_lock_enabled() {
+        match (
+            commit.requested_retention,
+            configuration.default_retention(),
+        ) {
+            (Some(retention), _) => Some(retention),
+            (None, Some(default_retention)) => Some(
+                default_retention
+                    .for_object_at(commit.committed_at)
+                    .map_err(invariant)?,
+            ),
+            (None, None) => None,
+        }
+    } else {
+        None
+    };
+    commit.version = commit
+        .version
+        .with_initial_object_lock(retention, commit.requested_legal_hold.unwrap_or(false))
+        .map_err(invariant)?;
+    Ok(())
+}
+
 async fn commit_object_version_in_transaction(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     commit: &S3ObjectVersionCommit,
@@ -2553,7 +3186,7 @@ fn row_to_object_version(row: PgRow) -> Result<ObjectVersion, RepositoryError> {
     let payload = if is_delete_marker {
         ObjectVersionPayload::DeleteMarker
     } else {
-        ObjectVersionPayload::Object(
+        ObjectVersionPayload::Object(Box::new(
             StoredObjectVersion::new(
                 required_text(&row, "storage_backend")?,
                 required_text(&row, "storage_key")?,
@@ -2572,7 +3205,7 @@ fn row_to_object_version(row: PgRow) -> Result<ObjectVersion, RepositoryError> {
                 row_checksum(&row, "checksum_algorithm", "checksum_value")?,
             )
             .map_err(invariant)?,
-        )
+        ))
     };
     let retention_mode = row
         .try_get::<Option<String>, _>("retention_mode")
@@ -2942,6 +3575,132 @@ mod tests {
     }
 
     #[test]
+    fn list_object_versions_sql_is_bucket_scoped_stable_and_media_free() {
+        let query = S3ObjectVersionListQuery {
+            bucket_id: BucketId::new(),
+            prefix: "photos/".into(),
+            key_marker: Some("photos/a.jpg".into()),
+            version_id_marker: Some(S3VersionId::new("version-2").expect("version marker")),
+            delimiter: true,
+            limit: 1_000,
+        };
+        let sql = build_list_s3_object_versions_query(ApplicationId::new(), &query, Some(2), 1_001);
+        let sql = sql.sql();
+        let sql = sql.as_ref();
+
+        assert!(sql.contains("FROM objects AS logical_object"));
+        assert!(sql.contains("JOIN object_versions AS version"));
+        assert!(sql.contains("version.superseded_at IS NULL"));
+        assert!(sql.contains("version.state = 'committed'"));
+        assert!(sql.contains("logical_object.current_version_id = version.id AS is_latest"));
+        assert!(sql.contains("GROUP BY split_part(relative_key, '/', 1)"));
+        assert!(sql.contains("entry_key COLLATE \"C\" >"));
+        assert!(sql.contains("entry_key COLLATE \"C\" ="));
+        assert!(sql.contains("generation <"));
+        assert!(sql.contains("generation DESC NULLS LAST"));
+        assert!(sql.contains("LIMIT"));
+        assert!(!sql.contains(" media "));
+        assert!(FIND_LIST_VERSION_MARKER_GENERATION_SQL.contains("external_version_id = $4"));
+        assert!(FIND_LIST_VERSION_MARKER_GENERATION_SQL.contains("superseded_at IS NULL"));
+    }
+
+    #[test]
+    fn list_object_versions_limit_and_key_only_marker_are_explicit() {
+        let query = S3ObjectVersionListQuery {
+            bucket_id: BucketId::new(),
+            prefix: String::new(),
+            key_marker: Some("before".into()),
+            version_id_marker: None,
+            delimiter: false,
+            limit: 10,
+        };
+        let sql = build_list_s3_object_versions_query(ApplicationId::new(), &query, None, 11);
+        let sql = sql.sql();
+        let sql = sql.as_ref();
+        assert!(sql.contains("WHERE entry_key COLLATE \"C\" >"));
+        assert!(!sql.contains("generation <"));
+        assert!(!sql.contains("filtered AS"));
+        assert_eq!(
+            s3_version_fetch_limit(&S3ObjectVersionListQuery {
+                limit: 0,
+                ..query.clone()
+            }),
+            Ok(None)
+        );
+        assert_eq!(
+            s3_version_fetch_limit(&S3ObjectVersionListQuery {
+                limit: 1_000,
+                ..query.clone()
+            }),
+            Ok(Some(1_001))
+        );
+        assert!(matches!(
+            s3_version_fetch_limit(&S3ObjectVersionListQuery {
+                limit: 1_001,
+                ..query
+            }),
+            Err(RepositoryError::Invariant(_))
+        ));
+    }
+
+    #[test]
+    fn list_multipart_uploads_sql_uses_active_database_state_and_byte_order() {
+        let query = S3MultipartUploadListQuery {
+            bucket_id: BucketId::new(),
+            prefix: "uploads/".into(),
+            key_marker: Some("uploads/movie.mp4".into()),
+            upload_id_marker: Some("upload-002".into()),
+            delimiter: true,
+            limit: 1_000,
+            as_of: OffsetDateTime::UNIX_EPOCH,
+        };
+        let sql = build_list_s3_multipart_uploads_query(ApplicationId::new(), &query, 1_001);
+        let sql = sql.sql();
+        let sql = sql.as_ref();
+
+        assert!(sql.contains("FROM s3_multipart_uploads"));
+        assert!(sql.contains("state IN ('pending', 'completing')"));
+        assert!(sql.contains("expires_at >"));
+        assert!(sql.contains("GROUP BY split_part(relative_key, '/', 1)"));
+        assert!(sql.contains("entry_key COLLATE \"C\" >"));
+        assert!(sql.contains("upload_id COLLATE \"C\" >"));
+        assert!(sql.contains("upload_id COLLATE \"C\" ASC NULLS LAST"));
+        assert!(sql.contains("LIMIT"));
+        for forbidden in ["object_store", "storage_key", " media "] {
+            assert!(
+                !sql.contains(forbidden),
+                "forbidden listing dependency: {forbidden}"
+            );
+        }
+        assert_eq!(
+            s3_multipart_upload_fetch_limit(&S3MultipartUploadListQuery {
+                limit: 0,
+                ..query.clone()
+            }),
+            Ok(None)
+        );
+        assert_eq!(s3_multipart_upload_fetch_limit(&query), Ok(Some(1_001)));
+    }
+
+    #[test]
+    fn upload_id_marker_without_key_marker_does_not_change_sql_cursor() {
+        let query = S3MultipartUploadListQuery {
+            bucket_id: BucketId::new(),
+            prefix: String::new(),
+            key_marker: None,
+            upload_id_marker: Some("ignored-by-s3".into()),
+            delimiter: false,
+            limit: 10,
+            as_of: OffsetDateTime::UNIX_EPOCH,
+        };
+        let sql = build_list_s3_multipart_uploads_query(ApplicationId::new(), &query, 11);
+        let sql = sql.sql();
+        let sql = sql.as_ref();
+        assert!(!sql.contains("WHERE entry_key COLLATE"));
+        assert!(!sql.contains("upload_id COLLATE \"C\" >"));
+    }
+
+    #[test]
     fn upload_intent_sql_matches_staging_contract() {
         let migration = include_str!("../migrations/0012_s3_object_versions.sql");
         assert!(migration.contains("proposed_version_id UUID NOT NULL UNIQUE"));
@@ -3091,6 +3850,8 @@ mod tests {
                 max_attempts: 3,
                 created_at: OffsetDateTime::UNIX_EPOCH,
             }],
+            requested_retention: None,
+            requested_legal_hold: None,
         }
     }
 
@@ -3202,6 +3963,8 @@ mod tests {
             committed_at: OffsetDateTime::UNIX_EPOCH,
             replaced_null_version_id: Some(previous.id()),
             gc_tasks: Vec::new(),
+            requested_retention: None,
+            requested_legal_hold: None,
         };
 
         assert_eq!(

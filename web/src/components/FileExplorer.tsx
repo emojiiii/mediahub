@@ -1,3 +1,4 @@
+import { useQuery } from '@tanstack/react-query'
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from 'react'
 import {
   Archive,
@@ -18,7 +19,7 @@ import {
   Trash2,
 } from 'lucide-react'
 
-import type { ObjectItem } from '../api'
+import { api, type ObjectItem, type VariantParams } from '../api'
 
 export type FileKind =
   | 'image'
@@ -120,6 +121,177 @@ function joinClasses(...classes: Array<string | false | null | undefined>): stri
   return classes.filter(Boolean).join(' ')
 }
 
+const MAX_THUMBNAIL_URL_REQUESTS = 4
+const THUMBNAIL_PREFETCH_MARGIN = '240px 0px'
+const THUMBNAIL_VARIANT_PARAMS: VariantParams = {
+  width: 384,
+  height: 384,
+  fit: 'inside',
+  quality: 68,
+  format: 'webp',
+  blur: 0,
+  crop: 'center',
+  background: 'ffffff',
+}
+const VARIANT_IMAGE_MIME_TYPES = new Set([
+  'image/bmp',
+  'image/gif',
+  'image/jpeg',
+  'image/png',
+  'image/tiff',
+  'image/vnd.microsoft.icon',
+  'image/webp',
+  'image/x-icon',
+])
+let activeThumbnailUrlRequests = 0
+const queuedThumbnailUrlRequests: Array<() => void> = []
+
+function normalizedMimeType(value: string): string {
+  return value.trim().toLowerCase().split(';', 1)[0] ?? ''
+}
+
+function drainThumbnailUrlQueue() {
+  while (activeThumbnailUrlRequests < MAX_THUMBNAIL_URL_REQUESTS) {
+    const start = queuedThumbnailUrlRequests.shift()
+    if (!start) return
+    start()
+  }
+}
+
+function abortError(): DOMException {
+  return new DOMException('Thumbnail URL request was cancelled', 'AbortError')
+}
+
+function withThumbnailUrlRequestLimit<T>(request: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let started = false
+    let settled = false
+
+    const removeAbortListener = () => signal.removeEventListener('abort', cancel)
+    const finish = () => {
+      activeThumbnailUrlRequests -= 1
+      drainThumbnailUrlQueue()
+    }
+    const start = () => {
+      if (settled) return
+      started = true
+      activeThumbnailUrlRequests += 1
+      Promise.resolve()
+        .then(request)
+        .then((value) => {
+          if (settled) return
+          settled = true
+          removeAbortListener()
+          resolve(value)
+        }, (error: unknown) => {
+          if (settled) return
+          settled = true
+          removeAbortListener()
+          reject(error)
+        })
+        .finally(finish)
+    }
+    function cancel() {
+      if (settled) return
+      settled = true
+      removeAbortListener()
+      if (!started) {
+        const queuedIndex = queuedThumbnailUrlRequests.indexOf(start)
+        if (queuedIndex >= 0) queuedThumbnailUrlRequests.splice(queuedIndex, 1)
+      }
+      reject(abortError())
+    }
+
+    if (signal.aborted) {
+      cancel()
+    } else {
+      signal.addEventListener('abort', cancel, { once: true })
+      if (activeThumbnailUrlRequests < MAX_THUMBNAIL_URL_REQUESTS) start()
+      else queuedThumbnailUrlRequests.push(start)
+    }
+  })
+}
+
+function useNearViewport<T extends HTMLElement>() {
+  const ref = useRef<T>(null)
+  const [isNearViewport, setIsNearViewport] = useState(false)
+
+  useEffect(() => {
+    if (isNearViewport || !ref.current) return
+    if (typeof IntersectionObserver === 'undefined') {
+      setIsNearViewport(true)
+      return
+    }
+
+    const node = ref.current
+    const scrollRoot = node.closest<HTMLElement>('[data-testid="object-explorer-scroll"]')
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return
+      setIsNearViewport(true)
+      observer.disconnect()
+    }, { root: scrollRoot, rootMargin: THUMBNAIL_PREFETCH_MARGIN })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [isNearViewport])
+
+  return { ref, isNearViewport }
+}
+
+function ImageThumbnail({ item }: { item: ObjectItem }) {
+  const { ref, isNearViewport } = useNearViewport<HTMLDivElement>()
+  const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
+  const [failedUrl, setFailedUrl] = useState<string | null>(null)
+  const mimeType = normalizedMimeType(item.type)
+  const useVariant = VARIANT_IMAGE_MIME_TYPES.has(mimeType)
+  const thumbnailUrl = useQuery({
+    queryKey: ['object-thumbnail-url', 'v2', item.id, item.revision, item.visibility, mimeType, useVariant ? THUMBNAIL_VARIANT_PARAMS : 'original'],
+    queryFn: async ({ signal }) => {
+      const result = await withThumbnailUrlRequestLimit(
+        () => useVariant
+          ? api.getVariantUrl(item.id, THUMBNAIL_VARIANT_PARAMS)
+          : item.visibility === '公开'
+            ? api.getPublicUrl(item.id)
+            : api.getSignedUrl(item.id),
+        signal,
+      )
+      if (!result.url.trim()) throw new Error('Thumbnail URL is empty')
+      return result
+    },
+    enabled: isNearViewport,
+    staleTime: item.visibility === '公开' ? Infinity : 4 * 60 * 1000,
+    gcTime: item.visibility === '公开' ? 30 * 60 * 1000 : 10 * 60 * 1000,
+    retry: false,
+    refetchOnWindowFocus: false,
+  })
+  const url = isNearViewport ? thumbnailUrl.data?.url : undefined
+  const imageLoaded = Boolean(url && loadedUrl === url)
+  const imageFailed = thumbnailUrl.isError || Boolean(url && failedUrl === url)
+
+  return (
+    <div ref={ref} className="absolute inset-0">
+      {!imageLoaded && !imageFailed && (
+        <div data-testid={`thumbnail-loading-${item.id}`} aria-hidden="true" className="absolute inset-0 animate-pulse bg-fuchsia-100/55 dark:bg-fuchsia-950/25">
+          <div className="absolute inset-x-[18%] bottom-[18%] h-1.5 rounded-full bg-fuchsia-300/25 dark:bg-fuchsia-300/10" />
+        </div>
+      )}
+      {url && !imageFailed && (
+        <img
+          src={url}
+          alt={`${item.name} 缩略图`}
+          loading="lazy"
+          decoding="async"
+          draggable={false}
+          referrerPolicy="no-referrer"
+          className={joinClasses('absolute inset-0 size-full object-cover transition-opacity duration-200', imageLoaded ? 'opacity-100' : 'opacity-0')}
+          onLoad={() => setLoadedUrl(url)}
+          onError={() => setFailedUrl(url)}
+        />
+      )}
+      {imageFailed && <FileImage data-testid={`thumbnail-fallback-${item.id}`} aria-hidden="true" className="absolute inset-0 m-auto size-12 text-fuchsia-700 drop-shadow-sm dark:text-fuchsia-300" strokeWidth={1.45} />}
+    </div>
+  )
+}
+
 function FilePreview({ item }: { item: ObjectItem }) {
   const kind = classifyMimeType(item.type)
   const presentation = KIND_PRESENTATION[kind]
@@ -128,8 +300,10 @@ function FilePreview({ item }: { item: ObjectItem }) {
 
   return (
     <div className={joinClasses('relative grid overflow-hidden rounded-xl ring-1 ring-inset ring-black/5 dark:ring-white/5', height, presentation.preview)}>
-      <div aria-hidden="true" className="absolute inset-0 opacity-25 [background-image:linear-gradient(to_right,currentColor_1px,transparent_1px),linear-gradient(to_bottom,currentColor_1px,transparent_1px)] [background-size:24px_24px]" />
-      <Icon aria-hidden="true" className={joinClasses('relative m-auto size-12 drop-shadow-sm', presentation.color)} strokeWidth={1.45} />
+      {kind === 'image' ? <ImageThumbnail item={item} /> : <>
+        <div aria-hidden="true" className="absolute inset-0 opacity-25 [background-image:linear-gradient(to_right,currentColor_1px,transparent_1px),linear-gradient(to_bottom,currentColor_1px,transparent_1px)] [background-size:24px_24px]" />
+        <Icon aria-hidden="true" className={joinClasses('relative m-auto size-12 drop-shadow-sm', presentation.color)} strokeWidth={1.45} />
+      </>}
       {kind === 'video' && <span className="absolute inset-0 m-auto grid size-9 place-items-center rounded-full bg-black/65 text-white shadow-lg"><Play aria-hidden="true" className="ml-0.5 size-4 fill-current" /></span>}
       <span className="absolute bottom-2 left-2 rounded-md bg-white/75 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-slate-700 shadow-sm backdrop-blur dark:bg-black/45 dark:text-slate-200">{extension(item.name)}</span>
     </div>

@@ -108,3 +108,40 @@
 - Silo 真实 bucket 证明 generic S3 不应假设普通 CopyObject 支持 destination create-only；PrismArk 现在使用条件 Multipart Copy 建立不可覆盖语义。
 - Multipart Copy 不保留 attributes，必须在取得随机不可变 final key 的所有权后执行同源 server-side metadata repair，并在重试时先比较字节，避免把不同对象误判为幂等提交。
 - `pgsty/silo:latest` 上的完整 ObjectStore 合同和 Presigned PUT 已通过，验证了 Local/S3 共享端口在真实兼容后端上的关键行为。
+# S3 Listing vertical slice findings (2026-08-08)
+
+- Baseline is clean `bdd6323` on `master`.
+- Existing ListObjectsV2 is split between `s3_http_core.rs`, `s3_list.rs`, `s3_xml.rs`, and `S3ObjectRepository`.
+- `S3ObjectRepository` already exposes a partial object-version listing path used internally, but no S3 ListObjectVersions HTTP contract exists yet.
+- Multipart persistence is in `s3_multipart_uploads`; listing must read upload rows and never enumerate object storage.
+- `S3ObjectRepository::list_s3_object_versions` currently lists versions for one internal `ObjectId`; the S3 API needs a new bucket-scoped page DTO/query instead of looping over objects.
+- Existing `S3ObjectListQuery` validates the 1000-item cap and PostgreSQL ListObjectsV2 already follows the desired limit+1 pagination pattern.
+- Existing ListObjectsV2 query parsing/rendering lives in `s3_list.rs`, while generic S3 XML builders live in `s3_xml.rs`; the new version/multipart list XML can share the latter's XML escaping helpers.
+- Existing HTTP bucket handler is centralized in `s3_http_core.rs`; classifier query-key allowlists in that file must distinguish `versions` and `uploads` before auth/dispatch.
+- ListObjectVersions must page a combined byte-ordered stream: object key ascending, generation descending within a key, with delete markers included and superseded null rows excluded. `objects.current_version_id` determines `IsLatest`.
+- ListMultipartUploads must include active `pending`/`completing` rows from `s3_multipart_uploads`, ordered by key then upload ID, and must not call `ObjectStore`.
+- A dedicated `S3ListingRepository` in app `s3_repository.rs` avoids expanding the existing per-object audit method and avoids forcing in-memory object-store implementations to emulate PostgreSQL bucket listing.
+- The new app types will need a minimal root re-export in `mediahub-app/src/lib.rs`; this is the only anticipated source write outside the requested listing file set.
+- `PostgresRepository` is stored concretely in `AppState`, so a new exported trait can be called directly without changing router/state plumbing.
+- `object_versions.generation` is the stable per-key chronology; timestamps are presentation fields and must not be used as the pagination tiebreaker.
+- Multipart upload IDs are persisted opaque strings, so marker comparison must use PostgreSQL `COLLATE "C"` rather than locale ordering.
+- PostgreSQL listing DTO/query code now compiles. Version-marker existence is checked with a parameterized lookup so an unknown paired marker can become S3 `InvalidArgument` instead of silently skipping data.
+- Both SQL builders produce delimiter prefixes and concrete rows in one CTE stream, apply markers before `LIMIT`, and return only metadata columns/object-version rows.
+- `ListMultipartUploads` filters `state IN ('pending', 'completing')` and `expires_at > as_of`; completed, aborted, and logically expired uploads are invisible.
+- HTTP compilation passes after adding pre-auth classification, strict operation-specific parameter rejection, marker parsing, handlers, and XML conversion.
+- Standard Multipart behavior is preserved for an `upload-id-marker` without `key-marker`: it is echoed but ignored by the repository cursor.
+- The version handler maps an unknown paired marker to `InvalidArgument`; all other repository failures remain service errors.
+- Real PostgreSQL 17 execution validates version ordering/resume, null/delete-marker `IsLatest`, delimiter prefixes, invalid marker handling, multipart key/upload ordering, expiry/state filtering, and marker resume.
+- The disposable PostgreSQL container used an ephemeral loopback port and was removed after the contract passed; no volume was created.
+
+## 第二阶段实现结论（2026-08-08）
+
+- Silo 源码最终成功克隆到 `.research/silo`，HEAD 为 `100e2e5`；前期“无法克隆”的记录只是当时的网络失败，不再代表当前状态。
+- Operation classifier 必须把 `x-amz-copy-source`、`?versions`、`?uploads`、`?object-lock` 以及对象级 lock subresource 放在普通 Put/Get/Multipart 分支之前，否则会出现危险的误路由或假成功。
+- CopyObject 与 UploadPartCopy 复用 UploadIntent → ObjectVersion 提交链路；复制结果不能绕过 checksum、版本、quota、GC 和审计边界。
+- ListObjectVersions 的 `IsLatest` 只能由 `objects.current_version_id` 推导；版本时间戳不能作为分页游标，稳定顺序使用 key byte order + generation。
+- ListMultipartUploads 只列 pending/completing 且未过期的持久化 upload；对象存储扫描既不正确也无法稳定分页。
+- WebDAV 作为兼容层可以复用 ObjectVersion 服务，但 MOVE 在没有条件化源删除事务前不应通过“COPY 后普通 DELETE”冒充原子移动。
+- 预览接口按 application_id + version_id 查询 committed data version，delete marker 与跨租户统一 404；这比从 legacy Media 反查更符合不可变预览语义。
+- 文件浏览器若直接加载原图会把产品差异化能力变成带宽风险；使用规范化 Variant 缩略图、IntersectionObserver 和并发闸门更符合 PrismArk 的定位。
+- 当前已通过 Silo 真实 ObjectStore 合同，但本机仍未安装 AWS CLI、mcli/mc 或 rclone，因此不能把 native-client 脚本存在等同于这些客户端已实测通过。

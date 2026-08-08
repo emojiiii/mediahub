@@ -9,6 +9,7 @@ enum S3BucketPutOperation {
     CreateBucket,
     PutVersioning,
     PutLifecycle,
+    PutObjectLock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,7 +21,8 @@ enum S3BucketDeleteOperation {
 fn classify_s3_bucket_put(uri: &Uri, request_id: &str) -> Result<S3BucketPutOperation, S3ApiError> {
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
-    if versioning && lifecycle {
+    let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
+    if usize::from(versioning) + usize::from(lifecycle) + usize::from(object_lock) > 1 {
         return Err(S3ApiError::invalid_request(
             "Bucket configuration subresources cannot be combined.",
             uri.path(),
@@ -31,6 +33,8 @@ fn classify_s3_bucket_put(uri: &Uri, request_id: &str) -> Result<S3BucketPutOper
         S3BucketPutOperation::PutVersioning
     } else if lifecycle {
         S3BucketPutOperation::PutLifecycle
+    } else if object_lock {
+        S3BucketPutOperation::PutObjectLock
     } else {
         S3BucketPutOperation::CreateBucket
     })
@@ -42,7 +46,8 @@ fn classify_s3_bucket_delete(
 ) -> Result<S3BucketDeleteOperation, S3ApiError> {
     let versioning = s3_query_flag(uri, "versioning", request_id)?;
     let lifecycle = s3_query_flag(uri, "lifecycle", request_id)?;
-    if versioning && lifecycle {
+    let object_lock = s3_query_flag(uri, "object-lock", request_id)?;
+    if usize::from(versioning) + usize::from(lifecycle) + usize::from(object_lock) > 1 {
         return Err(S3ApiError::invalid_request(
             "Bucket configuration subresources cannot be combined.",
             uri.path(),
@@ -52,6 +57,13 @@ fn classify_s3_bucket_delete(
     if versioning {
         return Err(S3ApiError::method_not_allowed(
             "DeleteBucketVersioning is not an S3 operation.",
+            uri.path(),
+            request_id,
+        ));
+    }
+    if object_lock {
+        return Err(S3ApiError::method_not_allowed(
+            "Object Lock cannot be disabled after it has been enabled.",
             uri.path(),
             request_id,
         ));
@@ -75,6 +87,28 @@ pub(super) async fn s3_bucket_get(
     match operation {
         S3BucketGetOperation::ListObjects => {
             s3_list_objects(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+            )
+            .await
+        }
+        S3BucketGetOperation::ListObjectVersions => {
+            s3_list_object_versions(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+            )
+            .await
+        }
+        S3BucketGetOperation::ListMultipartUploads => {
+            s3_list_multipart_uploads(
                 State(state),
                 Path(bucket_name),
                 OriginalUri(uri),
@@ -108,6 +142,17 @@ pub(super) async fn s3_bucket_get(
         }
         S3BucketGetOperation::GetLifecycle => {
             s3_get_bucket_lifecycle_configuration(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+            )
+            .await
+        }
+        S3BucketGetOperation::GetObjectLock => {
+            s3_get_bucket_object_lock(
                 State(state),
                 Path(bucket_name),
                 OriginalUri(uri),
@@ -157,6 +202,18 @@ pub(super) async fn s3_bucket_put(
         }
         S3BucketPutOperation::PutLifecycle => {
             s3_put_bucket_lifecycle_configuration(
+                State(state),
+                Path(bucket_name),
+                OriginalUri(uri),
+                method,
+                headers,
+                request_id,
+                content,
+            )
+            .await
+        }
+        S3BucketPutOperation::PutObjectLock => {
+            s3_put_bucket_object_lock(
                 State(state),
                 Path(bucket_name),
                 OriginalUri(uri),

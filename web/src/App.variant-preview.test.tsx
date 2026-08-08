@@ -2,7 +2,16 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { DEFAULT_VARIANT_PARAMS, ObjectPreviewModal, isRasterImageMimeType, isValidVariantParams } from './App'
+import {
+  DEFAULT_VARIANT_PARAMS,
+  ObjectPreviewModal,
+  RASTER_PREVIEW_MAX_ZOOM,
+  RASTER_PREVIEW_MIN_ZOOM,
+  calculateRasterPreviewFitZoom,
+  clampRasterPreviewZoom,
+  isRasterImageMimeType,
+  isValidVariantParams,
+} from './App'
 import { api, type ObjectItem } from './api'
 import { ThemeProvider } from './theme'
 
@@ -23,7 +32,25 @@ const IMAGE: ObjectItem = {
 
 function renderPreview(item: ObjectItem = IMAGE) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<ThemeProvider defaultTheme="light"><QueryClientProvider client={queryClient}><ObjectPreviewModal item={item} onClose={vi.fn()} /></QueryClientProvider></ThemeProvider>)
+  const preview = (nextItem: ObjectItem) => <ThemeProvider defaultTheme="light"><QueryClientProvider client={queryClient}><ObjectPreviewModal item={nextItem} onClose={vi.fn()} /></QueryClientProvider></ThemeProvider>
+  const rendered = render(preview(item))
+  return { ...rendered, rerenderPreview: (nextItem: ObjectItem) => rendered.rerender(preview(nextItem)) }
+}
+
+function loadRasterImage({ imageWidth = 1600, imageHeight = 1200, viewportWidth = 800, viewportHeight = 600 } = {}) {
+  const viewport = screen.getByTestId('raster-preview-viewport')
+  const image = screen.getByTestId('raster-preview-image')
+  Object.defineProperties(viewport, {
+    clientWidth: { configurable: true, value: viewportWidth },
+    clientHeight: { configurable: true, value: viewportHeight },
+  })
+  Object.defineProperties(image, {
+    naturalWidth: { configurable: true, value: imageWidth },
+    naturalHeight: { configurable: true, value: imageHeight },
+  })
+  fireEvent(window, new Event('resize'))
+  fireEvent.load(image)
+  return { image, viewport }
 }
 
 async function advanceTimers(milliseconds: number) {
@@ -62,7 +89,7 @@ describe('图片实时 Variant 预览', () => {
     expect(isValidVariantParams({ ...DEFAULT_VARIANT_PARAMS, background: 'white' })).toBe(false)
   })
 
-  it('让完整预览区域成为 object-contain 的稳定尺寸框', async () => {
+  it('让完整预览区域成为可缩放且稳定的 object-contain 画布', async () => {
     vi.spyOn(api, 'getSignedUrl').mockResolvedValue({
       url: 'https://media.example.test/original.png',
       expiresAt: '2026-07-18T09:00:00.000Z',
@@ -71,10 +98,9 @@ describe('图片实时 Variant 预览', () => {
     renderPreview()
 
     expect(await screen.findByTestId('raster-preview-image')).toHaveClass(
-      'h-full',
-      'min-h-0',
-      'w-full',
-      'min-w-0',
+      'absolute',
+      'max-h-none',
+      'max-w-none',
       'object-contain',
       'object-center',
     )
@@ -84,6 +110,80 @@ describe('图片实时 Variant 预览', () => {
       'flex-1',
       'overflow-hidden',
     )
+    expect(screen.getByRole('toolbar', { name: '图片缩放控制' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '适应窗口（0）' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '显示为原始大小 100%' })).toBeInTheDocument()
+  })
+
+  it('限制手动缩放边界，同时允许适应窗口低于最小手动缩放值', () => {
+    expect(clampRasterPreviewZoom(0)).toBe(RASTER_PREVIEW_MIN_ZOOM)
+    expect(clampRasterPreviewZoom(10)).toBe(RASTER_PREVIEW_MAX_ZOOM)
+    expect(clampRasterPreviewZoom(Number.NaN)).toBe(1)
+    expect(calculateRasterPreviewFitZoom(
+      { width: 800, height: 600 },
+      { width: 20_000, height: 10_000 },
+    )).toBeLessThan(RASTER_PREVIEW_MIN_ZOOM)
+  })
+
+  it('按钮缩放会在 10% 到 800% 边界停止', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockResolvedValue({ url: 'https://media.example.test/original.png', expiresAt: '' })
+    renderPreview()
+    await screen.findByTestId('raster-preview-image')
+    loadRasterImage({ imageWidth: 400, imageHeight: 300, viewportWidth: 800, viewportHeight: 600 })
+
+    fireEvent.click(screen.getByRole('button', { name: '显示为原始大小 100%' }))
+    const zoomIn = screen.getByRole('button', { name: '放大图片（+）' })
+    for (let index = 0; index < 20; index += 1) fireEvent.click(zoomIn)
+    expect(screen.getByLabelText('当前缩放 800%')).toBeInTheDocument()
+    expect(zoomIn).toBeDisabled()
+
+    const zoomOut = screen.getByRole('button', { name: '缩小图片（-）' })
+    for (let index = 0; index < 30; index += 1) fireEvent.click(zoomOut)
+    expect(screen.getByLabelText('当前缩放 10%')).toBeInTheDocument()
+    expect(zoomOut).toBeDisabled()
+  })
+
+  it('支持快捷键与双击切换，并忽略文本输入中的按键', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockResolvedValue({ url: 'https://media.example.test/original.png', expiresAt: '' })
+    renderPreview()
+    await screen.findByTestId('raster-preview-image')
+    const { viewport } = loadRasterImage()
+
+    expect(viewport).toHaveAttribute('data-view-mode', 'fit')
+    fireEvent.keyDown(window, { key: '+' })
+    expect(viewport).toHaveAttribute('data-view-mode', 'custom')
+    fireEvent.keyDown(window, { key: '0' })
+    expect(viewport).toHaveAttribute('data-view-mode', 'fit')
+
+    const widthInput = screen.getByRole('spinbutton', { name: 'Variant 宽度' })
+    fireEvent.keyDown(widthInput, { key: '+' })
+    expect(viewport).toHaveAttribute('data-view-mode', 'fit')
+
+    fireEvent.doubleClick(viewport)
+    expect(viewport).toHaveAttribute('data-view-mode', 'actual')
+    fireEvent.doubleClick(viewport)
+    expect(viewport).toHaveAttribute('data-view-mode', 'fit')
+  })
+
+  it('100% 下可拖拽平移，并在模式或对象切换时重置视图', async () => {
+    vi.spyOn(api, 'getSignedUrl').mockImplementation(async (mediaId) => ({ url: `https://media.example.test/${mediaId}.png`, expiresAt: '' }))
+    const rendered = renderPreview()
+    await screen.findByTestId('raster-preview-image')
+    const { image, viewport } = loadRasterImage({ imageWidth: 1000, imageHeight: 800, viewportWidth: 400, viewportHeight: 300 })
+
+    fireEvent.click(screen.getByRole('button', { name: '显示为原始大小 100%' }))
+    fireEvent.pointerDown(viewport, { button: 0, pointerId: 7, clientX: 100, clientY: 100 })
+    fireEvent.pointerMove(viewport, { pointerId: 7, clientX: 150, clientY: 130 })
+    expect(image).toHaveStyle({ transform: 'translate(-50%, -50%) translate(50px, 30px) scale(1)' })
+    fireEvent.pointerUp(viewport, { pointerId: 7, clientX: 150, clientY: 130 })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Variant' }))
+    await waitFor(() => expect(viewport).toHaveAttribute('data-view-mode', 'fit'))
+    expect(image.style.transform).toContain('translate(0px, 0px)')
+
+    fireEvent.click(screen.getByRole('button', { name: '显示为原始大小 100%' }))
+    rendered.rerenderPreview({ ...IMAGE, id: 'media_next', name: 'next.png', key: 'previews/next.png', revision: 2 })
+    await waitFor(() => expect(screen.getByTestId('raster-preview-viewport')).toHaveAttribute('data-view-mode', 'fit'))
   })
 
   it('公开对象使用无 token 链接预览，并可复制原链和短链', async () => {

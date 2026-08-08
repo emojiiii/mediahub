@@ -7,8 +7,9 @@ use std::{
 use async_trait::async_trait;
 use futures::executor::block_on;
 use mediahub_core::{
-    ApplicationId, BucketId, BucketS3Configuration, Checksum, EntityTag, NewStorageGcTask,
-    ObjectId, ObjectRetention, ObjectVersion, ObjectVersionId, ObjectVersionPayload,
+    ApplicationId, BucketId, BucketS3Configuration, Checksum, DefaultRetention,
+    DefaultRetentionPeriod, EntityTag, NewStorageGcTask, ObjectId, ObjectRetention,
+    ObjectRetentionUpdateError, ObjectVersion, ObjectVersionId, ObjectVersionPayload,
     ObjectVersionState, PersistedBucketS3Configuration, PersistedS3Bucket, PersistedS3Object,
     PersistedUploadIntent, RetentionMode, S3Bucket, S3LifecycleConfiguration, S3Object,
     S3VersionId, SourceProtocol, StorageGcReason, StoredObjectVersion, UploadIntent,
@@ -20,10 +21,12 @@ use time::{Duration, OffsetDateTime};
 use crate::{
     BeginPutObjectReceipt, BeginPutObjectRequest, CompletePutObjectRequest, ComposedObject,
     DeleteObjectRequest, DeleteS3ObjectCommand, DeleteS3ObjectOutcome, DeletedS3ObjectVersion,
-    FixedClock, InMemoryObjectStore, ListObjectVersionsRequest, ObjectMetadata, ObjectPage,
-    ObjectStore, ObjectStoreError, RepositoryError, S3BucketRepository, S3DeleteLockReason,
-    S3ObjectCommitTarget, S3ObjectListItem, S3ObjectListQuery, S3ObjectPage, S3ObjectRepository,
-    S3ObjectRequest, S3ObjectService, S3ObjectServiceError, S3ObjectVersionCommit,
+    FixedClock, InMemoryObjectStore, ListObjectVersionsRequest, NewS3ObjectLock, ObjectMetadata,
+    ObjectPage, ObjectStore, ObjectStoreError, PutObjectLegalHoldRequest,
+    PutObjectRetentionRequest, PutS3ObjectLockCommand, PutS3ObjectLockOutcome, RepositoryError,
+    S3BucketRepository, S3DeleteLockReason, S3ObjectCommitTarget, S3ObjectListItem,
+    S3ObjectListQuery, S3ObjectLockMutation, S3ObjectPage, S3ObjectRepository, S3ObjectRequest,
+    S3ObjectService, S3ObjectServiceError, S3ObjectVersionCommit, S3ObjectVersionRead,
     S3UploadIntentRepository, StreamedObject,
 };
 
@@ -167,12 +170,74 @@ impl S3BucketRepository for MemoryS3Repository {
 
     async fn set_s3_bucket_versioning(
         &self,
-        _application_id: ApplicationId,
-        _name: &str,
-        _status: VersioningStatus,
-        _updated_at: OffsetDateTime,
+        application_id: ApplicationId,
+        name: &str,
+        status: VersioningStatus,
+        updated_at: OffsetDateTime,
     ) -> Result<BucketS3Configuration, RepositoryError> {
-        unreachable!("not used by ObjectService tests")
+        let mut state = self.state();
+        let bucket = state
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.application_id() == application_id && bucket.name() == name)
+            .ok_or(RepositoryError::NotFound)?;
+        let mut configuration = bucket.configuration().clone();
+        configuration
+            .transition_versioning(status, updated_at)
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        *bucket = S3Bucket::from_persistence(PersistedS3Bucket {
+            id: bucket.id(),
+            application_id: bucket.application_id(),
+            name: bucket.name().to_owned(),
+            configuration: PersistedBucketS3Configuration {
+                region: configuration.region().to_owned(),
+                versioning_status: configuration.versioning_status(),
+                object_lock_enabled: configuration.object_lock_enabled(),
+                default_retention: configuration.default_retention(),
+                lifecycle_configuration: configuration.lifecycle_configuration().cloned(),
+                revision: configuration.revision(),
+                updated_at: configuration.updated_at(),
+            },
+            created_at: bucket.created_at(),
+        })
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        Ok(configuration)
+    }
+
+    async fn replace_s3_bucket_object_lock(
+        &self,
+        application_id: ApplicationId,
+        name: &str,
+        default_retention: Option<DefaultRetention>,
+        updated_at: OffsetDateTime,
+    ) -> Result<BucketS3Configuration, RepositoryError> {
+        let mut state = self.state();
+        let bucket = state
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.application_id() == application_id && bucket.name() == name)
+            .ok_or(RepositoryError::NotFound)?;
+        let mut configuration = bucket.configuration().clone();
+        configuration
+            .replace_object_lock_configuration(default_retention, updated_at)
+            .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        *bucket = S3Bucket::from_persistence(PersistedS3Bucket {
+            id: bucket.id(),
+            application_id: bucket.application_id(),
+            name: bucket.name().to_owned(),
+            configuration: PersistedBucketS3Configuration {
+                region: configuration.region().to_owned(),
+                versioning_status: configuration.versioning_status(),
+                object_lock_enabled: configuration.object_lock_enabled(),
+                default_retention: configuration.default_retention(),
+                lifecycle_configuration: configuration.lifecycle_configuration().cloned(),
+                revision: configuration.revision(),
+                updated_at: configuration.updated_at(),
+            },
+            created_at: bucket.created_at(),
+        })
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
+        Ok(configuration)
     }
 
     async fn replace_s3_bucket_lifecycle(
@@ -326,6 +391,37 @@ impl S3ObjectRepository for MemoryS3Repository {
             .flat_map(|versions| versions.iter())
             .find(|version| version.id() == version_id)
             .cloned())
+    }
+
+    async fn find_committed_s3_object_version_for_application(
+        &self,
+        application_id: ApplicationId,
+        version_id: ObjectVersionId,
+    ) -> Result<Option<S3ObjectVersionRead>, RepositoryError> {
+        let state = self.state();
+        let Some(version) = state
+            .versions
+            .values()
+            .flatten()
+            .find(|version| {
+                version.id() == version_id
+                    && version.application_id() == application_id
+                    && version.state() == ObjectVersionState::Committed
+                    && !version.is_delete_marker()
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(object) = state.objects.get(&version.object_id()) else {
+            return Err(RepositoryError::Invariant(
+                "object version has no logical object".into(),
+            ));
+        };
+        Ok(Some(S3ObjectVersionRead {
+            object_key: object.key().to_owned(),
+            version,
+        }))
     }
 
     async fn find_current_s3_object_version(
@@ -558,6 +654,103 @@ impl S3ObjectRepository for MemoryS3Repository {
             }
         }
     }
+
+    async fn put_s3_object_lock(
+        &self,
+        command: &PutS3ObjectLockCommand,
+    ) -> Result<PutS3ObjectLockOutcome, RepositoryError> {
+        let mut state = self.state();
+        let Some(bucket) = state.buckets.iter().find(|bucket| {
+            bucket.application_id() == command.application_id && bucket.id() == command.bucket_id
+        }) else {
+            return Err(RepositoryError::NotFound);
+        };
+        if !bucket.configuration().object_lock_enabled() {
+            return Ok(PutS3ObjectLockOutcome::ObjectLockNotEnabled);
+        }
+        let Some(object) = state
+            .objects
+            .values()
+            .find(|object| {
+                object.application_id() == command.application_id
+                    && object.bucket_id() == command.bucket_id
+                    && object.key() == command.object_key
+            })
+            .cloned()
+        else {
+            return Ok(if command.version_id.is_some() {
+                PutS3ObjectLockOutcome::VersionNotFound
+            } else {
+                PutS3ObjectLockOutcome::ObjectNotFound
+            });
+        };
+        let target_id = match &command.version_id {
+            Some(version_id) => state
+                .versions
+                .get(&object.id())
+                .into_iter()
+                .flatten()
+                .find(|version| {
+                    version.external_version_id() == version_id
+                        && !state.superseded_versions.contains(&version.id())
+                        && !state.deleted_versions.contains(&version.id())
+                })
+                .map(ObjectVersion::id),
+            None => object.current_version_id(),
+        };
+        let Some(target_id) = target_id else {
+            return Ok(if command.version_id.is_some() {
+                PutS3ObjectLockOutcome::VersionNotFound
+            } else {
+                PutS3ObjectLockOutcome::ObjectNotFound
+            });
+        };
+        let versions = state.versions.get_mut(&object.id()).ok_or_else(|| {
+            RepositoryError::Invariant("logical object has no version history".into())
+        })?;
+        let target = versions
+            .iter_mut()
+            .find(|version| version.id() == target_id)
+            .ok_or_else(|| RepositoryError::Invariant("object head version is missing".into()))?;
+        if target.is_delete_marker() {
+            return Ok(PutS3ObjectLockOutcome::DeleteMarker {
+                version_id: target.external_version_id().clone(),
+                is_current: object.current_version_id() == Some(target.id()),
+            });
+        }
+        let updated = match command.mutation {
+            S3ObjectLockMutation::Retention {
+                retention,
+                bypass_governance,
+            } => {
+                match target.with_retention_update(retention, command.updated_at, bypass_governance)
+                {
+                    Ok(updated) => updated,
+                    Err(ObjectRetentionUpdateError::RetainUntilMustBeFuture) => {
+                        return Ok(PutS3ObjectLockOutcome::InvalidRetention);
+                    }
+                    Err(ObjectRetentionUpdateError::ComplianceRetentionLocked) => {
+                        return Ok(PutS3ObjectLockOutcome::RetentionLocked(
+                            S3DeleteLockReason::ComplianceRetention,
+                        ));
+                    }
+                    Err(ObjectRetentionUpdateError::GovernanceRetentionLocked) => {
+                        return Ok(PutS3ObjectLockOutcome::RetentionLocked(
+                            S3DeleteLockReason::GovernanceRetention,
+                        ));
+                    }
+                    Err(ObjectRetentionUpdateError::InvalidVersion) => {
+                        return Ok(PutS3ObjectLockOutcome::VersionNotFound);
+                    }
+                }
+            }
+            S3ObjectLockMutation::LegalHold(legal_hold) => target
+                .with_legal_hold_update(legal_hold)
+                .map_err(|error| RepositoryError::Invariant(error.to_string()))?,
+        };
+        *target = updated.clone();
+        Ok(PutS3ObjectLockOutcome::Updated(updated))
+    }
     async fn create_s3_object_with_version(
         &self,
         _object: S3Object,
@@ -647,6 +840,46 @@ fn enqueue_memory_gc_task(
         };
     }
     state.gc_tasks.push(task);
+    Ok(())
+}
+
+fn freeze_memory_object_lock(
+    buckets: &[S3Bucket],
+    commit: &mut S3ObjectVersionCommit,
+) -> Result<(), RepositoryError> {
+    let bucket = buckets
+        .iter()
+        .find(|bucket| {
+            bucket.application_id() == commit.version.application_id()
+                && bucket.id() == commit.version.bucket_id()
+        })
+        .ok_or(RepositoryError::NotFound)?;
+    let requested = commit.requested_retention.is_some() || commit.requested_legal_hold.is_some();
+    if requested && !bucket.configuration().object_lock_enabled() {
+        return Err(RepositoryError::Conflict);
+    }
+    let retention = if bucket.configuration().object_lock_enabled() {
+        commit.requested_retention.or_else(|| {
+            bucket
+                .configuration()
+                .default_retention()
+                .and_then(|value| value.for_object_at(commit.committed_at).ok())
+        })
+    } else {
+        None
+    };
+    if bucket.configuration().default_retention().is_some()
+        && bucket.configuration().object_lock_enabled()
+        && retention.is_none()
+    {
+        return Err(RepositoryError::Invariant(
+            "bucket default retention could not be resolved".into(),
+        ));
+    }
+    commit.version = commit
+        .version
+        .with_initial_object_lock(retention, commit.requested_legal_hold.unwrap_or(false))
+        .map_err(|error| RepositoryError::Invariant(error.to_string()))?;
     Ok(())
 }
 
@@ -791,6 +1024,7 @@ impl S3UploadIntentRepository for MemoryS3Repository {
         commit.validate()?;
         self.record("intent.commit");
         let mut state = self.state();
+        let mut commit = commit;
         let intent = state
             .intents
             .get(&intent_id)
@@ -807,6 +1041,8 @@ impl S3UploadIntentRepository for MemoryS3Repository {
                 "injected DB commit failure".into(),
             ));
         }
+
+        freeze_memory_object_lock(&state.buckets, &mut commit)?;
 
         let active_null = if commit.version.is_null_version() {
             state
@@ -1168,6 +1404,151 @@ fn setup(
     (application_id, bucket_id, repository, store, service)
 }
 
+#[test]
+fn memory_bucket_repository_persists_object_lock_configuration() {
+    block_on(async {
+        let (application_id, _, repository, _, _) = setup(VersioningStatus::Unversioned);
+        let retention =
+            DefaultRetention::new(RetentionMode::Governance, DefaultRetentionPeriod::Days(30))
+                .expect("valid default retention");
+        let updated_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let configuration = repository
+            .replace_s3_bucket_object_lock(application_id, "assets", Some(retention), updated_at)
+            .await
+            .expect("replace in-memory Object Lock configuration");
+        assert!(configuration.object_lock_enabled());
+        assert_eq!(configuration.versioning_status(), VersioningStatus::Enabled);
+        assert_eq!(configuration.default_retention(), Some(retention));
+        assert_eq!(configuration.revision(), 2);
+        assert_eq!(configuration.updated_at(), updated_at);
+
+        let persisted = repository
+            .get_s3_bucket_configuration(application_id, "assets")
+            .await
+            .expect("read in-memory Object Lock configuration")
+            .expect("bucket exists");
+        assert_eq!(persisted, configuration);
+    });
+}
+
+#[test]
+fn object_lock_defaults_and_mutations_are_frozen_on_object_versions() {
+    block_on(async {
+        let content = b"prismark";
+        let (application_id, _, repository, store, service) = setup(VersioningStatus::Unversioned);
+        let default =
+            DefaultRetention::new(RetentionMode::Governance, DefaultRetentionPeriod::Days(30))
+                .expect("default retention");
+        repository
+            .replace_s3_bucket_object_lock(
+                application_id,
+                "assets",
+                Some(default),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("enable Object Lock");
+
+        let begun = begin_and_stage(application_id, &service, &store, content).await;
+        let completed = service
+            .complete_put_with_object_lock(
+                &complete_request(application_id, begun.intent.id(), content),
+                NewS3ObjectLock {
+                    retention: None,
+                    legal_hold: Some(true),
+                },
+            )
+            .await
+            .expect("commit locked version");
+        assert_eq!(
+            completed.version.retention(),
+            Some(ObjectRetention::new(
+                RetentionMode::Governance,
+                OffsetDateTime::UNIX_EPOCH + Duration::days(30),
+            ))
+        );
+        assert!(completed.version.legal_hold());
+
+        let object = S3ObjectRequest {
+            application_id,
+            bucket_name: "assets".into(),
+            object_key: "folder/example.txt".into(),
+            version_id: Some(completed.version.external_version_id().clone()),
+        };
+        assert!(matches!(
+            service
+                .put_object_retention(&PutObjectRetentionRequest {
+                    object: object.clone(),
+                    retention: ObjectRetention::new(
+                        RetentionMode::Governance,
+                        OffsetDateTime::UNIX_EPOCH + Duration::days(20),
+                    ),
+                    bypass_governance: false,
+                })
+                .await,
+            Err(S3ObjectServiceError::RetentionUpdateLocked(
+                S3DeleteLockReason::GovernanceRetention
+            ))
+        ));
+        let shortened = service
+            .put_object_retention(&PutObjectRetentionRequest {
+                object: object.clone(),
+                retention: ObjectRetention::new(
+                    RetentionMode::Governance,
+                    OffsetDateTime::UNIX_EPOCH + Duration::days(20),
+                ),
+                bypass_governance: true,
+            })
+            .await
+            .expect("signed governance bypass is represented by the command flag");
+        assert_eq!(
+            shortened.retention().expect("retention").retain_until(),
+            OffsetDateTime::UNIX_EPOCH + Duration::days(20)
+        );
+        let released = service
+            .put_object_legal_hold(&PutObjectLegalHoldRequest {
+                object,
+                legal_hold: false,
+            })
+            .await
+            .expect("release legal hold");
+        assert!(!released.legal_hold());
+    });
+}
+
+#[test]
+fn explicit_put_object_lock_is_rejected_before_promotion_on_an_unlocked_bucket() {
+    block_on(async {
+        let content = b"prismark";
+        let (application_id, _, repository, store, service) = setup(VersioningStatus::Enabled);
+        let begun = begin_and_stage(application_id, &service, &store, content).await;
+        let result = service
+            .complete_put_with_object_lock(
+                &complete_request(application_id, begun.intent.id(), content),
+                NewS3ObjectLock {
+                    retention: Some(ObjectRetention::new(
+                        RetentionMode::Governance,
+                        OffsetDateTime::UNIX_EPOCH + Duration::days(30),
+                    )),
+                    legal_hold: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(S3ObjectServiceError::ObjectLockNotEnabled)
+        ));
+        assert!(
+            !repository
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| event == "storage.promote")
+        );
+    });
+}
+
 fn begin_request(application_id: ApplicationId, size: u64) -> BeginPutObjectRequest {
     BeginPutObjectRequest {
         application_id,
@@ -1230,6 +1611,7 @@ fn complete_request(
         intent_id,
         streamed: streamed(content),
         created_by: "test-access-key".into(),
+        source_protocol: SourceProtocol::S3,
     }
 }
 

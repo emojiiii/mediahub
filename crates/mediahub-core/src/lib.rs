@@ -36,9 +36,9 @@ pub use metadata::{
     MAX_METADATA_KEYS, MAX_METADATA_STRING_BYTES, MediaMetadata, SystemMetadata,
 };
 pub use object_version::{
-    ObjectId, ObjectRetention, ObjectVersion, ObjectVersionId, ObjectVersionPayload,
-    ObjectVersionState, PersistedObjectVersion, PersistedS3Object, S3Object, S3VersionId,
-    SourceProtocol, StoredObjectVersion,
+    ObjectId, ObjectRetention, ObjectRetentionUpdateError, ObjectVersion, ObjectVersionId,
+    ObjectVersionPayload, ObjectVersionState, PersistedObjectVersion, PersistedS3Object, S3Object,
+    S3VersionId, SourceProtocol, StoredObjectVersion,
 };
 pub use s3_bucket::{
     BucketS3Configuration, DefaultRetention, DefaultRetentionPeriod,

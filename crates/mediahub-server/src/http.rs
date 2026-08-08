@@ -90,6 +90,14 @@ fn control_plane_router(state: Arc<AppState>, web_root: Option<PathBuf>) -> Rout
         )
         .route("/api/v1/media", get(list_media).post(upload_media))
         .route("/api/v1/media/batch", post(batch_media))
+        .route(
+            "/api/v1/object-versions/{version_id}/preview-manifest",
+            get(get_object_version_preview_manifest),
+        )
+        .route(
+            "/api/v1/object-versions/{version_id}/content",
+            get(read_object_version_content).head(read_object_version_content),
+        )
         .route("/api/v1/short-links", post(create_short_link))
         .route(
             "/api/v1/jobs/{job_id}",
@@ -263,6 +271,7 @@ fn cors_layer(origins: &[HeaderValue]) -> CorsLayer {
         .allow_credentials(true)
         .allow_methods([
             Method::GET,
+            Method::HEAD,
             Method::POST,
             Method::PUT,
             Method::PATCH,
@@ -276,11 +285,13 @@ fn cors_layer(origins: &[HeaderValue]) -> CorsLayer {
     }
 }
 
-fn cors_allowed_headers() -> [HeaderName; 10] {
+fn cors_allowed_headers() -> [HeaderName; 12] {
     [
         axum::http::header::AUTHORIZATION,
         axum::http::header::CONTENT_TYPE,
         axum::http::header::IF_MATCH,
+        axum::http::header::IF_NONE_MATCH,
+        axum::http::header::RANGE,
         HeaderName::from_static("idempotency-key"),
         HeaderName::from_static("x-csrf-token"),
         HeaderName::from_static("x-mediahub-access-key"),

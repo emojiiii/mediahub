@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
-use crate::{ApplicationId, BucketId, S3LifecycleConfiguration};
+use crate::{ApplicationId, BucketId, ObjectRetention, S3LifecycleConfiguration};
 
 const MAX_REGION_BYTES: usize = 63;
 
@@ -73,6 +73,40 @@ impl DefaultRetention {
     #[must_use]
     pub const fn period(self) -> DefaultRetentionPeriod {
         self.period
+    }
+
+    /// Resolves a bucket default into the absolute timestamp frozen on a new
+    /// object version. Year periods use calendar years (including leap-day
+    /// clamping) instead of treating a year as a fixed number of days.
+    pub fn for_object_at(
+        self,
+        created_at: OffsetDateTime,
+    ) -> Result<ObjectRetention, S3ModelError> {
+        let retain_until = match self.period {
+            DefaultRetentionPeriod::Days(days) => created_at
+                .checked_add(Duration::days(i64::from(days)))
+                .ok_or(S3ModelError::InvalidObjectRetention)?,
+            DefaultRetentionPeriod::Years(years) => {
+                let years =
+                    i32::try_from(years).map_err(|_| S3ModelError::InvalidObjectRetention)?;
+                let year = created_at
+                    .year()
+                    .checked_add(years)
+                    .ok_or(S3ModelError::InvalidObjectRetention)?;
+                let date = created_at
+                    .date()
+                    .replace_year(year)
+                    .or_else(|_| {
+                        created_at
+                            .date()
+                            .replace_day(28)
+                            .and_then(|date| date.replace_year(year))
+                    })
+                    .map_err(|_| S3ModelError::InvalidObjectRetention)?;
+                created_at.replace_date(date)
+            }
+        };
+        Ok(ObjectRetention::new(self.mode, retain_until))
     }
 }
 
@@ -180,6 +214,33 @@ impl BucketS3Configuration {
             return Ok(false);
         }
         self.lifecycle_configuration = lifecycle_configuration;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(S3ModelError::InvalidConfigurationRevision)?;
+        self.updated_at = now;
+        Ok(true)
+    }
+
+    /// Enables Object Lock and replaces its optional default retention rule.
+    ///
+    /// Object Lock is irreversible. First enablement also enables versioning;
+    /// subsequent calls may only replace (or clear) the default retention
+    /// rule while keeping both Object Lock and versioning enabled.
+    pub fn replace_object_lock_configuration(
+        &mut self,
+        default_retention: Option<DefaultRetention>,
+        now: OffsetDateTime,
+    ) -> Result<bool, S3ModelError> {
+        if self.object_lock_enabled
+            && self.versioning_status == VersioningStatus::Enabled
+            && self.default_retention == default_retention
+        {
+            return Ok(false);
+        }
+        self.object_lock_enabled = true;
+        self.versioning_status = VersioningStatus::Enabled;
+        self.default_retention = default_retention;
         self.revision = self
             .revision
             .checked_add(1)
@@ -360,6 +421,8 @@ pub enum S3ModelError {
     InvalidObjectGeneration,
     #[error("object version payload is invalid")]
     InvalidObjectVersionPayload,
+    #[error("object retention is invalid")]
+    InvalidObjectRetention,
     #[error("object version does not belong to the logical object")]
     ObjectVersionOwnershipMismatch,
     #[error("object version creator is invalid")]
@@ -485,5 +548,41 @@ mod tests {
             ),
             Err(S3ModelError::RetentionRequiresObjectLock)
         );
+    }
+
+    #[test]
+    fn object_lock_enablement_is_irreversible_and_revisioned_as_one_change() {
+        let mut configuration = configuration(false);
+        let retention =
+            DefaultRetention::new(RetentionMode::Compliance, DefaultRetentionPeriod::Years(2))
+                .expect("valid retention");
+        let enabled_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        assert!(
+            configuration
+                .replace_object_lock_configuration(Some(retention), enabled_at)
+                .expect("enable Object Lock")
+        );
+        assert!(configuration.object_lock_enabled());
+        assert_eq!(configuration.versioning_status(), VersioningStatus::Enabled);
+        assert_eq!(configuration.default_retention(), Some(retention));
+        assert_eq!(configuration.revision(), 2);
+        assert_eq!(configuration.updated_at(), enabled_at);
+
+        assert!(
+            !configuration
+                .replace_object_lock_configuration(Some(retention), enabled_at)
+                .expect("idempotent replacement")
+        );
+        let cleared_at = enabled_at + time::Duration::seconds(1);
+        assert!(
+            configuration
+                .replace_object_lock_configuration(None, cleared_at)
+                .expect("clear only the default retention")
+        );
+        assert!(configuration.object_lock_enabled());
+        assert_eq!(configuration.versioning_status(), VersioningStatus::Enabled);
+        assert_eq!(configuration.default_retention(), None);
+        assert_eq!(configuration.revision(), 3);
+        assert_eq!(configuration.updated_at(), cleared_at);
     }
 }

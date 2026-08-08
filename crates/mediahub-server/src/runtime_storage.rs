@@ -2,7 +2,7 @@ use std::{ops::Range, path::Path};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, stream};
 use mediahub_adapter_local::LocalObjectStore;
 use mediahub_adapter_s3::S3ObjectStore;
 use mediahub_app::{
@@ -10,6 +10,7 @@ use mediahub_app::{
     StoredUpload, StreamedObject, StreamingUploadError, UploadSessionStorage,
 };
 use mediahub_core::{MediaId, OffsetDateTime, UploadSession, UploadSessionId};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 #[derive(Clone, Debug)]
 pub(crate) enum RuntimeObjectStore {
@@ -75,6 +76,82 @@ impl RuntimeObjectStore {
             Self::S3(store) => {
                 store
                     .put_temporary_stream(temporary_key, stream, expected_size, content_type)
+                    .await
+            }
+        }
+    }
+
+    /// Copies one committed immutable payload into a new temporary key while
+    /// calculating the same SHA-256 and MD5 facts as a streamed HTTP upload.
+    /// Local storage remains streaming; remote storage currently uses the
+    /// adapter's bounded read API until that port exposes streaming ranges.
+    pub(crate) async fn copy_committed_to_temporary(
+        &self,
+        source_key: &str,
+        source_size: u64,
+        range: Option<Range<u64>>,
+        temporary_key: &str,
+        content_type: &str,
+    ) -> Result<StreamedObject, StreamingUploadError> {
+        let (start, expected_size) = match range.as_ref() {
+            Some(range) => (range.start, range.end.saturating_sub(range.start)),
+            None => (0, source_size),
+        };
+        match self {
+            Self::Local(store) => {
+                let mut file = store.open_file(source_key).await?;
+                if start != 0 {
+                    file.seek(std::io::SeekFrom::Start(start))
+                        .await
+                        .map_err(|error| {
+                            StreamingUploadError::Storage(ObjectStoreError::Unavailable(format!(
+                                "failed to seek copy source: {error}"
+                            )))
+                        })?;
+                }
+                let chunks =
+                    stream::try_unfold((file, expected_size), |(mut file, remaining)| async move {
+                        if remaining == 0 {
+                            return Ok::<_, ObjectStoreError>(None);
+                        }
+                        let capacity = usize::try_from(remaining.min(64 * 1024))
+                            .expect("copy chunk is bounded to 64 KiB");
+                        let mut chunk = vec![0_u8; capacity];
+                        let read = file.read(&mut chunk).await.map_err(|error| {
+                            ObjectStoreError::Unavailable(format!(
+                                "failed to read copy source: {error}"
+                            ))
+                        })?;
+                        if read == 0 {
+                            return Ok::<_, ObjectStoreError>(None);
+                        }
+                        chunk.truncate(read);
+                        Ok::<_, ObjectStoreError>(Some((
+                            bytes::Bytes::from(chunk),
+                            (file, remaining.saturating_sub(read as u64)),
+                        )))
+                    });
+                match store
+                    .put_temporary_stream(temporary_key, chunks, expected_size, content_type)
+                    .await
+                {
+                    Err(StreamingUploadError::Stream(error)) => Err(StreamingUploadError::Storage(
+                        ObjectStoreError::Unavailable(error),
+                    )),
+                    result => result,
+                }
+            }
+            Self::S3(store) => {
+                let content = match range {
+                    Some(range) => ObjectStore::read_range(store, source_key, range).await?,
+                    None => ObjectStore::read(store, source_key).await?,
+                };
+                let chunks =
+                    stream::once(
+                        async move { Ok::<_, ObjectStoreError>(bytes::Bytes::from(content)) },
+                    );
+                store
+                    .put_temporary_stream(temporary_key, chunks, expected_size, content_type)
                     .await
             }
         }
@@ -312,6 +389,30 @@ mod tests {
         let metadata = runtime.head("committed/object").await.expect("head object");
         assert_eq!(metadata.size, 5);
         assert_eq!(metadata.content_type.as_deref(), Some("text/plain"));
+        let copied = runtime
+            .copy_committed_to_temporary(
+                "committed/object",
+                metadata.size,
+                Some(1..4),
+                "temporary/copied-range",
+                "text/plain",
+            )
+            .await
+            .expect("stream committed range into temporary storage");
+        assert_eq!(copied.size, 3);
+        assert_eq!(copied.md5.len(), 32);
+        assert_eq!(copied.sha256.len(), 64);
+        runtime
+            .commit_temporary("temporary/copied-range", "copied/range")
+            .await
+            .expect("commit copied range");
+        assert_eq!(
+            runtime
+                .read("copied/range")
+                .await
+                .expect("read copied range"),
+            b"ell"
+        );
         let page = runtime
             .list("committed", None, 10)
             .await
@@ -431,6 +532,28 @@ mod tests {
             .expect("head S3 object");
         assert_eq!(metadata.size, 5);
         assert_eq!(metadata.content_type.as_deref(), Some("text/plain"));
+        let copied = runtime
+            .copy_committed_to_temporary(
+                session.storage_key(),
+                metadata.size,
+                Some(1..4),
+                "temporary/s3-copy-range",
+                "text/plain",
+            )
+            .await
+            .expect("copy S3-backed range");
+        assert_eq!(copied.size, 3);
+        runtime
+            .commit_temporary("temporary/s3-copy-range", "copied/s3-range")
+            .await
+            .expect("commit S3-backed copy");
+        assert_eq!(
+            runtime
+                .read("copied/s3-range")
+                .await
+                .expect("read S3-backed copy"),
+            b"ell"
+        );
         let page = runtime
             .list("objects", None, 10)
             .await

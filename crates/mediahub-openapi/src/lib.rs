@@ -58,6 +58,9 @@ use utoipa::OpenApi;
         dto::Media,
         dto::MediaPage,
         dto::OneTimeToken,
+        dto::ObjectVersionPreviewManifest,
+        dto::ObjectVersionPreviewMode,
+        dto::ObjectVersionPreviewRenderer,
         dto::Permission,
         dto::RegistrationResponse,
         dto::ResendVerificationResponse,
@@ -118,10 +121,10 @@ mod tests {
         let paths = document["paths"]
             .as_object()
             .ok_or_else(|| anyhow!("paths must be an object"))?;
-        ensure!(paths.len() == 48, "expected 48 paths, got {}", paths.len());
+        ensure!(paths.len() == 50, "expected 50 paths, got {}", paths.len());
         ensure!(
-            contract::OPERATION_COUNT == 71,
-            "expected 71 operations, got {}",
+            contract::OPERATION_COUNT == 74,
+            "expected 74 operations, got {}",
             contract::OPERATION_COUNT
         );
         ensure!(
@@ -200,7 +203,7 @@ mod tests {
                 }
             }
         }
-        ensure!(operations == 71, "expected 71 operations, got {operations}");
+        ensure!(operations == 74, "expected 74 operations, got {operations}");
         Ok(())
     }
 

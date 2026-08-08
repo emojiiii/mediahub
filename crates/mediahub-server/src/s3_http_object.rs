@@ -4,6 +4,16 @@ const MAX_S3_CONTENT_TYPE_BYTES: usize = 1_024;
 const MAX_S3_USER_METADATA_NAME_BYTES: usize = 128;
 const MAX_S3_USER_METADATA_BYTES: usize = 2 * 1_024;
 
+fn validate_s3_object_size(size: u64) -> Result<(), ApiError> {
+    if size > MAX_UPLOAD_OBJECT_BYTES {
+        Err(ApiError::payload_too_large(
+            "object size exceeds the 2 GiB S3 object limit",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 type RuntimeS3ObjectService = S3ObjectService<
     mediahub_adapter_postgres::PostgresRepository,
     mediahub_adapter_postgres::PostgresRepository,
@@ -55,11 +65,22 @@ async fn s3_put_regular_object(
     }
 
     let expected_size = s3_content_length(headers, resource, request_id)?;
-    validate_upload_expected_size(expected_size)
+    validate_s3_object_size(expected_size)
         .map_err(|error| S3ApiError::from_api(error, resource, request_id))?;
     let content_type = s3_object_content_type(headers, resource, request_id)?;
     let user_metadata = s3_user_metadata(headers, resource, request_id)?;
     let expected_md5 = parse_content_md5(headers, resource, request_id)?;
+    let object_lock =
+        parse_put_object_lock_headers(headers, uri, request_id, OffsetDateTime::now_utc())?;
+    ensure_put_object_lock_bucket(
+        state,
+        auth,
+        bucket_name,
+        object_lock,
+        resource,
+        request_id,
+    )
+    .await?;
 
     // The durable owner is created before the request body stream is touched.
     let service = runtime_s3_object_service(state, resource, request_id)?;
@@ -113,12 +134,16 @@ async fn s3_put_regular_object(
 
     let streamed_size = streamed.size;
     let completed = match service
-        .complete_put(&CompletePutObjectRequest {
-            application_id: auth.application.id,
-            intent_id,
-            streamed,
-            created_by: auth.actor_id.clone(),
-        })
+        .complete_put_with_object_lock(
+            &CompletePutObjectRequest {
+                application_id: auth.application.id,
+                intent_id,
+                streamed,
+                created_by: auth.actor_id.clone(),
+                source_protocol: mediahub_core::SourceProtocol::S3,
+            },
+            object_lock,
+        )
         .await
     {
         Ok(completed) => completed,
@@ -158,6 +183,7 @@ async fn s3_put_regular_object(
         response.headers_mut(),
         completed.version.external_version_id(),
     )?;
+    insert_s3_object_lock_headers(response.headers_mut(), &completed.version)?;
     Ok(response)
 }
 
@@ -228,7 +254,9 @@ async fn s3_read_regular_object(
             value
                 .to_str()
                 .map_err(|_| S3ApiError::invalid_range(resource, request_id))
-                .and_then(|value| parse_s3_single_range(value, payload.size_bytes(), resource, request_id))
+                .and_then(|value| {
+                    parse_s3_single_range(value, payload.size_bytes(), resource, request_id)
+                })
         })
         .transpose()?;
     let head_only = method == Method::HEAD;
@@ -262,7 +290,12 @@ async fn s3_read_regular_object(
     };
     let mut response = (status, body).into_response();
     insert_s3_request_id(&mut response, request_id);
-    insert_s3_object_headers(response.headers_mut(), &head.version, payload, range.as_ref())?;
+    insert_s3_object_headers(
+        response.headers_mut(),
+        &head.version,
+        payload,
+        range.as_ref(),
+    )?;
     Ok(response)
 }
 
@@ -353,8 +386,7 @@ fn s3_object_content_type(
             request_id,
         ));
     }
-    normalized_mime(value)
-        .map_err(|error| S3ApiError::from_api(error, resource, request_id))
+    normalized_mime(value).map_err(|error| S3ApiError::from_api(error, resource, request_id))
 }
 
 fn s3_user_metadata(
@@ -425,10 +457,7 @@ fn parse_content_md5(
     Ok(Some(hex::encode(decoded)))
 }
 
-fn parse_s3_version_id(
-    uri: &Uri,
-    request_id: &str,
-) -> Result<Option<S3VersionId>, S3ApiError> {
+fn parse_s3_version_id(uri: &Uri, request_id: &str) -> Result<Option<S3VersionId>, S3ApiError> {
     s3_query_value(uri, "versionId", request_id)?
         .map(|value| {
             S3VersionId::new(value).map_err(|_| {
@@ -445,9 +474,12 @@ fn stored_object_payload<'a>(
 ) -> Result<&'a StoredObjectVersion, S3ApiError> {
     match version.payload() {
         ObjectVersionPayload::Object(payload) => Ok(payload),
-        ObjectVersionPayload::DeleteMarker => {
-            Err(S3ApiError::delete_marker(version.external_version_id(), false, resource, request_id))
-        }
+        ObjectVersionPayload::DeleteMarker => Err(S3ApiError::delete_marker(
+            version.external_version_id(),
+            false,
+            resource,
+            request_id,
+        )),
     }
 }
 
@@ -472,12 +504,8 @@ fn insert_s3_object_headers(
     );
     headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(
-            payload
-                .content_type()
-                .unwrap_or("application/octet-stream"),
-        )
-        .map_err(|_| S3ApiError::internal_error(resource, "response"))?,
+        HeaderValue::from_str(payload.content_type().unwrap_or("application/octet-stream"))
+            .map_err(|_| S3ApiError::internal_error(resource, "response"))?,
     );
     headers.insert(ETAG, entity_tag_header_value(payload.etag().as_str()));
     headers.insert(
@@ -498,6 +526,7 @@ fn insert_s3_object_headers(
         );
     }
     insert_s3_version_id(headers, version.external_version_id())?;
+    insert_s3_object_lock_headers(headers, version)?;
     insert_s3_user_metadata_headers(headers, payload.user_metadata(), resource)
 }
 
@@ -547,9 +576,10 @@ fn if_match_satisfied(
         .to_str()
         .map_err(|_| S3ApiError::invalid_argument("If-Match is invalid.", resource, request_id))?;
     Ok(value.trim() == "*"
-        || value.split(',').map(str::trim).any(|candidate| {
-            !candidate.starts_with("W/") && candidate == format!("\"{etag}\"")
-        }))
+        || value
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| !candidate.starts_with("W/") && candidate == format!("\"{etag}\"")))
 }
 
 fn if_none_match_matches_s3(
@@ -651,8 +681,20 @@ fn map_s3_object_service_error(
             version_id,
             is_current,
         } => S3ApiError::delete_marker(&version_id, is_current, resource, request_id),
-        S3ObjectServiceError::DeleteLocked(reason) => S3ApiError::access_denied(
-            s3_delete_lock_message(reason),
+        S3ObjectServiceError::DeleteLocked(reason) => {
+            S3ApiError::access_denied(s3_delete_lock_message(reason), resource, request_id)
+        }
+        S3ObjectServiceError::ObjectLockNotEnabled => {
+            S3ApiError::invalid_bucket_object_lock_configuration(resource, request_id)
+        }
+        S3ObjectServiceError::ObjectRetentionNotFound => {
+            S3ApiError::no_such_object_lock_configuration(resource, request_id)
+        }
+        S3ObjectServiceError::RetentionUpdateLocked(reason) => {
+            S3ApiError::access_denied(s3_delete_lock_message(reason), resource, request_id)
+        }
+        S3ObjectServiceError::InvalidObjectRetention => S3ApiError::invalid_argument(
+            "RetainUntilDate must be in the future.",
             resource,
             request_id,
         ),
@@ -661,11 +703,13 @@ fn map_s3_object_service_error(
         | S3ObjectServiceError::UploadIntentOwnershipMismatch
         | S3ObjectServiceError::UploadIntentFactsMismatch
         | S3ObjectServiceError::InvalidUploadIntentState(_)
-        | S3ObjectServiceError::Repository(RepositoryError::Conflict) => S3ApiError::operation_aborted(
-            "A conflicting conditional operation is currently in progress against this resource.",
-            resource,
-            request_id,
-        ),
+        | S3ObjectServiceError::Repository(RepositoryError::Conflict) => {
+            S3ApiError::operation_aborted(
+                "A conflicting conditional operation is currently in progress against this resource.",
+                resource,
+                request_id,
+            )
+        }
         S3ObjectServiceError::Repository(RepositoryError::NotFound) => {
             S3ApiError::no_such_key(resource, request_id)
         }

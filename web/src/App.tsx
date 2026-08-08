@@ -41,6 +41,7 @@ import {
   LoaderCircle,
   LogOut,
   Mail,
+  Maximize2,
   Monitor,
   PanelLeft,
   Pencil,
@@ -53,6 +54,8 @@ import {
   UploadCloud,
   Webhook,
   X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react'
 import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useForm } from 'react-hook-form'
@@ -1158,6 +1161,204 @@ function ObjectEditorModal({ item, onClose, onSaved }: { item: ObjectItem; onClo
 type ImagePreviewMode = 'original' | 'variant'
 type LoadedVariant = { url: string; expiresAt: string; params: VariantParams }
 
+export const RASTER_PREVIEW_MIN_ZOOM = 0.1
+export const RASTER_PREVIEW_MAX_ZOOM = 8
+const RASTER_PREVIEW_ZOOM_STEP = 1.25
+const RASTER_PREVIEW_FIT_GUTTER = 32
+
+type RasterPreviewSize = { width: number; height: number }
+type RasterPreviewPoint = { x: number; y: number }
+type RasterPreviewView = { mode: 'fit' | 'actual' | 'custom'; zoom: number }
+
+export function clampRasterPreviewZoom(zoom: number): number {
+  if (!Number.isFinite(zoom)) return 1
+  return Math.min(RASTER_PREVIEW_MAX_ZOOM, Math.max(RASTER_PREVIEW_MIN_ZOOM, zoom))
+}
+
+export function calculateRasterPreviewFitZoom(viewport: RasterPreviewSize, image: RasterPreviewSize): number {
+  if (viewport.width <= 0 || viewport.height <= 0 || image.width <= 0 || image.height <= 0) return 1
+  const availableWidth = Math.max(1, viewport.width - RASTER_PREVIEW_FIT_GUTTER)
+  const availableHeight = Math.max(1, viewport.height - RASTER_PREVIEW_FIT_GUTTER)
+  return Math.min(RASTER_PREVIEW_MAX_ZOOM, availableWidth / image.width, availableHeight / image.height)
+}
+
+export function isRasterPreviewKeyboardTargetEditable(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement
+    && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+}
+
+function samePoint(left: RasterPreviewPoint, right: RasterPreviewPoint): boolean {
+  return left.x === right.x && left.y === right.y
+}
+
+function clampRasterPreviewPan(pan: RasterPreviewPoint, viewport: RasterPreviewSize, image: RasterPreviewSize, zoom: number): RasterPreviewPoint {
+  const maxX = Math.max(0, (image.width * zoom - viewport.width) / 2)
+  const maxY = Math.max(0, (image.height * zoom - viewport.height) / 2)
+  return {
+    x: Math.min(maxX, Math.max(-maxX, pan.x)),
+    y: Math.min(maxY, Math.max(-maxY, pan.y)),
+  }
+}
+
+function RasterImageCanvas({ src, alt, resetKey, fallback, children }: { src?: string; alt: string; resetKey: string; fallback: React.ReactNode; children?: React.ReactNode }) {
+  const viewportRef = useRef<HTMLDivElement>(null)
+  const dragRef = useRef<{ pointerId: number; startX: number; startY: number; origin: RasterPreviewPoint } | null>(null)
+  const [viewportSize, setViewportSize] = useState<RasterPreviewSize>({ width: 0, height: 0 })
+  const [imageSize, setImageSize] = useState<RasterPreviewSize>({ width: 0, height: 0 })
+  const [view, setView] = useState<RasterPreviewView>({ mode: 'fit', zoom: 1 })
+  const [pan, setPan] = useState<RasterPreviewPoint>({ x: 0, y: 0 })
+  const [dragging, setDragging] = useState(false)
+
+  const measureViewport = useCallback(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const next = { width: viewport.clientWidth, height: viewport.clientHeight }
+    setViewportSize((current) => current.width === next.width && current.height === next.height ? current : next)
+  }, [])
+
+  useEffect(() => {
+    measureViewport()
+    const viewport = viewportRef.current
+    if (!viewport) return
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', measureViewport)
+      return () => window.removeEventListener('resize', measureViewport)
+    }
+    const observer = new ResizeObserver(measureViewport)
+    observer.observe(viewport)
+    return () => observer.disconnect()
+  }, [measureViewport])
+
+  useEffect(() => {
+    dragRef.current = null
+    setDragging(false)
+    setPan({ x: 0, y: 0 })
+    setView({ mode: 'fit', zoom: 1 })
+  }, [resetKey])
+
+  const fitZoom = calculateRasterPreviewFitZoom(viewportSize, imageSize)
+  const activeZoom = view.mode === 'fit' ? fitZoom : view.zoom
+  const displayZoom = Math.max(1, Math.round(activeZoom * 100))
+  const canPan = imageSize.width * activeZoom > viewportSize.width + 1
+    || imageSize.height * activeZoom > viewportSize.height + 1
+
+  useEffect(() => {
+    setPan((current) => {
+      const next = clampRasterPreviewPan(current, viewportSize, imageSize, activeZoom)
+      return samePoint(current, next) ? current : next
+    })
+  }, [activeZoom, imageSize, viewportSize])
+
+  const showFit = useCallback(() => {
+    setView({ mode: 'fit', zoom: 1 })
+    setPan({ x: 0, y: 0 })
+  }, [])
+  const showActual = useCallback(() => {
+    setView({ mode: 'actual', zoom: 1 })
+    setPan({ x: 0, y: 0 })
+  }, [])
+  const zoomBy = useCallback((direction: 1 | -1) => {
+    const candidate = direction > 0 ? activeZoom * RASTER_PREVIEW_ZOOM_STEP : activeZoom / RASTER_PREVIEW_ZOOM_STEP
+    const nextZoom = clampRasterPreviewZoom(candidate)
+    if (direction < 0 && activeZoom <= RASTER_PREVIEW_MIN_ZOOM) return
+    if (direction > 0 && activeZoom >= RASTER_PREVIEW_MAX_ZOOM) return
+    setView({ mode: 'custom', zoom: nextZoom })
+  }, [activeZoom])
+  const toggleFitAndActual = useCallback(() => {
+    if (view.mode === 'fit') showActual()
+    else showFit()
+  }, [showActual, showFit, view.mode])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || isRasterPreviewKeyboardTargetEditable(event.target)) return
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault()
+        zoomBy(1)
+      } else if (event.key === '-' || event.key === '_') {
+        event.preventDefault()
+        zoomBy(-1)
+      } else if (event.key === '0') {
+        event.preventDefault()
+        showFit()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [showFit, zoomBy])
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!canPan || event.button !== 0) return
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, origin: pan }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    setDragging(true)
+    event.preventDefault()
+  }
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    setPan(clampRasterPreviewPan({
+      x: drag.origin.x + event.clientX - drag.startX,
+      y: drag.origin.y + event.clientY - drag.startY,
+    }, viewportSize, imageSize, activeZoom))
+  }
+  const finishDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return
+    dragRef.current = null
+    setDragging(false)
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
+  }
+
+  return <div
+    ref={viewportRef}
+    data-testid="raster-preview-viewport"
+    data-view-mode={view.mode}
+    data-zoom={activeZoom.toFixed(4)}
+    className={cn('relative grid min-h-0 min-w-0 flex-1 place-items-center overflow-hidden', canPan && (dragging ? 'cursor-grabbing' : 'cursor-grab'))}
+    role="region"
+    aria-label="图片预览区域，可拖拽平移或双击切换适应窗口与 100%"
+    style={{ touchAction: canPan ? 'none' : 'auto' }}
+    onDoubleClick={toggleFitAndActual}
+    onPointerDown={handlePointerDown}
+    onPointerMove={handlePointerMove}
+    onPointerUp={finishDrag}
+    onPointerCancel={finishDrag}
+  >
+    {src ? <img
+      data-testid="raster-preview-image"
+      className="pointer-events-none absolute left-1/2 top-1/2 block max-h-none max-w-none select-none object-contain object-center will-change-transform"
+      style={{
+        width: imageSize.width > 0 ? `${imageSize.width}px` : 'auto',
+        height: imageSize.height > 0 ? `${imageSize.height}px` : 'auto',
+        transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${activeZoom})`,
+        transformOrigin: 'center',
+      }}
+      src={src}
+      alt={alt}
+      draggable={false}
+      onLoad={(event) => {
+        setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })
+        measureViewport()
+      }}
+    /> : fallback}
+    {src && <div
+      className="absolute bottom-3 left-1/2 z-10 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-1 rounded-lg border border-white/15 bg-black/70 p-1 text-white shadow-lg backdrop-blur sm:bottom-4"
+      role="toolbar"
+      aria-label="图片缩放控制"
+      onPointerDown={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      <Button isIconOnly size="sm" variant="ghost" className="text-white hover:bg-white/15" aria-label="缩小图片（-）" isDisabled={activeZoom <= RASTER_PREVIEW_MIN_ZOOM} onClick={() => zoomBy(-1)}><ZoomOut className="size-4" /></Button>
+      <output className="min-w-12 text-center text-[11px] font-medium tabular-nums" aria-live="polite" aria-label={`当前缩放 ${displayZoom}%`}>{displayZoom}%</output>
+      <Button isIconOnly size="sm" variant="ghost" className="text-white hover:bg-white/15" aria-label="放大图片（+）" isDisabled={activeZoom >= RASTER_PREVIEW_MAX_ZOOM} onClick={() => zoomBy(1)}><ZoomIn className="size-4" /></Button>
+      <span aria-hidden="true" className="mx-0.5 h-5 w-px bg-white/20" />
+      <Button size="sm" variant="ghost" className="px-2 text-white hover:bg-white/15" aria-label="适应窗口（0）" onClick={showFit}><Maximize2 className="size-3.5" /><span className="hidden sm:inline">适应</span></Button>
+      <Button size="sm" variant="ghost" className="min-w-12 px-2 text-white hover:bg-white/15" aria-label="显示为原始大小 100%" onClick={showActual}>100%</Button>
+    </div>}
+    {children}
+  </div>
+}
+
 function ImageVariantToolbar({ mode, params, pending, valid, failed, onModeChange, onParamsChange }: { mode: ImagePreviewMode; params: VariantParams; pending: boolean; valid: boolean; failed: boolean; onModeChange: (mode: ImagePreviewMode) => void; onParamsChange: (params: VariantParams) => void }) {
   return <div data-testid="image-variant-toolbar" className="shrink-0 border-b border-separator bg-surface px-3 py-2">
     <div className="flex min-w-0 items-end gap-3 overflow-x-auto pb-1">
@@ -1259,8 +1460,7 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
   const genericMedia = originalPreview.isLoading ? loading : originalPreview.error ? originalError : currentUrl ? <Suspense fallback={<div className="flex items-center gap-3 text-sm text-white/65"><Spinner aria-label="加载多格式查看器" color="accent" /><span>正在加载查看器</span></div>}><EnhancedPreviewSurface fileName={item.name} mimeType={item.type} size={item.size} url={currentUrl} theme={resolvedTheme} /></Suspense> : null
   const rasterMedia = <>
     <ImageVariantToolbar mode={imageMode} params={variantParams} pending={variantPending} valid={variantValid} failed={Boolean(variantError)} onModeChange={setImageMode} onParamsChange={handleVariantParamsChange} />
-    <div data-testid="raster-preview-viewport" className="relative grid min-h-0 min-w-0 flex-1 place-items-center overflow-hidden p-3 sm:p-5">
-      {originalPreview.isLoading ? loading : originalPreview.error ? originalError : currentUrl ? <img data-testid="raster-preview-image" className="block h-full min-h-0 w-full min-w-0 object-contain object-center" src={currentUrl} alt={item.name} /> : null}
+    <RasterImageCanvas src={currentUrl} alt={item.name} resetKey={`${item.id}:${item.revision}:${imageMode}:${currentUrl ?? ''}`} fallback={originalPreview.isLoading ? loading : originalPreview.error ? originalError : null}>
       {imageMode === 'variant' && variantCandidateUrl && debouncedVariant && variantCandidateUrl !== loadedVariant?.url && <img
         key={`${variantCandidateUrl}:${variantImageAttempt}`}
         data-testid="variant-image-preloader"
@@ -1272,8 +1472,8 @@ export function ObjectPreviewModal({ item, variant, onClose, onEdit }: { item: O
         onError={() => setVariantImageError('Variant 图像生成失败，仍保留上一次成功的预览。')}
       />}
       {variantPending && currentUrl && <span className="pointer-events-none absolute right-4 top-4 flex items-center gap-2 rounded-md bg-black/70 px-2.5 py-1.5 text-[10px] text-white shadow-sm"><LoaderCircle className="size-3.5 animate-spin" />正在生成 Variant</span>}
-      {imageMode === 'variant' && variantError && <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between gap-3 rounded-md border border-danger/30 bg-danger-soft px-3 py-2 text-xs text-danger-soft-foreground" role="alert"><span>{variantError}</span><Button size="sm" variant="danger-soft" className="shrink-0" onClick={retryVariant}><RefreshCw className="size-3.5" />重试</Button></div>}
-    </div>
+      {imageMode === 'variant' && variantError && <div className="absolute bottom-16 left-4 right-4 z-20 flex items-center justify-between gap-3 rounded-md border border-danger/30 bg-danger-soft px-3 py-2 text-xs text-danger-soft-foreground" role="alert"><span>{variantError}</span><Button size="sm" variant="danger-soft" className="shrink-0" onClick={retryVariant}><RefreshCw className="size-3.5" />重试</Button></div>}
+    </RasterImageCanvas>
   </>
 
   return <Modal title={variant ? 'Variant 预览' : '对象预览'} onClose={onClose} size="cover" containerClassName="h-[calc(100dvh-2rem)] max-h-[calc(100dvh-2rem)] sm:h-[calc(100dvh-3rem)] sm:max-h-[calc(100dvh-3rem)]" dialogClassName="flex h-full min-h-0 flex-col overflow-hidden" bodyClassName="flex min-h-0 flex-1 overflow-hidden p-0">

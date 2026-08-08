@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::STANDARD;
 use mediahub_app::{S3MultipartUploadState, S3ObjectRepository};
-use mediahub_core::ObjectVersionPayload;
+use mediahub_core::{ObjectVersionPayload, VersioningStatus};
 
 use super::s3_http::S3ApiError;
 use super::*;
@@ -43,6 +43,7 @@ async fn auth_test_state(pool: sqlx::PgPool, registration_enabled: bool) -> Arc<
     let webdav = webdav::WebDavService::new(
         repository.clone(),
         object_store.clone(),
+        time::Duration::hours(24),
         Arc::clone(&access_key_cipher),
     );
     Arc::new(AppState {
@@ -395,6 +396,497 @@ fn s3_test_xml_value(xml: &str, element: &str) -> Option<String> {
 }
 
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
+async fn s3_bucket_object_lock_http_round_trip_is_signed_strict_and_persistent(pool: sqlx::PgPool) {
+    let state = auth_test_state(pool, true).await;
+    let (user_id, _) = authenticated_test_user(&state, "s3-object-lock@example.com", "user").await;
+    let application = state
+        .repository
+        .default_application_for_user(user_id)
+        .await
+        .expect("application lookup")
+        .expect("application");
+    let access_key_id = "mh_ak_object_lock_test";
+    let access_key_secret = "object-lock-test-secret";
+    state
+        .repository
+        .create_access_key(&NewAccessKey {
+            id: uuid::Uuid::now_v7().to_string(),
+            application_id: application.id,
+            access_key_id: access_key_id.into(),
+            secret_ciphertext: state
+                .access_key_cipher
+                .encrypt(access_key_secret.as_bytes())
+                .expect("encrypt access key"),
+            secret_key_version: state.access_key_cipher.version(),
+            secret_last_four: "cret".into(),
+            name: "Object Lock S3".into(),
+            permissions: vec!["bucket:manage".into(), "bucket:list".into()],
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .expect("persist access key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn({
+        let application = s3_router::router(Arc::clone(&state));
+        async move {
+            axum::serve(listener, application)
+                .await
+                .expect("S3 Object Lock test server");
+        }
+    });
+    let client = reqwest::Client::new();
+    let bucket_url = format!("http://{address}/locked-assets");
+
+    let mut create = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&bucket_url)
+        .header("host", address.to_string())
+        .header("x-amz-bucket-object-lock-enabled", "true")
+        .body(Vec::new())
+        .expect("CreateBucket request");
+    sign_s3_test_request(&mut create, access_key_id, access_key_secret, None);
+    let created = send_s3_test_request(&client, create).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_configuration = mediahub_app::S3BucketRepository::get_s3_bucket_configuration(
+        &state.repository,
+        application.id,
+        "locked-assets",
+    )
+    .await
+    .expect("configuration lookup")
+    .expect("created bucket");
+    assert!(created_configuration.object_lock_enabled());
+    assert_eq!(
+        created_configuration.versioning_status(),
+        VersioningStatus::Enabled
+    );
+    assert_eq!(created_configuration.revision(), 1);
+
+    let mut get = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetObjectLockConfiguration request");
+    sign_s3_test_request(&mut get, access_key_id, access_key_secret, None);
+    let response = send_s3_test_request(&client, get).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let initial_xml = response.text().await.expect("Object Lock XML");
+    assert!(initial_xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
+    assert!(!initial_xml.contains("<Rule>"));
+
+    let object_lock_xml = br#"<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Years>2</Years></DefaultRetention></Rule></ObjectLockConfiguration>"#.to_vec();
+    let content_md5 = STANDARD.encode(md5::Md5::digest(&object_lock_xml));
+    let mut put = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .header("content-md5", content_md5)
+        .body(object_lock_xml)
+        .expect("PutObjectLockConfiguration request");
+    sign_s3_test_request(&mut put, access_key_id, access_key_secret, None);
+    let response = send_s3_test_request(&client, put).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut get = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetObjectLockConfiguration request");
+    sign_s3_test_request(&mut get, access_key_id, access_key_secret, None);
+    let response = send_s3_test_request(&client, get).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let configured_xml = response.text().await.expect("configured Object Lock XML");
+    assert!(configured_xml.contains("<Mode>COMPLIANCE</Mode>"));
+    assert!(configured_xml.contains("<Years>2</Years>"));
+    let configured = mediahub_app::S3BucketRepository::get_s3_bucket_configuration(
+        &state.repository,
+        application.id,
+        "locked-assets",
+    )
+    .await
+    .expect("configuration lookup")
+    .expect("configured bucket");
+    assert_eq!(configured.revision(), 2);
+
+    let missing_md5_body =
+        br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"#.to_vec();
+    let mut missing_md5 = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .body(missing_md5_body)
+        .expect("missing Content-MD5 request");
+    sign_s3_test_request(&mut missing_md5, access_key_id, access_key_secret, None);
+    let response = send_s3_test_request(&client, missing_md5).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("missing MD5 error")
+            .contains("<Code>InvalidDigest</Code>")
+    );
+
+    let invalid_bucket_url = format!("http://{address}/invalid-lock-header");
+    let mut false_header = http::Request::builder()
+        .method(Method::PUT)
+        .uri(invalid_bucket_url)
+        .header("host", address.to_string())
+        .header("x-amz-bucket-object-lock-enabled", "false")
+        .body(Vec::new())
+        .expect("invalid CreateBucket Object Lock header");
+    sign_s3_test_request(&mut false_header, access_key_id, access_key_secret, None);
+    let response = send_s3_test_request(&client, false_header).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("invalid Object Lock header error")
+            .contains("<Code>InvalidArgument</Code>")
+    );
+
+    let ordinary_bucket_url = format!("http://{address}/ordinary-assets");
+    let mut create_ordinary = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&ordinary_bucket_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("ordinary CreateBucket request");
+    sign_s3_test_request(&mut create_ordinary, access_key_id, access_key_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, create_ordinary)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let mut get_disabled = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{ordinary_bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetObjectLockConfiguration for ordinary bucket");
+    sign_s3_test_request(&mut get_disabled, access_key_id, access_key_secret, None);
+    let response = send_s3_test_request(&client, get_disabled).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("Object Lock not configured error")
+            .contains("<Code>ObjectLockConfigurationNotFoundError</Code>")
+    );
+
+    let enable_xml =
+        br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"#
+            .to_vec();
+    let enable_md5 = STANDARD.encode(md5::Md5::digest(&enable_xml));
+    let mut enable_existing = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{ordinary_bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .header("content-md5", enable_md5)
+        .body(enable_xml)
+        .expect("enable Object Lock on an existing bucket");
+    sign_s3_test_request(&mut enable_existing, access_key_id, access_key_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, enable_existing)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let enabled_existing = mediahub_app::S3BucketRepository::get_s3_bucket_configuration(
+        &state.repository,
+        application.id,
+        "ordinary-assets",
+    )
+    .await
+    .expect("configuration lookup")
+    .expect("ordinary bucket");
+    assert!(enabled_existing.object_lock_enabled());
+    assert_eq!(
+        enabled_existing.versioning_status(),
+        VersioningStatus::Enabled
+    );
+    assert_eq!(enabled_existing.revision(), 2);
+
+    server.abort();
+}
+
+#[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
+async fn s3_object_version_lock_http_round_trip_enforces_retention_and_legal_hold(
+    pool: sqlx::PgPool,
+) {
+    let state = auth_test_state(pool, true).await;
+    let (user_id, _) = authenticated_test_user(&state, "s3-version-lock@example.com", "user").await;
+    let application = state
+        .repository
+        .default_application_for_user(user_id)
+        .await
+        .expect("application lookup")
+        .expect("application");
+    let access_key_id = "mh_ak_version_lock_test";
+    let access_key_secret = "version-lock-test-secret";
+    state
+        .repository
+        .create_access_key(&NewAccessKey {
+            id: uuid::Uuid::now_v7().to_string(),
+            application_id: application.id,
+            access_key_id: access_key_id.into(),
+            secret_ciphertext: state
+                .access_key_cipher
+                .encrypt(access_key_secret.as_bytes())
+                .expect("encrypt access key"),
+            secret_key_version: state.access_key_cipher.version(),
+            secret_last_four: "cret".into(),
+            name: "ObjectVersion Lock S3".into(),
+            permissions: vec![
+                "bucket:manage".into(),
+                "bucket:list".into(),
+                "media:upload".into(),
+                "media:read".into(),
+            ],
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .expect("persist access key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn({
+        let application = s3_router::router(Arc::clone(&state));
+        async move {
+            axum::serve(listener, application)
+                .await
+                .expect("S3 ObjectVersion lock test server");
+        }
+    });
+    let client = reqwest::Client::new();
+    let bucket_url = format!("http://{address}/version-locked-assets");
+    let mut create = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&bucket_url)
+        .header("host", address.to_string())
+        .header("x-amz-bucket-object-lock-enabled", "true")
+        .body(Vec::new())
+        .expect("CreateBucket request");
+    sign_s3_test_request(&mut create, access_key_id, access_key_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, create).await.status(),
+        StatusCode::OK
+    );
+
+    let bucket_lock = br#"<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#.to_vec();
+    let bucket_lock_md5 = STANDARD.encode(md5::Md5::digest(&bucket_lock));
+    let mut configure = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{bucket_url}?object-lock"))
+        .header("host", address.to_string())
+        .header("content-md5", bucket_lock_md5)
+        .body(bucket_lock)
+        .expect("PutObjectLockConfiguration request");
+    sign_s3_test_request(&mut configure, access_key_id, access_key_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, configure).await.status(),
+        StatusCode::OK
+    );
+
+    let explicit_until = (OffsetDateTime::now_utc() + time::Duration::days(60))
+        .replace_nanosecond(0)
+        .expect("whole-second explicit retention");
+    let explicit_until = explicit_until
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("retention timestamp");
+    let object_url = format!("{bucket_url}/docs/locked.txt");
+    let mut put = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&object_url)
+        .header("host", address.to_string())
+        .header(CONTENT_TYPE, "text/plain")
+        .header("x-amz-object-lock-mode", "COMPLIANCE")
+        .header("x-amz-object-lock-retain-until-date", &explicit_until)
+        .header("x-amz-object-lock-legal-hold", "ON")
+        .body(b"locked-content".to_vec())
+        .expect("PutObject request");
+    sign_s3_test_request(&mut put, access_key_id, access_key_secret, None);
+    let put = send_s3_test_request(&client, put).await;
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(put.headers()["x-amz-object-lock-mode"], "COMPLIANCE");
+    assert_eq!(
+        put.headers()["x-amz-object-lock-retain-until-date"],
+        explicit_until
+    );
+    assert_eq!(put.headers()["x-amz-object-lock-legal-hold"], "ON");
+    let version_id = put.headers()["x-amz-version-id"]
+        .to_str()
+        .expect("version ID")
+        .to_owned();
+
+    let mut get_retention = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{object_url}?retention&versionId={version_id}"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetObjectRetention request");
+    sign_s3_test_request(&mut get_retention, access_key_id, access_key_secret, None);
+    let get_retention = send_s3_test_request(&client, get_retention).await;
+    assert_eq!(get_retention.status(), StatusCode::OK);
+    assert_eq!(get_retention.headers()["x-amz-version-id"], version_id);
+    let retention_xml = get_retention.text().await.expect("retention XML");
+    assert!(retention_xml.contains("<Mode>COMPLIANCE</Mode>"));
+    assert!(retention_xml.contains(&format!(
+        "<RetainUntilDate>{explicit_until}</RetainUntilDate>"
+    )));
+
+    let shorter_until = (OffsetDateTime::now_utc() + time::Duration::days(40))
+        .replace_nanosecond(0)
+        .expect("whole-second shorter retention")
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("shorter timestamp");
+    let shorter_xml = format!(
+        "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>{shorter_until}</RetainUntilDate></Retention>"
+    )
+    .into_bytes();
+    let shorter_md5 = STANDARD.encode(md5::Md5::digest(&shorter_xml));
+    let mut shorten = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{object_url}?retention&versionId={version_id}"))
+        .header("host", address.to_string())
+        .header("content-md5", shorter_md5)
+        .header("x-amz-bypass-governance-retention", "true")
+        .body(shorter_xml)
+        .expect("shorten compliance retention request");
+    sign_s3_test_request(&mut shorten, access_key_id, access_key_secret, None);
+    let shorten = send_s3_test_request(&client, shorten).await;
+    assert_eq!(shorten.status(), StatusCode::FORBIDDEN);
+    assert!(
+        shorten
+            .text()
+            .await
+            .expect("locked response")
+            .contains("<Code>AccessDenied</Code>")
+    );
+
+    let legal_hold_off = br#"<LegalHold><Status>OFF</Status></LegalHold>"#.to_vec();
+    let legal_hold_md5 = STANDARD.encode(md5::Md5::digest(&legal_hold_off));
+    let mut release_hold = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{object_url}?legal-hold&versionId={version_id}"))
+        .header("host", address.to_string())
+        .header("content-md5", legal_hold_md5)
+        .body(legal_hold_off)
+        .expect("PutObjectLegalHold request");
+    sign_s3_test_request(&mut release_hold, access_key_id, access_key_secret, None);
+    assert_eq!(
+        send_s3_test_request(&client, release_hold).await.status(),
+        StatusCode::OK
+    );
+    let mut get_hold = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("{object_url}?legal-hold&versionId={version_id}"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("GetObjectLegalHold request");
+    sign_s3_test_request(&mut get_hold, access_key_id, access_key_secret, None);
+    let get_hold = send_s3_test_request(&client, get_hold).await;
+    assert_eq!(get_hold.status(), StatusCode::OK);
+    assert!(
+        get_hold
+            .text()
+            .await
+            .expect("legal hold XML")
+            .contains("<Status>OFF</Status>")
+    );
+
+    let missing_md5 = br#"<LegalHold><Status>ON</Status></LegalHold>"#.to_vec();
+    let mut missing_md5_request = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{object_url}?legal-hold&versionId={version_id}"))
+        .header("host", address.to_string())
+        .body(missing_md5)
+        .expect("missing MD5 request");
+    sign_s3_test_request(
+        &mut missing_md5_request,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let missing_md5_response = send_s3_test_request(&client, missing_md5_request).await;
+    assert_eq!(missing_md5_response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        missing_md5_response
+            .text()
+            .await
+            .expect("missing MD5 error")
+            .contains("<Code>InvalidDigest</Code>")
+    );
+
+    let governance_url = format!("{bucket_url}/docs/governance.txt");
+    let governance_until = (OffsetDateTime::now_utc() + time::Duration::days(50))
+        .replace_nanosecond(0)
+        .expect("whole-second governance retention")
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("governance timestamp");
+    let mut put_governance = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&governance_url)
+        .header("host", address.to_string())
+        .header("x-amz-object-lock-mode", "GOVERNANCE")
+        .header("x-amz-object-lock-retain-until-date", governance_until)
+        .body(b"governance".to_vec())
+        .expect("governance PutObject request");
+    sign_s3_test_request(&mut put_governance, access_key_id, access_key_secret, None);
+    let put_governance = send_s3_test_request(&client, put_governance).await;
+    assert_eq!(put_governance.status(), StatusCode::OK);
+    let governance_version = put_governance.headers()["x-amz-version-id"]
+        .to_str()
+        .expect("governance version")
+        .to_owned();
+    let bypass_until = (OffsetDateTime::now_utc() + time::Duration::days(20))
+        .replace_nanosecond(0)
+        .expect("whole-second bypass retention")
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("bypass timestamp");
+    let bypass_xml = format!(
+        "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{bypass_until}</RetainUntilDate></Retention>"
+    )
+    .into_bytes();
+    let bypass_md5 = STANDARD.encode(md5::Md5::digest(&bypass_xml));
+    let mut unsigned_bypass = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!(
+            "{governance_url}?retention&versionId={governance_version}"
+        ))
+        .header("host", address.to_string())
+        .header("content-md5", bypass_md5)
+        .body(bypass_xml)
+        .expect("unsigned bypass request");
+    sign_s3_test_request(&mut unsigned_bypass, access_key_id, access_key_secret, None);
+    unsigned_bypass.headers_mut().insert(
+        HeaderName::from_static("x-amz-bypass-governance-retention"),
+        HeaderValue::from_static("true"),
+    );
+    let unsigned_bypass = send_s3_test_request(&client, unsigned_bypass).await;
+    assert_eq!(unsigned_bypass.status(), StatusCode::FORBIDDEN);
+    assert!(
+        unsigned_bypass
+            .text()
+            .await
+            .expect("unsigned bypass error")
+            .contains("<Code>AccessDenied</Code>")
+    );
+
+    server.abort();
+}
+
+#[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
 async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(pool: sqlx::PgPool) {
     let state = auth_test_state(pool, true).await;
     let storage_root = state.object_store.root().to_path_buf();
@@ -538,6 +1030,33 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
     assert!(put_response.headers().contains_key(ETAG));
     assert!(put_response.headers().contains_key("x-amz-request-id"));
     assert_eq!(put_response.headers()["x-amz-version-id"], "null");
+
+    let empty_url = format!("http://{address}/{}/empty/zero-byte.txt", bucket.name());
+    let mut empty_put = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&empty_url)
+        .header("host", address.to_string())
+        .header(CONTENT_TYPE, "text/plain")
+        .header(CONTENT_LENGTH, "0")
+        .body(Vec::new())
+        .expect("zero-byte PutObject request");
+    sign_s3_test_request(&mut empty_put, access_key_id, access_key_secret, None);
+    let empty_put = send_s3_test_request(&client, empty_put).await;
+    assert_eq!(empty_put.status(), StatusCode::OK);
+    assert_eq!(
+        empty_put.headers()[ETAG],
+        "\"d41d8cd98f00b204e9800998ecf8427e\""
+    );
+    let mut empty_head = http::Request::builder()
+        .method(Method::HEAD)
+        .uri(&empty_url)
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("zero-byte HeadObject request");
+    sign_s3_test_request(&mut empty_head, access_key_id, access_key_secret, None);
+    let empty_head = send_s3_test_request(&client, empty_head).await;
+    assert_eq!(empty_head.status(), StatusCode::OK);
+    assert_eq!(empty_head.headers()[CONTENT_LENGTH], "0");
 
     let object = state
         .repository
@@ -739,6 +1258,190 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
             .await
             .expect("ACL error XML")
             .contains("<Code>AccessControlListNotSupported</Code>")
+    );
+
+    let copy_key = "images/copied-result.webp";
+    let copy_url = format!("http://{address}/{}/{}", bucket.name(), copy_key);
+    let copy_source = format!("/{}/images%2Fimgtask_test-0.png", bucket.name());
+    let mut copy = http::Request::builder()
+        .method(Method::PUT)
+        .uri(&copy_url)
+        .header("host", address.to_string())
+        .header("x-amz-copy-source", &copy_source)
+        .header("x-amz-metadata-directive", "REPLACE")
+        .header(CONTENT_TYPE, "image/webp")
+        .header("x-amz-meta-origin", "copy-object-test")
+        .body(Vec::new())
+        .expect("CopyObject request");
+    sign_s3_test_request(&mut copy, access_key_id, access_key_secret, None);
+    let copy = send_s3_test_request(&client, copy).await;
+    let copy_status = copy.status();
+    assert_eq!(copy.headers()["x-amz-version-id"], "null");
+    assert_eq!(copy.headers()["x-amz-copy-source-version-id"], "null");
+    let copy_xml = copy.text().await.expect("CopyObject XML");
+    assert_eq!(
+        copy_status,
+        StatusCode::OK,
+        "CopyObject response: {copy_xml}"
+    );
+    assert!(copy_xml.contains("<CopyObjectResult"));
+    assert!(copy_xml.contains("<ETag>&quot;"));
+    let copied_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), copy_key)
+        .await
+        .expect("copied object lookup")
+        .expect("copied object");
+    let copied_version = state
+        .repository
+        .find_current_s3_object_version(copied_object.id())
+        .await
+        .expect("copied version lookup")
+        .expect("copied version");
+    assert_eq!(
+        copied_version.source_protocol(),
+        mediahub_core::SourceProtocol::S3
+    );
+    let ObjectVersionPayload::Object(copied_payload) = copied_version.payload() else {
+        panic!("CopyObject must commit an object payload");
+    };
+    assert_eq!(copied_payload.content_type(), Some("image/webp"));
+    assert_eq!(
+        copied_payload.user_metadata()["origin"],
+        serde_json::json!("copy-object-test")
+    );
+    assert_eq!(
+        state
+            .object_store
+            .read(copied_payload.storage_key())
+            .await
+            .expect("read copied object"),
+        content
+    );
+
+    let mut failed_copy_condition = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{copy_url}-condition-failed"))
+        .header("host", address.to_string())
+        .header("x-amz-copy-source", &copy_source)
+        .header("x-amz-copy-source-if-match", "\"not-the-source-etag\"")
+        .body(Vec::new())
+        .expect("conditional CopyObject request");
+    sign_s3_test_request(
+        &mut failed_copy_condition,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let failed_copy_condition = send_s3_test_request(&client, failed_copy_condition).await;
+    assert_eq!(
+        failed_copy_condition.status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+
+    let part_copy_key = "images/upload-part-copy.bin";
+    let part_copy_url = format!("http://{address}/{}/{}", bucket.name(), part_copy_key);
+    let mut create_part_copy = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("{part_copy_url}?uploads"))
+        .header("host", address.to_string())
+        .body(Vec::new())
+        .expect("CreateMultipartUpload for UploadPartCopy");
+    sign_s3_test_request(
+        &mut create_part_copy,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let create_part_copy = send_s3_test_request(&client, create_part_copy).await;
+    assert_eq!(create_part_copy.status(), StatusCode::OK);
+    let part_copy_create_xml = create_part_copy
+        .text()
+        .await
+        .expect("UploadPartCopy UploadId XML");
+    let part_copy_upload_id =
+        s3_test_xml_value(&part_copy_create_xml, "UploadId").expect("UploadPartCopy UploadId");
+    let mut upload_part_copy = http::Request::builder()
+        .method(Method::PUT)
+        .uri(format!(
+            "{part_copy_url}?partNumber=1&uploadId={part_copy_upload_id}"
+        ))
+        .header("host", address.to_string())
+        .header("x-amz-copy-source", &copy_source)
+        .header("x-amz-copy-source-range", "bytes=1-4")
+        .body(Vec::new())
+        .expect("UploadPartCopy request");
+    sign_s3_test_request(
+        &mut upload_part_copy,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let upload_part_copy = send_s3_test_request(&client, upload_part_copy).await;
+    let upload_part_copy_status = upload_part_copy.status();
+    assert_eq!(
+        upload_part_copy.headers()["x-amz-copy-source-version-id"],
+        "null"
+    );
+    let upload_part_copy_xml = upload_part_copy.text().await.expect("UploadPartCopy XML");
+    assert_eq!(
+        upload_part_copy_status,
+        StatusCode::OK,
+        "UploadPartCopy response: {upload_part_copy_xml}"
+    );
+    assert!(upload_part_copy_xml.contains("<CopyPartResult"));
+    let upload_part_copy_etag =
+        s3_test_xml_value(&upload_part_copy_xml, "ETag").expect("UploadPartCopy ETag");
+    let part_copy_complete_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{upload_part_copy_etag}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let mut complete_part_copy = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("{part_copy_url}?uploadId={part_copy_upload_id}"))
+        .header("host", address.to_string())
+        .header(CONTENT_TYPE, "application/xml")
+        .body(part_copy_complete_body)
+        .expect("CompleteMultipartUpload after UploadPartCopy");
+    sign_s3_test_request(
+        &mut complete_part_copy,
+        access_key_id,
+        access_key_secret,
+        None,
+    );
+    let complete_part_copy = send_s3_test_request(&client, complete_part_copy).await;
+    let complete_part_copy_status = complete_part_copy.status();
+    let complete_part_copy_xml = complete_part_copy
+        .text()
+        .await
+        .expect("UploadPartCopy completion XML");
+    assert_eq!(
+        complete_part_copy_status,
+        StatusCode::OK,
+        "UploadPartCopy completion response: {complete_part_copy_xml}"
+    );
+    let part_copy_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), part_copy_key)
+        .await
+        .expect("UploadPartCopy object lookup")
+        .expect("UploadPartCopy object");
+    let part_copy_version = state
+        .repository
+        .find_current_s3_object_version(part_copy_object.id())
+        .await
+        .expect("UploadPartCopy version lookup")
+        .expect("UploadPartCopy version");
+    let ObjectVersionPayload::Object(part_copy_payload) = part_copy_version.payload() else {
+        panic!("UploadPartCopy completion must commit object data");
+    };
+    assert_eq!(
+        state
+            .object_store
+            .read(part_copy_payload.storage_key())
+            .await
+            .expect("read UploadPartCopy object"),
+        content[1..5]
     );
 
     let multipart_key = "images/multipart-result.bin";
@@ -992,7 +1695,7 @@ async fn s3_gateway_persists_object_versions_and_serves_presigned_get_and_head(p
     let mut second_list = http::Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "{bucket_url}?list-type=2&prefix=images%2F&max-keys=1&continuation-token={continuation}"
+            "{bucket_url}?list-type=2&prefix=images%2F&max-keys=100&continuation-token={continuation}"
         ))
         .header("host", address.to_string())
         .body(Vec::new())
@@ -1994,7 +2697,8 @@ async fn canonical_object_paths_enforce_visibility_and_preserve_http_reads(pool:
 }
 
 #[sqlx::test(migrator = "mediahub_adapter_postgres::MIGRATOR")]
-async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::PgPool) {
+async fn webdav_uses_object_versions_while_path_api_remains_legacy(pool: sqlx::PgPool) {
+    let verification_pool = pool.clone();
     let state = auth_test_state(pool, true).await;
     let storage_root = state.object_store.root().to_path_buf();
     let (user_id, session_headers) =
@@ -2018,16 +2722,6 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
         .create_bucket(&bucket)
         .await
         .expect("persist bucket");
-    upload_test_media(
-        &state,
-        application.id,
-        bucket.id(),
-        "nested/source.txt",
-        b"source-content",
-        None,
-    )
-    .await;
-
     let access_key_id = "mh_ak_webdav";
     let access_key_secret = "webdav-secret";
     state
@@ -2119,6 +2813,35 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
             .contains(&application.app_id)
     );
 
+    let source_url = format!("{dav_bucket}nested/source.txt");
+    let source_put = client
+        .put(&source_url)
+        .basic_auth(access_key_id, Some(access_key_secret))
+        .header(CONTENT_TYPE, "application/x-prismark-text")
+        .body("source-content")
+        .send()
+        .await
+        .expect("DAV source PUT");
+    assert_eq!(source_put.status(), StatusCode::CREATED);
+    let source_etag = source_put
+        .headers()
+        .get(ETAG)
+        .expect("DAV source ETag")
+        .clone();
+    let source_head = client
+        .head(&source_url)
+        .basic_auth(access_key_id, Some(access_key_secret))
+        .send()
+        .await
+        .expect("DAV source HEAD");
+    assert_eq!(source_head.status(), StatusCode::OK);
+    assert_eq!(source_head.headers()[CONTENT_LENGTH], "14");
+    assert_eq!(
+        source_head.headers()[CONTENT_TYPE],
+        "application/x-prismark-text"
+    );
+    assert_eq!(source_head.headers()[ETAG], source_etag);
+
     let bucket_listing = client
         .request(
             reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND"),
@@ -2167,7 +2890,47 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
         .send()
         .await
         .expect("duplicate DAV PUT");
-    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(duplicate.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .repository
+            .find_by_object_key(application.id, bucket.id(), "nested/uploaded.txt")
+            .await
+            .expect("legacy Media lookup")
+            .is_none(),
+        "WebDAV must not create a Media shadow row"
+    );
+    let uploaded_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), "nested/uploaded.txt")
+        .await
+        .expect("WebDAV object lookup")
+        .expect("WebDAV logical object");
+    assert_eq!(uploaded_object.generation(), 2);
+    let uploaded_version = state
+        .repository
+        .find_current_s3_object_version(uploaded_object.id())
+        .await
+        .expect("WebDAV current version lookup")
+        .expect("WebDAV current version");
+    assert_eq!(
+        uploaded_version.source_protocol(),
+        mediahub_core::SourceProtocol::Dav
+    );
+    let ObjectVersionPayload::Object(uploaded_payload) = uploaded_version.payload() else {
+        panic!("WebDAV current version must contain object data");
+    };
+    assert_eq!(uploaded_payload.size_bytes(), 11);
+    assert_eq!(uploaded_payload.content_type(), Some("text/plain"));
+    let replacement_gc_tasks = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM storage_gc_tasks
+         WHERE application_id = $1 AND reason = 'replaced_null_version'",
+    )
+    .bind(application.id.as_uuid())
+    .fetch_one(&verification_pool)
+    .await
+    .expect("WebDAV replacement GC lookup");
+    assert_eq!(replacement_gc_tasks, 1);
 
     let new_bucket_url = format!("{dav_application}dav-created/");
     let mkcol = client
@@ -2193,33 +2956,77 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
         .await
         .expect("DAV COPY");
     assert_eq!(copy.status(), StatusCode::CREATED);
+    let copied = client
+        .get(&copy_url)
+        .basic_auth(access_key_id, Some(access_key_secret))
+        .send()
+        .await
+        .expect("copied DAV object GET");
+    assert_eq!(copied.status(), StatusCode::OK);
+    assert_eq!(
+        copied.headers()[CONTENT_TYPE],
+        "application/x-prismark-text"
+    );
+    assert_eq!(
+        copied.bytes().await.expect("copied DAV body").as_ref(),
+        b"source-content"
+    );
 
     let moved_url = format!("{dav_bucket}nested/moved.txt");
     let moved = client
         .request(
             reqwest::Method::from_bytes(b"MOVE").expect("MOVE"),
-            &copy_url,
+            &source_url,
         )
         .basic_auth(access_key_id, Some(access_key_secret))
         .header("Destination", &moved_url)
         .send()
         .await
         .expect("DAV MOVE");
-    assert_eq!(moved.status(), StatusCode::CREATED);
-    let removed_source = client
-        .get(&copy_url)
+    assert_eq!(moved.status(), StatusCode::NOT_IMPLEMENTED);
+    let preserved_source = client
+        .get(&source_url)
         .basic_auth(access_key_id, Some(access_key_secret))
         .send()
         .await
-        .expect("moved source GET");
-    assert_eq!(removed_source.status(), StatusCode::NOT_FOUND);
+        .expect("source GET after rejected MOVE");
+    assert_eq!(preserved_source.status(), StatusCode::OK);
+    mediahub_app::S3BucketRepository::set_s3_bucket_versioning(
+        &state.repository,
+        application.id,
+        bucket.name(),
+        mediahub_core::VersioningStatus::Enabled,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .expect("enable versioning before DAV delete");
     let delete = client
-        .delete(&moved_url)
+        .delete(&put_url)
         .basic_auth(access_key_id, Some(access_key_secret))
         .send()
         .await
         .expect("DAV DELETE");
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    let deleted_head = client
+        .head(&put_url)
+        .basic_auth(access_key_id, Some(access_key_secret))
+        .send()
+        .await
+        .expect("deleted DAV object HEAD");
+    assert_eq!(deleted_head.status(), StatusCode::NOT_FOUND);
+    let deleted_object = state
+        .repository
+        .find_s3_object(application.id, bucket.id(), "nested/uploaded.txt")
+        .await
+        .expect("deleted WebDAV object lookup")
+        .expect("deleted WebDAV logical object");
+    let delete_marker = state
+        .repository
+        .find_current_s3_object_version(deleted_object.id())
+        .await
+        .expect("WebDAV delete marker lookup")
+        .expect("WebDAV delete marker");
+    assert!(delete_marker.is_delete_marker());
 
     let renamed_directory = format!("{dav_bucket}renamed/");
     let directory_move = client
@@ -2232,29 +3039,29 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
         .send()
         .await
         .expect("DAV directory MOVE");
-    assert_eq!(directory_move.status(), StatusCode::CREATED);
+    assert_eq!(directory_move.status(), StatusCode::NOT_IMPLEMENTED);
     let renamed_source = client
         .get(format!("{renamed_directory}source.txt"))
         .basic_auth(access_key_id, Some(access_key_secret))
         .send()
         .await
         .expect("renamed directory object GET");
-    assert_eq!(renamed_source.status(), StatusCode::OK);
-    assert_eq!(
-        renamed_source
-            .bytes()
-            .await
-            .expect("renamed directory object body")
-            .as_ref(),
-        b"source-content"
-    );
+    assert_eq!(renamed_source.status(), StatusCode::NOT_FOUND);
     let old_directory_source = client
         .get(format!("{dav_bucket}nested/source.txt"))
         .basic_auth(access_key_id, Some(access_key_secret))
         .send()
         .await
         .expect("old directory object GET");
-    assert_eq!(old_directory_source.status(), StatusCode::NOT_FOUND);
+    assert_eq!(old_directory_source.status(), StatusCode::OK);
+    assert_eq!(
+        old_directory_source
+            .bytes()
+            .await
+            .expect("original directory object body")
+            .as_ref(),
+        b"source-content"
+    );
 
     let isolated = client
         .request(
@@ -2422,9 +3229,8 @@ async fn webdav_and_path_object_api_share_the_durable_object_model(pool: sqlx::P
         .expect("WebDAV audit list");
     for action in [
         "bucket.created",
-        "media.uploaded",
-        "media.copied",
-        "media.delete_scheduled",
+        "dav.object.uploaded",
+        "dav.object.deleted",
     ] {
         assert!(
             audit.iter().any(|event| {
@@ -3238,6 +4044,8 @@ async fn startup_rejects_database_key_versions_missing_from_the_keyring(pool: sq
     };
     assert!(error.to_string().contains("version 2"));
 }
+
+include!("handlers_object_versions_tests.rs");
 
 #[test]
 fn signed_media_url_tokens_reject_tampering() {

@@ -1663,6 +1663,168 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/object-versions/{version_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read immutable ObjectVersion content */
+        get: {
+            parameters: {
+                query?: never;
+                header?: {
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
+                    Range?: components["parameters"]["Range"];
+                    "If-None-Match"?: components["parameters"]["IfNoneMatch"];
+                };
+                path: {
+                    version_id: components["parameters"]["ObjectVersionId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/octet-stream": string;
+                    };
+                };
+                /** @description Partial content */
+                206: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/octet-stream": string;
+                    };
+                };
+                /** @description Not modified */
+                304: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Range not satisfiable */
+                416: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        /** Read immutable ObjectVersion content headers */
+        head: {
+            parameters: {
+                query?: never;
+                header?: {
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
+                    Range?: components["parameters"]["Range"];
+                    "If-None-Match"?: components["parameters"]["IfNoneMatch"];
+                };
+                path: {
+                    version_id: components["parameters"]["ObjectVersionId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Partial content */
+                206: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Not modified */
+                304: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Range not satisfiable */
+                416: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/object-versions/{version_id}/preview-manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Resolve an immutable ObjectVersion preview manifest */
+        get: {
+            parameters: {
+                query?: never;
+                header?: {
+                    "X-MediaHub-App-Id"?: components["parameters"]["ApplicationContext"];
+                };
+                path: {
+                    version_id: components["parameters"]["ObjectVersionId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Successful response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ObjectVersionPreviewManifest"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                503: components["responses"]["Unavailable"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/short-links": {
         parameters: {
             query?: never;
@@ -3174,6 +3336,24 @@ export interface components {
             items: components["schemas"]["Media"][];
             next_cursor: string | null;
         };
+        ObjectVersionPreviewManifest: {
+            content_type: string;
+            content_url: string;
+            etag: string;
+            /** Format: int64 */
+            max_bytes?: number | null;
+            mode: components["schemas"]["ObjectVersionPreviewMode"];
+            renderer: components["schemas"]["ObjectVersionPreviewRenderer"];
+            renderer_version: string;
+            /** Format: int64 */
+            size: number;
+            version_id: string;
+            warnings: string[];
+        };
+        /** @enum {string} */
+        ObjectVersionPreviewMode: "stream" | "buffered";
+        /** @enum {string} */
+        ObjectVersionPreviewRenderer: "archive" | "audio_video" | "image" | "pdf" | "spreadsheet" | "sqlite" | "text" | "general";
         OneTimeToken: {
             token: string;
         };
@@ -3461,6 +3641,7 @@ export interface components {
         MediaStatus: string;
         ObjectKey: string;
         ObjectPrefix: string;
+        ObjectVersionId: string;
         PublicBucketName: string;
         Range: string;
         SessionId: string;

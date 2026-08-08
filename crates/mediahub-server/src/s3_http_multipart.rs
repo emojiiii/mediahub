@@ -152,34 +152,24 @@ async fn s3_upload_part(
         }
     };
     if let Err(error) = signature.verify_payload_sha256(&streamed.sha256) {
-        persist_multipart_temporary_gc(
-            state,
-            &upload,
-            storage_key,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .map_err(|gc_error| {
-            warn!(error = %gc_error, "failed to persist bad-signature part cleanup");
-            S3ApiError::service_unavailable(resource, request_id)
-        })?;
+        persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+            .await
+            .map_err(|gc_error| {
+                warn!(error = %gc_error, "failed to persist bad-signature part cleanup");
+                S3ApiError::service_unavailable(resource, request_id)
+            })?;
         return Err(S3ApiError::from_sigv4(error, resource, request_id));
     }
     if expected_md5
         .as_deref()
         .is_some_and(|expected| !expected.eq_ignore_ascii_case(&streamed.md5))
     {
-        persist_multipart_temporary_gc(
-            state,
-            &upload,
-            storage_key,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .map_err(|gc_error| {
-            warn!(error = %gc_error, "failed to persist bad-digest part cleanup");
-            S3ApiError::service_unavailable(resource, request_id)
-        })?;
+        persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+            .await
+            .map_err(|gc_error| {
+                warn!(error = %gc_error, "failed to persist bad-digest part cleanup");
+                S3ApiError::service_unavailable(resource, request_id)
+            })?;
         return Err(S3ApiError::bad_digest(resource, request_id));
     }
 
@@ -203,17 +193,12 @@ async fn s3_upload_part(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            persist_multipart_temporary_gc(
-                state,
-                &upload,
-                storage_key,
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .map_err(|gc_error| {
-                warn!(error = %gc_error, "failed to persist rejected part cleanup");
-                S3ApiError::service_unavailable(resource, request_id)
-            })?;
+            persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+                .await
+                .map_err(|gc_error| {
+                    warn!(error = %gc_error, "failed to persist rejected part cleanup");
+                    S3ApiError::service_unavailable(resource, request_id)
+                })?;
             return Err(S3ApiError::from_api(
                 ApiError::from_repository(error),
                 resource,
@@ -232,17 +217,12 @@ async fn s3_upload_part(
             Ok(response)
         }
         S3MultipartPartPut::NotPending(_) | S3MultipartPartPut::Expired(_) => {
-            persist_multipart_temporary_gc(
-                state,
-                &upload,
-                storage_key,
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .map_err(|error| {
-                warn!(error = %error, "failed to persist terminal multipart part cleanup");
-                S3ApiError::service_unavailable(resource, request_id)
-            })?;
+            persist_multipart_temporary_gc(state, &upload, storage_key, OffsetDateTime::now_utc())
+                .await
+                .map_err(|error| {
+                    warn!(error = %error, "failed to persist terminal multipart part cleanup");
+                    S3ApiError::service_unavailable(resource, request_id)
+                })?;
             Err(S3ApiError::no_such_upload(resource, request_id))
         }
     }
@@ -526,13 +506,7 @@ async fn s3_complete_multipart_upload(
     let lease_until = now + time::Duration::seconds(S3_MULTIPART_COMPLETION_LEASE_SECONDS);
     let claim = state
         .repository
-        .claim_multipart_completion(
-            upload_id,
-            &manifest,
-            &completion_token,
-            lease_until,
-            now,
-        )
+        .claim_multipart_completion(upload_id, &manifest, &completion_token, lease_until, now)
         .await
         .map_err(|error| {
             warn!(error = %error, "S3 multipart completion claim failed");
@@ -578,7 +552,7 @@ async fn s3_complete_multipart_upload(
         }
         return Err(S3ApiError::entity_too_small(resource, request_id));
     }
-    if let Err(error) = validate_upload_expected_size(manifest.total_size) {
+    if let Err(error) = validate_s3_object_size(manifest.total_size) {
         if manifest.upload.upload_intent_id.is_none() {
             release_multipart_claim(state, upload_id, &completion_token).await;
         }
@@ -713,17 +687,18 @@ async fn s3_complete_multipart_upload(
         return Err(map_s3_object_service_error(error, resource, request_id));
     }
     let prepared = service
-        .prepare_claimed_upload_commit(
-            &committing,
-            &completion_token,
-            &final_entity_tag,
-            &final_checksum,
-            composed_size,
-            &auth.actor_id,
-        )
+        .prepare_claimed_upload_commit(PrepareClaimedUploadCommitRequest {
+            intent: &committing,
+            lease_token: &completion_token,
+            entity_tag: &final_entity_tag,
+            checksum: &final_checksum,
+            size_bytes: composed_size,
+            created_by: &auth.actor_id,
+            source_protocol: mediahub_core::SourceProtocol::S3,
+        })
         .await
         .map_err(|error| map_s3_object_service_error(error, resource, request_id))?;
-    let version = prepared.version;
+    let version_id = prepared.version.id();
     let object = state
         .repository
         .commit_multipart_object_version(
@@ -738,6 +713,20 @@ async fn s3_complete_multipart_upload(
             warn!(error = %error, "S3 multipart object-version commit failed");
             S3ApiError::from_api(ApiError::from_repository(error), resource, request_id)
         })?;
+    let version = state
+        .repository
+        .find_s3_object_version_by_id(version_id)
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "committed multipart ObjectVersion lookup failed");
+            S3ApiError::service_unavailable(resource, request_id)
+        })?
+        .filter(|version| {
+            version.object_id() == object.id()
+                && version.application_id() == auth.application.id
+                && version.bucket_id() == object.bucket_id()
+        })
+        .ok_or_else(|| S3ApiError::service_unavailable(resource, request_id))?;
     state
         .http_metrics
         .uploaded_bytes
@@ -858,11 +847,7 @@ fn canonical_completed_part_etag(value: &str) -> Option<String> {
 async fn release_multipart_claim(state: &AppState, upload_id: &str, completion_token: &str) {
     if let Err(error) = state
         .repository
-        .release_multipart_completion(
-            upload_id,
-            completion_token,
-            OffsetDateTime::now_utc(),
-        )
+        .release_multipart_completion(upload_id, completion_token, OffsetDateTime::now_utc())
         .await
     {
         warn!(upload_id, error = %error, "failed to release multipart completion claim");

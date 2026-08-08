@@ -454,6 +454,41 @@ pub struct Capabilities {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectVersionPreviewRenderer {
+    Archive,
+    AudioVideo,
+    Image,
+    Pdf,
+    Spreadsheet,
+    Sqlite,
+    Text,
+    General,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectVersionPreviewMode {
+    Stream,
+    Buffered,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectVersionPreviewManifest {
+    pub version_id: String,
+    pub etag: String,
+    pub content_type: String,
+    pub size: u64,
+    pub renderer: ObjectVersionPreviewRenderer,
+    pub renderer_version: String,
+    pub mode: ObjectVersionPreviewMode,
+    pub max_bytes: Option<u64>,
+    pub content_url: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteUploadSession {
     pub sha256: String,
